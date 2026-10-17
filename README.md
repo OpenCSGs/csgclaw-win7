@@ -6,9 +6,33 @@
   English | <a href="./README.zh.md">中文</a>
 </p>
 
-# CSGClaw
+# CSGClaw Win7
 
 > Your Personal AI Team
+
+## Windows 7 compatibility experiment
+
+This repository contains an experimental Windows 7 SP1 x64 port based on
+[CSGClaw v0.8.0](https://github.com/OpenCSGs/csgclaw/tree/v0.8.0).
+It uses Electron 22.3.27, a pinned Win7 Go toolchain, and a Web UI targeting
+Chromium 108. Desktop updates are disabled for this build.
+
+The [Win7 compatibility workflow](.github/workflows/win7-compat.yml) builds a
+portable ZIP on the `codex/win7-v0.8-electron22` branch. Download the ZIP from
+the workflow artifacts; the upstream installation commands below install the
+regular release and are not the Win7 installation path.
+
+Current validation in a UTM Windows 7 SP1 x64 VM:
+
+- The desktop application and Web UI launch.
+- STG login state and model configuration can be imported.
+- HTTPS model requests still fail with a TLS handshake timeout.
+- The bundled Codex runtime exits during initialization with `0xC0000139`.
+
+Agent question answering has not passed on Windows 7. The runtime and HTTPS
+issues remain unresolved.
+
+## Upstream project
 
 CSGClaw is a multi-agent collaboration platform built by OpenCSG — designed around one practical question: **once work becomes non-trivial, how do you get a group of AI agents to operate like a team, without the system becoming heavy or painful to set up?**
 

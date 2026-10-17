@@ -6,9 +6,30 @@
   <a href="./README.md">English</a> | 中文
 </p>
 
-# CSGClaw
+# CSGClaw Win7
 
 > Your Personal AI Team
+
+## Windows 7 兼容实验
+
+本仓库基于 [CSGClaw v0.8.0](https://github.com/OpenCSGs/csgclaw/tree/v0.8.0)，
+用于 Windows 7 SP1 x64 兼容实验。桌面使用 Electron 22.3.27 和固定版本的
+Win7 Go 工具链，Web UI 以 Chromium 108 为目标构建，桌面自动更新已禁用。
+
+[Win7 兼容构建工作流](.github/workflows/win7-compat.yml) 在
+`codex/win7-v0.8-electron22` 分支构建便携 ZIP，请从工作流产物下载。
+下文的上游安装命令安装常规发行版，不用于安装 Win7 实验版本。
+
+当前在 UTM Windows 7 SP1 x64 虚拟机中的验证结果：
+
+- 桌面应用和 Web UI 可以启动。
+- 可以导入 STG 登录态和模型配置。
+- HTTPS 模型请求仍出现 TLS 握手超时。
+- 内置 Codex runtime 在初始化时以 `0xC0000139` 退出。
+
+Windows 7 上的 Agent 问答尚未通过验证，runtime 和 HTTPS 问题仍待解决。
+
+## 上游项目
 
 CSGClaw 是 OpenCSG 推出的多智能体协作平台。它想解决的不是"怎么把一个 Agent 做得更万能"，而是一个更实际的问题：**当任务开始变复杂时，怎么让一组 AI 像一个团队一样协作，同时又足够轻、足够安全、足够容易启动。**
 
