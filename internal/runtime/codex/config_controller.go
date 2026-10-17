@@ -1,0 +1,321 @@
+package codex
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strings"
+	"sync"
+
+	"csgclaw/internal/auth"
+	"csgclaw/internal/mcpschema"
+	"csgclaw/internal/modelprovider"
+	agentruntime "csgclaw/internal/runtime"
+)
+
+var checkResponsesAPIForProvider = modelprovider.CheckResponsesOrChatCompletionsAPI
+var codexMCPServerNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var openCSGCredentialsForResponsesProbe = func(ctx context.Context) (string, string, bool, error) {
+	store, err := auth.DefaultStore()
+	if err != nil {
+		return "", "", false, err
+	}
+	return store.EnsureAIGatewayCredentials(ctx, &http.Client{})
+}
+
+type responsesProbeCache struct {
+	mu      sync.Mutex
+	results map[string]struct{}
+}
+
+var codexResponsesProbeCache = responsesProbeCache{results: make(map[string]struct{})}
+
+func TestOnlySetResponsesAPIProbe(probe func(context.Context, string, string, string, map[string]string) error) func() {
+	previous := checkResponsesAPIForProvider
+	checkResponsesAPIForProvider = probe
+	codexResponsesProbeCache.clear()
+	return func() {
+		checkResponsesAPIForProvider = previous
+		codexResponsesProbeCache.clear()
+	}
+}
+
+func (r *Runtime) ValidateConfig(ctx context.Context, current agentruntime.RuntimeConfigSnapshot) error {
+	if _, err := DecodeRuntimeOptions(current.Options); err != nil {
+		return err
+	}
+	target, ok, err := responsesProbeTarget(ctx, current.Profile)
+	if err != nil {
+		return fmt.Errorf("validate Codex provider Responses API: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	if err := codexResponsesProbeCache.validate(ctx, target); err != nil {
+		return fmt.Errorf("validate Codex provider Responses API at %s for model %s: %w", target.baseURL, target.modelID, err)
+	}
+	return nil
+}
+
+func (r *Runtime) ValidateStartConfig(_ context.Context, _ agentruntime.RuntimeConfigSnapshot) error {
+	return nil
+}
+
+func (r *Runtime) RestartRequired(change agentruntime.RuntimeConfigChange) (bool, error) {
+	return codexRuntimeOptionsChanged(change.Previous.Options, change.Current.Options) ||
+		!reflect.DeepEqual(change.Previous.Profile, change.Current.Profile), nil
+}
+
+func (r *Runtime) ReconcileConfig(ctx context.Context, h agentruntime.Handle, change agentruntime.RuntimeConfigChange) error {
+	if err := r.RefreshCodexHomeAgentsFile(ctx, h); err != nil {
+		return err
+	}
+	if !codexConversationProfileChanged(change.Previous.Profile, change.Current.Profile) {
+		return nil
+	}
+	return r.resetPersistedConversationMappings(h.RuntimeID)
+}
+
+func codexConversationProfileChanged(previous, current agentruntime.RuntimeProfileConfig) bool {
+	return strings.TrimSpace(previous.Provider) != strings.TrimSpace(current.Provider) ||
+		strings.TrimRight(strings.TrimSpace(previous.BaseURL), "/") != strings.TrimRight(strings.TrimSpace(current.BaseURL), "/") ||
+		strings.TrimSpace(previous.ModelID) != strings.TrimSpace(current.ModelID)
+}
+
+// resetPersistedConversationMappings rotates model-facing Codex threads without
+// deleting their rollout files or the channel transcript. The next prompt for
+// each conversation key will create and persist a fresh thread.
+func (r *Runtime) resetPersistedConversationMappings(runtimeID string) error {
+	meta, err := r.readSessionMetadata(strings.TrimSpace(runtimeID))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read codex conversations before model change: %w", err)
+	}
+	if len(meta.ConversationSessions) == 0 && len(meta.FilePublishingConversations) == 0 {
+		return nil
+	}
+	meta.ConversationSessions = nil
+	meta.FilePublishingConversations = nil
+	path, err := r.sessionMetadataPath(runtimeID)
+	if err != nil {
+		return fmt.Errorf("resolve codex session metadata after model change: %w", err)
+	}
+	if err := writeJSONFile(r.writeFile, path, meta); err != nil {
+		return fmt.Errorf("reset codex conversations after model change: %w", err)
+	}
+	return nil
+}
+
+func (r *Runtime) ValidateMCPServers(_ context.Context, current agentruntime.MCPServersSnapshot) error {
+	if _, exists := current.Servers[AgentMCPServerName]; exists {
+		return fmt.Errorf("MCP server %q is managed by CSGClaw", AgentMCPServerName)
+	}
+	return validateCodexMCPServers(current.Servers)
+}
+
+// validateCodexMCPServers enforces the transports that Codex can represent in
+// config.toml. Codex configures URL-based MCP servers as Streamable HTTP and
+// has no transport field for legacy SSE servers, so accepting SSE here would
+// silently turn it into a different protocol when the config is rendered.
+func validateCodexMCPServers(servers map[string]any) error {
+	normalized, err := mcpschema.NormalizeMCPServers(servers)
+	if err != nil {
+		return err
+	}
+	for name, raw := range normalized {
+		if !codexMCPServerNamePattern.MatchString(name) {
+			return fmt.Errorf("%s server name %q is not supported by codex; must match %s", mcpschema.MCPServersKey, name, codexMCPServerNamePattern)
+		}
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%s.%s must be an object", mcpschema.MCPServersKey, name)
+		}
+		if !mcpschema.ServerEnabled(entry) {
+			continue
+		}
+		if mcpTrimmedString(entry["url"]) == "" {
+			continue
+		}
+		for headerName := range mcpStringMap(entry["env_http_headers"]) {
+			if !mcpschema.ValidMCPHTTPHeaderName(headerName) {
+				return fmt.Errorf("%s.%s.env_http_headers contains an invalid HTTP header name", mcpschema.MCPServersKey, name)
+			}
+		}
+		switch strings.ToLower(strings.TrimSpace(mcpTrimmedString(entry["transport"]))) {
+		case "", "streamable", "streamable-http", "streamable_http":
+			continue
+		case "sse":
+			return fmt.Errorf("%s.%s.transport %q is not supported by codex; use %q", mcpschema.MCPServersKey, name, "sse", "streamable-http")
+		default:
+			return fmt.Errorf("%s.%s.transport must be %q for a remote codex MCP server", mcpschema.MCPServersKey, name, "streamable-http")
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) MCPServersRestartRequired(change agentruntime.MCPServersChange) (bool, error) {
+	return agentruntime.MCPServersNeedsRestart(change.Previous.Servers, change.Current.Servers)
+}
+
+func (r *Runtime) ReconcileMCPServers(_ context.Context, h agentruntime.Handle, change agentruntime.MCPServersChange) error {
+	agentRef, err := r.resolveAgent(h)
+	if err != nil {
+		return err
+	}
+	codexHomeDir, err := r.resolveCodexHomeDir(agentRef.ID)
+	if err != nil {
+		return err
+	}
+	workspaceDir, err := r.resolveWorkspaceDir(agentRef.ID, agentRef.RuntimeOptions)
+	if err != nil {
+		return err
+	}
+	servers, err := codexMCPFileBridgeServers(change.Current.Servers, agentRef.ID)
+	if err != nil {
+		return err
+	}
+	return r.seedCodexHomeConfig(codexHomeDir, workspaceDir, agentRef.Profile.Normalized(), agentRef.RuntimeOptions, servers)
+}
+
+func (r *Runtime) ListMCPServers(_ context.Context, h agentruntime.Handle, _ agentruntime.MCPServersSnapshot) (agentruntime.MCPServersSnapshot, error) {
+	agentRef, err := r.resolveAgent(h)
+	if err != nil {
+		return agentruntime.MCPServersSnapshot{}, err
+	}
+	codexHomeDir, err := r.resolveCodexHomeDir(agentRef.ID)
+	if err != nil {
+		return agentruntime.MCPServersSnapshot{}, err
+	}
+	configPath := filepath.Join(codexHomeDir, configFileName)
+	raw, err := r.readFile(configPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return agentruntime.MCPServersSnapshot{}, nil
+		}
+		return agentruntime.MCPServersSnapshot{}, fmt.Errorf("read runtime codex mcp config %s: %w", configPath, err)
+	}
+	config, err := parseCodexMCPServers(string(raw))
+	if err != nil {
+		return agentruntime.MCPServersSnapshot{}, err
+	}
+	delete(config, AgentMCPServerName)
+	return agentruntime.MCPServersSnapshot{Servers: config}, nil
+}
+
+type responsesProbeTargetConfig struct {
+	provider string
+	baseURL  string
+	apiKey   string
+	modelID  string
+	headers  map[string]string
+}
+
+func responsesProbeTarget(ctx context.Context, profile agentruntime.RuntimeProfileConfig) (responsesProbeTargetConfig, bool, error) {
+	provider := strings.ToLower(strings.TrimSpace(profile.Provider))
+	switch provider {
+	case "codex", "claude_code", "claude-code":
+		return responsesProbeTargetConfig{}, false, nil
+	}
+	if provider == "csghub" || provider == "opencsg" {
+		baseURL, apiKey, ok, err := openCSGCredentialsForResponsesProbe(ctx)
+		if err != nil {
+			return responsesProbeTargetConfig{}, false, fmt.Errorf("resolve OpenCSG credentials: %w", err)
+		}
+		if !ok {
+			return responsesProbeTargetConfig{}, false, fmt.Errorf("OpenCSG sign-in is required")
+		}
+		return responsesProbeTargetConfig{
+			provider: provider,
+			baseURL:  strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+			apiKey:   strings.TrimSpace(apiKey),
+			modelID:  strings.TrimSpace(profile.ModelID),
+			headers:  normalizeHeaders(profile.Headers),
+		}, true, nil
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(profile.BaseURL), "/")
+	if baseURL == "" {
+		return responsesProbeTargetConfig{}, false, fmt.Errorf("provider base_url is required")
+	}
+	return responsesProbeTargetConfig{
+		provider: provider,
+		baseURL:  baseURL,
+		apiKey:   strings.TrimSpace(profile.APIKey),
+		modelID:  strings.TrimSpace(profile.ModelID),
+		headers:  normalizeHeaders(profile.Headers),
+	}, true, nil
+}
+
+func (c *responsesProbeCache) validate(ctx context.Context, target responsesProbeTargetConfig) error {
+	key := responsesProbeCacheKey(target)
+	c.mu.Lock()
+	if c.results == nil {
+		c.results = make(map[string]struct{})
+	}
+	if _, ok := c.results[key]; ok {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	err := checkResponsesAPIForProvider(ctx, target.baseURL, target.apiKey, target.modelID, target.headers)
+
+	if err == nil {
+		c.mu.Lock()
+		c.results[key] = struct{}{}
+		c.mu.Unlock()
+	}
+	return err
+}
+
+func (c *responsesProbeCache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.results = make(map[string]struct{})
+}
+
+func responsesProbeCacheKey(target responsesProbeTargetConfig) string {
+	return strings.TrimSpace(target.provider) + "\x00" + strings.TrimRight(strings.TrimSpace(target.baseURL), "/") + "\x00" + strings.TrimSpace(target.modelID)
+}
+
+func normalizeHeaders(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func codexRuntimeOptionsChanged(previous, current map[string]any) bool {
+	previousOpts, err := DecodeRuntimeOptions(previous)
+	if err != nil {
+		return true
+	}
+	currentOpts, err := DecodeRuntimeOptions(current)
+	if err != nil {
+		return true
+	}
+	return previousOpts.LocalWorkspaceDir != currentOpts.LocalWorkspaceDir ||
+		previousOpts.ExecutionMode != currentOpts.ExecutionMode ||
+		previousOpts.MemoryMode != currentOpts.MemoryMode
+}

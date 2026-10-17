@@ -1,0 +1,101 @@
+import {
+  AgentRuntimeStatuses,
+  agentRuntimeByName,
+  normalizeAgentRuntime,
+  normalizeAgentRuntimeList,
+  upsertAgentRuntime,
+} from "@/models/agentRuntimes";
+
+describe("agent runtimes", () => {
+  it("normalizes the API list and keeps Codex and DSH before Claude Code", () => {
+    const runtimes = normalizeAgentRuntimeList([
+      {
+        name: "claude-code",
+        label: "Claude Code",
+        supported: false,
+        installed: false,
+        installable: false,
+        status: "coming_soon",
+        docs_url: "https://example.com/claude",
+      },
+      { name: "", label: "Invalid" },
+      {
+        name: "dsh",
+        label: "DeepSeek Harness",
+        supported: true,
+        installed: true,
+        status: "installed",
+        path: "/tmp/dsh",
+        version: "0.1.6-alpha.2",
+        message_code: "dsh_not_installed",
+      },
+      {
+        name: "codex",
+        label: "Codex CLI",
+        supported: true,
+        installed: true,
+        installable: true,
+        status: "installed",
+        path: "/tmp/codex",
+        os: "darwin",
+        arch: "arm64",
+      },
+    ]);
+
+    expect(runtimes.map((runtime) => runtime.name)).toEqual(["codex", "dsh", "claude_code"]);
+    expect(runtimes[0]).toMatchObject({
+      installed: true,
+      path: "/tmp/codex",
+      status: AgentRuntimeStatuses.installed,
+    });
+    expect(runtimes[1]).toMatchObject({
+      path: "/tmp/dsh",
+      version: "0.1.6-alpha.2",
+      messageCode: "dsh_not_installed",
+    });
+    expect(runtimes[2]).toMatchObject({
+      docsURL: "https://example.com/claude",
+      status: AgentRuntimeStatuses.comingSoon,
+    });
+  });
+
+  it("derives safe fallback states for incomplete records", () => {
+    expect(normalizeAgentRuntime({ name: "codex", status: "unexpected" })).toMatchObject({
+      label: "Codex CLI",
+      status: AgentRuntimeStatuses.notInstalled,
+      supported: true,
+    });
+    expect(normalizeAgentRuntime({ name: "claude_code", status: "unexpected" })).toMatchObject({
+      label: "Claude Code",
+      status: AgentRuntimeStatuses.comingSoon,
+      supported: false,
+    });
+    expect(normalizeAgentRuntime({ name: "codex", status: "unsupported", installable: true })).toMatchObject({
+      status: AgentRuntimeStatuses.unsupported,
+      installed: false,
+    });
+    expect(normalizeAgentRuntime(null)).toBeNull();
+  });
+
+  it("upserts install results without disturbing runtime order", () => {
+    const initial = normalizeAgentRuntimeList([
+      { name: "codex", status: "not_installed", installed: false, installable: true, supported: true },
+      { name: "claude_code", status: "coming_soon", installed: false, supported: false },
+    ]);
+
+    const updated = upsertAgentRuntime(initial, {
+      name: "codex",
+      status: "installed",
+      installed: true,
+      installable: true,
+      supported: true,
+      path: "/opt/csgclaw/codex",
+    });
+
+    expect(updated.map((runtime) => runtime.name)).toEqual(["codex", "claude_code"]);
+    expect(agentRuntimeByName(updated, "codex")).toMatchObject({
+      installed: true,
+      path: "/opt/csgclaw/codex",
+    });
+  });
+});

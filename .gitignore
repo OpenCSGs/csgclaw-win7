@@ -1,0 +1,52 @@
+.DS_Store
+
+# Go build/test artifacts
+.cache/
+.gocache/
+bin/
+bin-csghub/
+dist/
+picoclaw-build.env
+.desktop-release-oss.env
+*.test
+*.out
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# Web frontend local artifacts
+node_modules/
+web/app/playwright-report/
+web/app/test-results/
+web/app/.vite/
+desktop/dist/
+desktop/out/
+desktop/.forge-generated/
+web/static-dist/*
+!web/static-dist/
+!web/static-dist/.gitkeep
+
+# Local binaries
+/csgclaw
+
+# Local runtime data
+manager-data/
+docker/
+
+# Generated embedded runtime workspaces
+/internal/agent/embed/
+
+# Editor / tool directories
+.cursor/
+.idea/
+.vscode/
+!.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Vendored native libraries / SDK dist fetched on demand
+third_party/boxlite-go/libboxlite.a
+third_party/boxlite-go/boxlite-c*/
+
+.playwright-cli

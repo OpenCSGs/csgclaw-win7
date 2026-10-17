@@ -1,0 +1,2183 @@
+package serve
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"csgclaw/cli/command"
+	"csgclaw/internal/activity"
+	"csgclaw/internal/agentengine"
+	agent "csgclaw/internal/agentengine/agents"
+	csgclawchannel "csgclaw/internal/channel/csgclaw"
+	csgclawinteraction "csgclaw/internal/channel/csgclaw/interaction"
+	channelrender "csgclaw/internal/channel/csgclaw/render"
+	"csgclaw/internal/channel/feishu"
+	"csgclaw/internal/config"
+	"csgclaw/internal/im"
+	"csgclaw/internal/llm"
+	internalonboard "csgclaw/internal/onboard"
+	"csgclaw/internal/participant"
+	agentruntime "csgclaw/internal/runtime"
+	"csgclaw/internal/sandboxproviders"
+	"csgclaw/internal/server"
+	"csgclaw/internal/upgrade"
+	appversion "csgclaw/internal/version"
+	"csgclaw/internal/worklease"
+)
+
+func TestReconcileInterruptedUserInputMessagesIncludesThreadReplies(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	renderer := channelrender.NewTurnRenderer()
+	pending, ok := renderer.RenderActivity(activity.RuntimeEvent{
+		Kind: activity.RuntimeEventUserInputRequest,
+		Payload: activity.UserInputSnapshot{
+			ID: "request-1", Status: activity.UserInputStatusPending, RequestedAt: now,
+			Questions: []activity.UserInputQuestionSnapshot{{ID: "q", Header: "Q", Question: "Answer?"}},
+		},
+		UserInputID: "request-1",
+		ReceivedAt:  now,
+	}, "csgclaw", "room-1", "manager")
+	if !ok {
+		t.Fatal("pending question was not rendered")
+	}
+	svc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "manager",
+		Users:         []im.User{{ID: "manager", Name: "Manager", Role: "manager"}},
+		Rooms: []im.Room{{
+			ID: "room-1", Title: "Room", Members: []string{"manager"},
+			Messages: []im.Message{
+				{ID: "root-1", SenderID: "manager", Content: "root", CreatedAt: now.Add(-time.Minute)},
+				{ID: pending.MessageID, SenderID: "manager", Content: pending.Text, Metadata: pending.Metadata, CreatedAt: now, RelatesTo: &im.MessageRelation{RelType: im.RelationTypeThread, EventID: "root-1"}},
+			},
+		}},
+	})
+	if err := reconcileInterruptedUserInputMessages(svc); err != nil {
+		t.Fatalf("reconcileInterruptedUserInputMessages() error = %v", err)
+	}
+	rooms := svc.ListRoomsWithOptions(im.ListMessagesOptions{IncludeThreadReplies: true})
+	if len(rooms) != 1 {
+		t.Fatal("room not found")
+	}
+	room := rooms[0]
+	var found im.Message
+	for _, message := range room.Messages {
+		if message.ID == pending.MessageID {
+			found = message
+			break
+		}
+	}
+	metadata, _ := json.Marshal(found.Metadata)
+	if found.ID == "" || !strings.Contains(found.Content, "Status: Request interrupted.") || !strings.Contains(string(metadata), `"status":"interrupted"`) || found.RelatesTo == nil || found.RelatesTo.EventID != "root-1" {
+		t.Fatalf("reconciled thread question = %+v", found)
+	}
+}
+
+func TestValidateServeInstallationRejectsReleaseOutsideBundle(t *testing.T) {
+	originalVersion := appversion.Version
+	appversion.Version = "v0.3.12"
+	t.Cleanup(func() { appversion.Version = originalVersion })
+
+	err := validateServeInstallation()
+	if !errors.Is(err, upgrade.ErrNotOfficialBundle) {
+		t.Fatalf("validateServeInstallation() error = %v, want ErrNotOfficialBundle", err)
+	}
+	if !strings.Contains(err.Error(), "拒绝启动正式版本") {
+		t.Fatalf("validateServeInstallation() error = %q, want Chinese guidance", err)
+	}
+	if !strings.Contains(err.Error(), "curl -fsSL https://csgclaw.opencsg.com/install.sh | bash") {
+		t.Fatalf("validateServeInstallation() error = %q, want official install command", err)
+	}
+}
+
+func TestOfficialInstallGuidance(t *testing.T) {
+	tests := []struct {
+		goos string
+		want string
+	}{
+		{goos: "darwin", want: "curl -fsSL https://csgclaw.opencsg.com/install.sh | bash"},
+		{goos: "linux", want: "curl -fsSL https://csgclaw.opencsg.com/install.sh | bash"},
+		{goos: "windows", want: "curl.exe -fsSL https://csgclaw.opencsg.com/install.ps1 | powershell -ExecutionPolicy Bypass -Command -"},
+	}
+
+	for _, tt := range tests {
+		_, got := officialInstallGuidance(tt.goos)
+		if got != tt.want {
+			t.Fatalf("officialInstallGuidance(%q) command = %q, want %q", tt.goos, got, tt.want)
+		}
+	}
+}
+
+func TestValidateServeInstallationAllowsLocalBuild(t *testing.T) {
+	originalVersion := appversion.Version
+	appversion.Version = "v0.3.12+local"
+	t.Cleanup(func() { appversion.Version = originalVersion })
+
+	if err := validateServeInstallation(); err != nil {
+		t.Fatalf("validateServeInstallation() error = %v", err)
+	}
+}
+
+func TestServeForegroundPreflightsCSGHubLiteProvider(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	var gotModelCfg config.ModelConfig
+	CheckModelProvider = func(_ context.Context, modelCfg config.ModelConfig) error {
+		gotModelCfg = modelCfg
+		return nil
+	}
+
+	cfg := csgHubLiteServeConfig("http://127.0.0.1:11435/v1")
+	if err := serveForeground(context.Background(), testContext(), cfg, "json"); err != nil {
+		t.Fatalf("serveForeground() error = %v", err)
+	}
+	if got, want := gotModelCfg.BaseURL, "http://127.0.0.1:11435/v1"; got != want {
+		t.Fatalf("CheckModelProvider baseURL = %q, want %q", got, want)
+	}
+	if got, want := gotModelCfg.APIKey, "local"; got != want {
+		t.Fatalf("CheckModelProvider apiKey = %q, want %q", got, want)
+	}
+}
+
+func TestServeRunAutoBootstrapsWhenStateIncomplete(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	origDetectBootstrapState := DetectBootstrapState
+	origEnsureBootstrapState := EnsureBootstrapState
+	t.Cleanup(func() {
+		DetectBootstrapState = origDetectBootstrapState
+		EnsureBootstrapState = origEnsureBootstrapState
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := (config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:  "127.0.0.1:18080",
+			AccessToken: "pc-secret",
+		},
+		Sandbox: config.SandboxConfig{
+			Provider: config.DefaultSandboxProvider,
+		},
+	}).Save(configPath); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	var ensureCalls int
+	DetectBootstrapState = func(opts internalonboard.DetectStateOptions) (internalonboard.DetectStateResult, error) {
+		if opts.ConfigPath != configPath {
+			t.Fatalf("DetectStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		return internalonboard.DetectStateResult{ConfigPath: configPath}, nil
+	}
+	EnsureBootstrapState = func(_ context.Context, opts internalonboard.EnsureStateOptions) (internalonboard.EnsureStateResult, error) {
+		ensureCalls++
+		if opts.ConfigPath != configPath {
+			t.Fatalf("EnsureStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		return internalonboard.EnsureStateResult{
+			ConfigPath: configPath,
+			Config: config.Config{
+				Bootstrap: config.BootstrapConfig{
+					DefaultManagerTemplate: "builtin.manager-codex",
+					DefaultWorkerTemplate:  "builtin.picoclaw-worker",
+				},
+			},
+		}, nil
+	}
+
+	run := testContext()
+	err := NewServeCmd().Run(context.Background(), run, nil, command.GlobalOptions{
+		Config: configPath,
+		Output: "json",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if ensureCalls != 1 {
+		t.Fatalf("EnsureBootstrapState calls = %d, want 1", ensureCalls)
+	}
+	if got := run.Stderr.(*bytes.Buffer).String(); !strings.Contains(got, "auto-initializing local state") {
+		t.Fatalf("stderr missing auto-bootstrap log:\n%s", got)
+	}
+}
+
+func TestServeRunSkipsAutoBootstrapWhenStateComplete(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	origDetectBootstrapState := DetectBootstrapState
+	origEnsureBootstrapState := EnsureBootstrapState
+	t.Cleanup(func() {
+		DetectBootstrapState = origDetectBootstrapState
+		EnsureBootstrapState = origEnsureBootstrapState
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := (config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:  "127.0.0.1:18080",
+			AccessToken: "pc-secret",
+		},
+		Sandbox: config.SandboxConfig{
+			Provider: config.DefaultSandboxProvider,
+		},
+	}).Save(configPath); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	DetectBootstrapState = func(opts internalonboard.DetectStateOptions) (internalonboard.DetectStateResult, error) {
+		if opts.ConfigPath != configPath {
+			t.Fatalf("DetectStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		return internalonboard.DetectStateResult{
+			ConfigPath:                 configPath,
+			ConfigExists:               true,
+			ConfigComplete:             true,
+			IMBootstrapComplete:        true,
+			ManagerAgentComplete:       true,
+			AdminParticipantComplete:   true,
+			ManagerParticipantComplete: true,
+		}, nil
+	}
+	EnsureBootstrapState = func(context.Context, internalonboard.EnsureStateOptions) (internalonboard.EnsureStateResult, error) {
+		t.Fatal("EnsureBootstrapState should not be called when bootstrap is complete")
+		return internalonboard.EnsureStateResult{}, nil
+	}
+
+	run := testContext()
+	err := NewServeCmd().Run(context.Background(), run, nil, command.GlobalOptions{
+		Config: configPath,
+		Output: "json",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got := run.Stderr.(*bytes.Buffer).String(); strings.Contains(got, "auto-initializing local state") {
+		t.Fatalf("stderr should not contain auto-bootstrap log:\n%s", got)
+	}
+}
+
+func TestServeRunNoAuthDetectDisablesCLIProxyAutoLoginDuringStartup(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+	t.Setenv("CSGCLAW_CLIPROXY_AUTO_LOGIN", "true")
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := (config.Config{
+		Server:  config.ServerConfig{ListenAddr: "127.0.0.1:18080", AccessToken: "pc-secret"},
+		Sandbox: config.SandboxConfig{Provider: config.DefaultSandboxProvider},
+	}).Save(configPath); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	origRunServer := RunServer
+	t.Cleanup(func() {
+		RunServer = origRunServer
+	})
+	var gotAutoLogin string
+	RunServer = func(opts server.Options) error {
+		gotAutoLogin = os.Getenv("CSGCLAW_CLIPROXY_AUTO_LOGIN")
+		return nil
+	}
+
+	run := testContext()
+	err := NewServeCmd().Run(context.Background(), run, []string{"--no-auth-detect"}, command.GlobalOptions{
+		Config: configPath,
+		Output: "json",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if gotAutoLogin != "0" {
+		t.Fatalf("CSGCLAW_CLIPROXY_AUTO_LOGIN during startup = %q, want 0", gotAutoLogin)
+	}
+	if got := os.Getenv("CSGCLAW_CLIPROXY_AUTO_LOGIN"); got != "true" {
+		t.Fatalf("CSGCLAW_CLIPROXY_AUTO_LOGIN after startup = %q, want restored true", got)
+	}
+}
+
+func TestServeRunNoAuthDetectPassesOptionToAutoBootstrap(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	origDetectBootstrapState := DetectBootstrapState
+	origEnsureBootstrapState := EnsureBootstrapState
+	t.Cleanup(func() {
+		DetectBootstrapState = origDetectBootstrapState
+		EnsureBootstrapState = origEnsureBootstrapState
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr: "127.0.0.1:18080",
+			NoAuth:     true,
+		},
+		Sandbox: config.SandboxConfig{
+			Provider: config.DefaultSandboxProvider,
+		},
+	}
+	if err := cfg.Save(configPath); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	DetectBootstrapState = func(opts internalonboard.DetectStateOptions) (internalonboard.DetectStateResult, error) {
+		if opts.ConfigPath != configPath {
+			t.Fatalf("DetectStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		return internalonboard.DetectStateResult{
+			ConfigPath:     configPath,
+			Config:         cfg,
+			ConfigExists:   true,
+			ConfigComplete: true,
+		}, nil
+	}
+	var gotNoAuthDetect bool
+	EnsureBootstrapState = func(_ context.Context, opts internalonboard.EnsureStateOptions) (internalonboard.EnsureStateResult, error) {
+		gotNoAuthDetect = opts.NoAuthDetect
+		if opts.ConfigPath != configPath {
+			t.Fatalf("EnsureStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		return internalonboard.EnsureStateResult{ConfigPath: configPath, Config: cfg}, nil
+	}
+
+	run := testContext()
+	err := NewServeCmd().Run(context.Background(), run, []string{"--no-auth-detect"}, command.GlobalOptions{
+		Config: configPath,
+		Output: "json",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !gotNoAuthDetect {
+		t.Fatalf("EnsureStateOptions.NoAuthDetect = false, want true")
+	}
+}
+
+func TestServeRunSkipsBootstrapWhenStateComplete(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+	t.Setenv("HOME", t.TempDir())
+	origCreateManagerParticipant := internalonboard.CreateManagerParticipant
+	origEnsureIMBootstrapState := internalonboard.EnsureIMBootstrapState
+	t.Cleanup(func() {
+		internalonboard.CreateManagerParticipant = origCreateManagerParticipant
+		internalonboard.EnsureIMBootstrapState = origEnsureIMBootstrapState
+	})
+	internalonboard.EnsureIMBootstrapState = func(string) error { return nil }
+	internalonboard.CreateManagerParticipant = func(_ context.Context, _, _ string, cfg config.Config) (participant.Participant, error) {
+		return participant.Participant{ID: agent.ManagerParticipantID}, nil
+	}
+
+	origDetectBootstrapState := DetectBootstrapState
+	origEnsureBootstrapState := EnsureBootstrapState
+	t.Cleanup(func() {
+		DetectBootstrapState = origDetectBootstrapState
+		EnsureBootstrapState = origEnsureBootstrapState
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte(`# Generated by csgclaw.
+
+[server]
+listen_addr = "127.0.0.1:18080"
+advertise_base_url = ""
+access_token = "pc-secret"
+no_auth = false
+
+[bootstrap]
+manager_image_override = ""
+
+[sandbox]
+provider = "boxlite"
+debian_registries_override = []
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	var ensureCalls int
+	DetectBootstrapState = func(opts internalonboard.DetectStateOptions) (internalonboard.DetectStateResult, error) {
+		if opts.ConfigPath != configPath {
+			t.Fatalf("DetectStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		return internalonboard.DetectStateResult{
+			ConfigPath:                 configPath,
+			ConfigExists:               true,
+			ConfigComplete:             true,
+			IMBootstrapComplete:        true,
+			ManagerAgentComplete:       true,
+			AdminParticipantComplete:   true,
+			ManagerParticipantComplete: true,
+		}, nil
+	}
+	EnsureBootstrapState = func(_ context.Context, opts internalonboard.EnsureStateOptions) (internalonboard.EnsureStateResult, error) {
+		ensureCalls++
+		if opts.ConfigPath != configPath {
+			t.Fatalf("EnsureStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		cfg, err := internalonboard.EnsureState(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("EnsureState() error = %v", err)
+		}
+		return cfg, nil
+	}
+
+	run := testContext()
+	err := NewServeCmd().Run(context.Background(), run, nil, command.GlobalOptions{
+		Config: configPath,
+		Output: "json",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if ensureCalls != 0 {
+		t.Fatalf("EnsureBootstrapState calls = %d, want 0", ensureCalls)
+	}
+}
+
+func TestServeForegroundContinuesWhenCSGHubLiteUnavailable(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	CheckModelProvider = func(context.Context, config.ModelConfig) error {
+		return fmt.Errorf("provider unavailable")
+	}
+
+	err := serveForeground(context.Background(), testContext(), csgHubLiteServeConfig("http://127.0.0.1:11435/v1"), "json")
+	if err != nil {
+		t.Fatalf("serveForeground() error = %v, want startup to continue with dynamic profile setup", err)
+	}
+}
+
+func TestRefreshStartupModelProvidersSavesDiscoveredModels(t *testing.T) {
+	origCheckCatalogModelProvider := CheckCatalogModelProvider
+	t.Cleanup(func() { CheckCatalogModelProvider = origCheckCatalogModelProvider })
+	CheckCatalogModelProvider = func(_ context.Context, input agent.ModelProviderCheckInput) agent.ModelProviderCheckResult {
+		if input.ID != agent.ModelProviderIDCodex {
+			return agent.ModelProviderCheckResult{ID: input.ID, Status: agent.ModelProviderStatusFailed}
+		}
+		return agent.ModelProviderCheckResult{
+			ID:     input.ID,
+			Status: agent.ModelProviderStatusConnected,
+			Models: []string{"gpt-5.5", "gpt-5.5-codex"},
+		}
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:  "127.0.0.1:18080",
+			AccessToken: "secret",
+		},
+		Sandbox: config.SandboxConfig{
+			Provider: config.DefaultSandboxProvider,
+		},
+	}
+	if err := cfg.Save(configPath); err != nil {
+		t.Fatalf("Save(config) error = %v", err)
+	}
+
+	refreshed, _, err := refreshStartupModelProviders(context.Background(), cfg, configPath, nil)
+	if err != nil {
+		t.Fatalf("refreshStartupModelProviders() error = %v", err)
+	}
+	if got := refreshed.Models.Providers[agent.ModelProviderIDCodex].Models; len(got) != 2 || got[0] != "gpt-5.5" || got[1] != "gpt-5.5-codex" {
+		t.Fatalf("refreshed codex models = %+v, want discovered models", got)
+	}
+	saved, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load(config) error = %v", err)
+	}
+	if got := saved.Models.Providers[agent.ModelProviderIDCodex].Models; len(got) != 2 || got[0] != "gpt-5.5" || got[1] != "gpt-5.5-codex" {
+		t.Fatalf("saved codex models = %+v, want discovered models", got)
+	}
+}
+
+func TestServeForegroundOpensIMURLWhenBrowserAllowed(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	openedCh := make(chan string, 1)
+	WaitForHealthy = func(string, time.Duration) error { return nil }
+	var opened string
+	OpenBrowser = func(rawURL string) error {
+		opened = rawURL
+		openedCh <- rawURL
+		return nil
+	}
+
+	run := testContext()
+	stdout := newNotifyingBuffer("Opened this URL in your browser.")
+	run.Stdout = stdout
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			AdvertiseBaseURL: "http://example.test/base",
+		},
+	}
+	if err := serveForegroundWithConfigPath(context.Background(), run, cfg, "", "table", serveOptions{OpenBrowser: true}); err != nil {
+		t.Fatalf("serveForeground() error = %v", err)
+	}
+	select {
+	case <-openedCh:
+	case <-time.After(time.Second):
+		t.Fatal("OpenBrowser was not called after server readiness")
+	}
+	if got, want := opened, "http://example.test/base/"; got != want {
+		t.Fatalf("OpenBrowser() URL = %q, want %q", got, want)
+	}
+	select {
+	case <-stdout.Seen():
+	case <-time.After(time.Second):
+		t.Fatal("browser-open confirmation was not printed")
+	}
+	if got := stdout.String(); !strings.Contains(got, "Opened this URL in your browser.") {
+		t.Fatalf("stdout missing browser-open confirmation:\n%s", got)
+	}
+}
+
+func TestServeRunDoesNotOpenBrowserByDefault(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	origRunServer := RunServer
+	t.Cleanup(func() {
+		RunServer = origRunServer
+	})
+	RunServer = func(opts server.Options) error {
+		if opts.OnReady != nil {
+			opts.OnReady(nil, nil)
+		}
+		return nil
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:       "127.0.0.1:18080",
+			AdvertiseBaseURL: "http://example.test/base",
+			AccessToken:      "pc-secret",
+		},
+		Sandbox: config.SandboxConfig{Provider: config.DefaultSandboxProvider},
+	}
+	if err := cfg.Save(configPath); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	openedCh := make(chan string, 1)
+	waitedCh := make(chan string, 1)
+	WaitForHealthy = func(rawURL string, _ time.Duration) error {
+		waitedCh <- rawURL
+		return nil
+	}
+	OpenBrowser = func(rawURL string) error {
+		openedCh <- rawURL
+		return nil
+	}
+
+	run := testContext()
+	if err := NewServeCmd().Run(context.Background(), run, nil, command.GlobalOptions{Config: configPath}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	select {
+	case rawURL := <-waitedCh:
+		t.Fatalf("WaitForHealthy called for %q, want no browser startup path", rawURL)
+	default:
+	}
+	select {
+	case rawURL := <-openedCh:
+		t.Fatalf("OpenBrowser called for %q, want suppressed", rawURL)
+	default:
+	}
+	if got := run.Stdout.(*bytes.Buffer).String(); !strings.Contains(got, "CSGClaw IM is available at: http://example.test/base/") {
+		t.Fatalf("stdout missing IM URL:\n%s", got)
+	}
+}
+
+func TestServeRunBrowserFlagOpensBrowser(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	origRunServer := RunServer
+	t.Cleanup(func() {
+		RunServer = origRunServer
+	})
+	RunServer = func(opts server.Options) error {
+		if opts.OnReady != nil {
+			opts.OnReady(nil, nil)
+		}
+		return nil
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:       "127.0.0.1:18080",
+			AdvertiseBaseURL: "http://example.test/base",
+			AccessToken:      "pc-secret",
+		},
+		Sandbox: config.SandboxConfig{Provider: config.DefaultSandboxProvider},
+	}
+	if err := cfg.Save(configPath); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	openedCh := make(chan string, 1)
+	WaitForHealthy = func(string, time.Duration) error { return nil }
+	OpenBrowser = func(rawURL string) error {
+		openedCh <- rawURL
+		return nil
+	}
+
+	run := testContext()
+	if err := NewServeCmd().Run(context.Background(), run, []string{"--browser"}, command.GlobalOptions{Config: configPath}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	select {
+	case got := <-openedCh:
+		if want := "http://example.test/base/"; got != want {
+			t.Fatalf("OpenBrowser() URL = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OpenBrowser was not called with --browser")
+	}
+}
+
+func TestServeForegroundPrintsManualIMURLWhenBrowserNotAllowed(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	readyCh := make(chan struct{}, 1)
+	WaitForHealthy = func(string, time.Duration) error { return nil }
+	OpenBrowser = func(string) error {
+		readyCh <- struct{}{}
+		return fmt.Errorf("not allowed")
+	}
+
+	run := testContext()
+	stdout := newNotifyingBuffer("Open this URL in your browser after startup.")
+	run.Stdout = stdout
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			AdvertiseBaseURL: "http://example.test/base",
+		},
+	}
+	if err := serveForegroundWithConfigPath(context.Background(), run, cfg, "", "table", serveOptions{OpenBrowser: true}); err != nil {
+		t.Fatalf("serveForeground() error = %v", err)
+	}
+	select {
+	case <-readyCh:
+	case <-time.After(time.Second):
+		t.Fatal("OpenBrowser fallback path was not reached after server readiness")
+	}
+	select {
+	case <-stdout.Seen():
+	case <-time.After(time.Second):
+		t.Fatal("manual-open hint was not printed after browser fallback")
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "CSGClaw IM is available at: http://example.test/base/") {
+		t.Fatalf("stdout missing IM URL:\n%s", got)
+	}
+	if !strings.Contains(got, "Open this URL in your browser after startup.") {
+		t.Fatalf("stdout missing manual-open hint:\n%s", got)
+	}
+}
+
+func TestServeForegroundWaitsForHealthyBeforeOpeningBrowser(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	waitStarted := make(chan struct{}, 1)
+	releaseWait := make(chan struct{})
+	openedCh := make(chan struct{}, 1)
+	WaitForHealthy = func(string, time.Duration) error {
+		waitStarted <- struct{}{}
+		<-releaseWait
+		return nil
+	}
+	OpenBrowser = func(string) error {
+		openedCh <- struct{}{}
+		return nil
+	}
+
+	run := testContext()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			AdvertiseBaseURL: "http://example.test/base",
+		},
+	}
+	if err := serveForegroundWithConfigPath(context.Background(), run, cfg, "", "table", serveOptions{OpenBrowser: true}); err != nil {
+		t.Fatalf("serveForeground() error = %v", err)
+	}
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("WaitForHealthy was not called")
+	}
+	select {
+	case <-openedCh:
+		t.Fatal("OpenBrowser called before health check completed")
+	default:
+	}
+	close(releaseWait)
+	select {
+	case <-openedCh:
+	case <-time.After(time.Second):
+		t.Fatal("OpenBrowser was not called after health check completed")
+	}
+}
+
+func TestServeRunRepeatedAutoBootstrapRemainsIdempotent(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	origDetectBootstrapState := DetectBootstrapState
+	origEnsureBootstrapState := EnsureBootstrapState
+	t.Cleanup(func() {
+		DetectBootstrapState = origDetectBootstrapState
+		EnsureBootstrapState = origEnsureBootstrapState
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:  "127.0.0.1:18080",
+			AccessToken: "pc-secret",
+		},
+		Sandbox: config.SandboxConfig{
+			Provider: config.DefaultSandboxProvider,
+		},
+	}
+	if err := cfg.Save(configPath); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	complete := false
+	ensureCalls := 0
+	DetectBootstrapState = func(opts internalonboard.DetectStateOptions) (internalonboard.DetectStateResult, error) {
+		if opts.ConfigPath != configPath {
+			t.Fatalf("DetectStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		return internalonboard.DetectStateResult{
+			ConfigPath:                 configPath,
+			ConfigExists:               true,
+			ConfigComplete:             complete,
+			IMBootstrapComplete:        complete,
+			ManagerAgentComplete:       complete,
+			AdminParticipantComplete:   complete,
+			ManagerParticipantComplete: complete,
+		}, nil
+	}
+	EnsureBootstrapState = func(_ context.Context, opts internalonboard.EnsureStateOptions) (internalonboard.EnsureStateResult, error) {
+		ensureCalls++
+		if opts.ConfigPath != configPath {
+			t.Fatalf("EnsureStateOptions.ConfigPath = %q, want %q", opts.ConfigPath, configPath)
+		}
+		complete = true
+		return internalonboard.EnsureStateResult{ConfigPath: configPath, Config: cfg}, nil
+	}
+
+	run1 := testContext()
+	if err := NewServeCmd().Run(context.Background(), run1, nil, command.GlobalOptions{Config: configPath}); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	run2 := testContext()
+	if err := NewServeCmd().Run(context.Background(), run2, nil, command.GlobalOptions{Config: configPath}); err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+
+	if ensureCalls != 1 {
+		t.Fatalf("EnsureBootstrapState calls = %d, want 1 across repeated serve runs", ensureCalls)
+	}
+	if got := run1.Stderr.(*bytes.Buffer).String(); !strings.Contains(got, "auto-initializing local state") {
+		t.Fatalf("first stderr missing auto-bootstrap log:\n%s", got)
+	}
+	if got := run2.Stderr.(*bytes.Buffer).String(); strings.Contains(got, "auto-initializing local state") {
+		t.Fatalf("second stderr should not contain auto-bootstrap log:\n%s", got)
+	}
+}
+
+func TestServeForegroundPassesContextToServer(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	origRunServer := RunServer
+	origNewAgentService := NewAgentService
+	origNewIMService := NewIMService
+	origNewFeishuService := NewFeishuService
+	origNewLLMService := NewLLMService
+	origEnsureBootstrapManager := EnsureBootstrapManager
+	origStartConfiguredAgents := StartConfiguredAgents
+	origEnsureCLIProxy := EnsureCLIProxy
+	origShutdownCLIProxy := ShutdownCLIProxy
+	t.Cleanup(func() {
+		RunServer = origRunServer
+		NewAgentService = origNewAgentService
+		NewIMService = origNewIMService
+		NewFeishuService = origNewFeishuService
+		NewLLMService = origNewLLMService
+		EnsureBootstrapManager = origEnsureBootstrapManager
+		StartConfiguredAgents = origStartConfiguredAgents
+		EnsureCLIProxy = origEnsureCLIProxy
+		ShutdownCLIProxy = origShutdownCLIProxy
+	})
+
+	ctx := context.WithValue(context.Background(), struct{}{}, "serve-context")
+	svc := &agent.Controller{}
+
+	NewAgentService = func(config.Config, feishu.AgentCredentialProvider) (*agent.Controller, error) {
+		return svc, nil
+	}
+	NewIMService = func(*im.Bus) (*im.Service, error) {
+		return nil, nil
+	}
+	NewFeishuService = func(provider feishu.Provider) (*feishu.Service, error) {
+		if provider == nil {
+			return nil, fmt.Errorf("provider = nil, want configured provider")
+		}
+		return feishu.NewServiceWithProvider(provider), nil
+	}
+	NewLLMService = func(config.Config, *agent.Controller) (*llm.Service, error) {
+		return nil, nil
+	}
+	EnsureCLIProxy = func(context.Context) error { return nil }
+	ShutdownCLIProxy = func(context.Context) error { return nil }
+
+	called := false
+	startCalled := make(chan struct{})
+	releaseStart := make(chan struct{})
+	startReturned := make(chan struct{})
+	startErrors := make(chan string, 6)
+	EnsureBootstrapManager = func(gotCtx context.Context, gotService *agent.Controller) error {
+		if gotCtx != ctx {
+			startErrors <- fmt.Sprintf("EnsureBootstrapManager context = %v, want %v", gotCtx, ctx)
+		}
+		if gotService == nil {
+			startErrors <- "EnsureBootstrapManager service = nil"
+		}
+		return nil
+	}
+	StartConfiguredAgents = func(gotCtx context.Context, gotService *agent.Controller) error {
+		defer close(startReturned)
+		if gotCtx != ctx {
+			startErrors <- fmt.Sprintf("StartConfiguredAgents context = %v, want %v", gotCtx, ctx)
+		}
+		if gotService == nil {
+			startErrors <- "StartConfiguredAgents service = nil"
+		}
+		close(startCalled)
+		<-releaseStart
+		return nil
+	}
+	RunServer = func(opts server.Options) error {
+		called = true
+		if opts.Context != ctx {
+			return fmt.Errorf("Context = %v, want %v", opts.Context, ctx)
+		}
+		if !opts.NoAuth {
+			return fmt.Errorf("NoAuth = false, want true")
+		}
+		if opts.Upgrade == nil {
+			return fmt.Errorf("Upgrade = nil, want configured manager")
+		}
+		if opts.MCP == nil {
+			return fmt.Errorf("MCP = nil, want configured service")
+		}
+		if opts.OnReady == nil {
+			return fmt.Errorf("OnReady is nil")
+		}
+		go opts.OnReady(nil, nil)
+		return nil
+	}
+	releasedStart := false
+	releaseConfiguredAgentStart := func() {
+		if !releasedStart {
+			close(releaseStart)
+			releasedStart = true
+		}
+	}
+
+	run := testContext()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:       "127.0.0.1:18080",
+			AdvertiseBaseURL: "http://example.test",
+			AccessToken:      "pc-secret",
+			NoAuth:           true,
+			ShowUpgrade:      true,
+		},
+		Model: config.ModelConfig{
+			Provider: "llm-api",
+			BaseURL:  "http://llm.test",
+			APIKey:   "sk-secret",
+			ModelID:  "model-test",
+		},
+		Models: config.SingleProfileLLM(config.ModelConfig{
+			BaseURL: "http://llm.test",
+			APIKey:  "sk-secret",
+			ModelID: "model-test",
+		}),
+		Bootstrap: config.BootstrapConfig{
+			DefaultManagerTemplate: "builtin.manager-codex",
+			DefaultWorkerTemplate:  "builtin.picoclaw-worker",
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- serveForeground(ctx, run, cfg, "table")
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			releaseConfiguredAgentStart()
+			t.Fatalf("serveForeground() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		releaseConfiguredAgentStart()
+		t.Fatal("serveForeground blocked on StartConfiguredAgents; want async agent startup")
+	}
+	select {
+	case <-startCalled:
+	case <-time.After(time.Second):
+		releaseConfiguredAgentStart()
+		t.Fatal("StartConfiguredAgents was not called")
+	}
+	releaseConfiguredAgentStart()
+	select {
+	case <-startReturned:
+	case <-time.After(time.Second):
+		t.Fatal("StartConfiguredAgents did not return after release")
+	}
+	close(startErrors)
+	for msg := range startErrors {
+		t.Error(msg)
+	}
+	if !called {
+		t.Fatal("RunServer was not called")
+	}
+
+	got := run.Stdout.(*bytes.Buffer).String()
+	for _, want := range []string{
+		"effective config:\n",
+		`listen_addr = "127.0.0.1:18080"`,
+		`advertise_base_url = "http://example.test"`,
+		`access_token = "pc*****et"`,
+		`no_auth = true`,
+		`show_upgrade = true`,
+		`[sandbox]`,
+		fmt.Sprintf(`provider = %q`, config.DockerProvider),
+		`debian_registries_override = []`,
+		"CSGClaw IM is available at: http://example.test/",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "[channels.feishu") {
+		t.Fatalf("stdout included Feishu channel config:\n%s", got)
+	}
+	if strings.Contains(got, "sk-secret") {
+		t.Fatalf("stdout leaked model API key:\n%s", got)
+	}
+	if strings.Contains(got, "pc-secret") {
+		t.Fatalf("stdout leaked server access token:\n%s", got)
+	}
+	if strings.Contains(got, "manager-secret") {
+		t.Fatalf("stdout leaked feishu app secret:\n%s", got)
+	}
+}
+
+func TestStartServerWithConfigPathLoadsPersistedUpgradeFailure(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	origRunServer := RunServer
+	t.Cleanup(func() {
+		RunServer = origRunServer
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	artifacts, err := upgrade.ResolveApplyArtifacts(configPath)
+	if err != nil {
+		t.Fatalf("ResolveApplyArtifacts() error = %v", err)
+	}
+	if err := artifacts.RecordFailure(errors.New("restart daemon: boom")); err != nil {
+		t.Fatalf("RecordFailure() error = %v", err)
+	}
+
+	RunServer = func(opts server.Options) error {
+		if opts.Upgrade == nil {
+			return errors.New("Upgrade = nil, want configured manager")
+		}
+		status := opts.Upgrade.Status()
+		if !strings.Contains(status.LastError, "restart daemon: boom") {
+			return fmt.Errorf("LastError = %q, want persisted failure", status.LastError)
+		}
+		if status.LastErrorLogPath != artifacts.LogPath {
+			return fmt.Errorf("LastErrorLogPath = %q, want %q", status.LastErrorLogPath, artifacts.LogPath)
+		}
+		return nil
+	}
+
+	run := testContext()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:  "127.0.0.1:18080",
+			AccessToken: "pc-secret",
+		},
+		Sandbox: config.SandboxConfig{
+			Provider: config.DefaultSandboxProvider,
+		},
+	}
+
+	if err := startServerWithConfigPath(context.Background(), run, cfg, nil, nil, nil, nil, configPath, "table"); err != nil {
+		t.Fatalf("startServerWithConfigPath() error = %v", err)
+	}
+	if _, err := os.Stat(artifacts.StatusPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("status file still exists after startup; stat err = %v", err)
+	}
+}
+
+func TestConfigureServeLoggerRejectsUnsupportedLevel(t *testing.T) {
+	_, err := configureServeLogger(&bytes.Buffer{}, "trace")
+	if err == nil {
+		t.Fatal("configureServeLogger() error = nil, want unsupported-level error")
+	}
+	if !strings.Contains(err.Error(), `unsupported log level "trace"`) {
+		t.Fatalf("configureServeLogger() error = %q, want unsupported-level error", err)
+	}
+}
+
+func TestConfigureServeLoggerSetsDebugLevel(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+	})
+
+	restore, err := configureServeLogger(&bytes.Buffer{}, "debug")
+	if err != nil {
+		t.Fatalf("configureServeLogger() error = %v", err)
+	}
+	defer restore()
+
+	if !slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		t.Fatal("default logger debug level is disabled, want enabled")
+	}
+}
+
+func TestServeForegroundStartsConfiguredAgentsOnReady(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	started := make(chan struct{})
+	StartConfiguredAgents = func(context.Context, *agent.Controller) error {
+		close(started)
+		return nil
+	}
+	RunServer = func(opts server.Options) error {
+		if opts.OnReady == nil {
+			return fmt.Errorf("OnReady is nil")
+		}
+		opts.OnReady(nil, nil)
+		return nil
+	}
+
+	if err := serveForeground(context.Background(), testContext(), config.Config{Server: config.ServerConfig{ListenAddr: "127.0.0.1:18080"}}, "json"); err != nil {
+		t.Fatalf("serveForeground() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("StartConfiguredAgents was not called from OnReady")
+	}
+}
+
+func TestServeForegroundEnsuresBootstrapManagerBeforeConfiguredAgents(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	calls := make(chan string, 2)
+	EnsureBootstrapManager = func(context.Context, *agent.Controller) error {
+		calls <- "manager"
+		return nil
+	}
+	StartConfiguredAgents = func(context.Context, *agent.Controller) error {
+		calls <- "configured-agents"
+		return nil
+	}
+	RunServer = func(opts server.Options) error {
+		if opts.OnReady == nil {
+			return fmt.Errorf("OnReady is nil")
+		}
+		opts.OnReady(nil, nil)
+		return nil
+	}
+
+	if err := serveForeground(context.Background(), testContext(), config.Config{Server: config.ServerConfig{ListenAddr: "127.0.0.1:18080"}}, "json"); err != nil {
+		t.Fatalf("serveForeground() error = %v", err)
+	}
+	got := make([]string, 0, 2)
+	for len(got) < 2 {
+		select {
+		case call := <-calls:
+			got = append(got, call)
+		case <-time.After(time.Second):
+			t.Fatalf("startup calls = %v, want manager before configured-agents", got)
+		}
+	}
+	if want := []string{"manager", "configured-agents"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("startup calls = %v, want %v", got, want)
+	}
+}
+
+func TestServeForegroundPassesConfigPathToServer(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	var gotConfigPath string
+	RunServer = func(opts server.Options) error {
+		gotConfigPath = opts.ConfigPath
+		return nil
+	}
+
+	if err := serveForegroundWithConfigPath(context.Background(), testContext(), config.Config{
+		Server: config.ServerConfig{ListenAddr: "127.0.0.1:18080"},
+	}, "/tmp/csgclaw.toml", "json"); err != nil {
+		t.Fatalf("serveForegroundWithConfigPath() error = %v", err)
+	}
+
+	if gotConfigPath != "/tmp/csgclaw.toml" {
+		t.Fatalf("RunServer config path = %q, want %q", gotConfigPath, "/tmp/csgclaw.toml")
+	}
+}
+
+func TestServeForegroundSharesOneAgentEngineWithFeishuBindings(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	started := make(chan struct{})
+	closed := make(chan struct{})
+	manager := &fakeFeishuBindingManager{
+		start: func(context.Context) error {
+			close(started)
+			return nil
+		},
+		close: func() { close(closed) },
+	}
+	var bindingEngine agentengine.Interface
+	NewFeishuBindingManager = func(_ *feishu.Service, engine agentengine.Interface) (feishuBindingManager, error) {
+		bindingEngine = engine
+		return manager, nil
+	}
+	var serverEngine agentengine.Interface
+	RunServer = func(opts server.Options) error {
+		serverEngine = opts.AgentEngine
+		if opts.OnReady == nil {
+			return fmt.Errorf("OnReady is nil")
+		}
+		opts.OnReady(nil, nil)
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			return fmt.Errorf("Feishu binding manager did not start")
+		}
+		return nil
+	}
+
+	if err := serveForeground(context.Background(), testContext(), config.Config{Server: config.ServerConfig{ListenAddr: "127.0.0.1:18080"}}, "json"); err != nil {
+		t.Fatal(err)
+	}
+	if bindingEngine == nil || bindingEngine != serverEngine {
+		t.Fatalf("Feishu Engine = %p, server Engine = %p; want the same instance", bindingEngine, serverEngine)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Feishu binding manager was not closed")
+	}
+}
+
+func TestServeForegroundUsesSingleBuiltInIMAdapterSource(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+
+	started := make(chan struct{})
+	closed := make(chan struct{})
+	handled := make(chan im.ParticipantEvent, 2)
+	var sourceBridge *im.ParticipantBridge
+	var cancelSubscription func()
+	NewCSGClawAdapterSource = func(
+		engine *agentengine.Engine,
+		_ *agent.Controller, _ *im.Service,
+		_ *im.Bus,
+		_ *participant.Service,
+		workReporter worklease.ParticipantWorkReporter,
+		bridge *im.ParticipantBridge,
+		_ *csgclawinteraction.Coordinator,
+	) (csgclawAdapterSource, error) {
+		if engine == nil || workReporter == nil || bridge == nil {
+			t.Fatal("built-in IM adapter dependencies were not assembled")
+		}
+		sourceBridge = bridge
+		return &fakeCSGClawAdapterSource{
+			start: func(context.Context) error {
+				events, cancel := bridge.Subscribe("manager")
+				cancelSubscription = cancel
+				go func() {
+					if event, ok := <-events; ok {
+						handled <- event
+					}
+				}()
+				close(started)
+				return nil
+			},
+			close: func() {
+				if cancelSubscription != nil {
+					cancelSubscription()
+				}
+				close(closed)
+			},
+		}, nil
+	}
+	RunServer = func(opts server.Options) error {
+		if opts.ParticipantBridge != sourceBridge {
+			return fmt.Errorf("server and built-in IM adapter use different participant bridges")
+		}
+		if got := opts.ParticipantBridge.SubscriberCount("manager"); got != 1 {
+			return fmt.Errorf("manager participant subscribers = %d, want exactly 1", got)
+		}
+		room := im.Room{ID: "room-1", IsDirect: true, Members: []string{"user-admin", "manager"}}
+		sender := im.User{ID: "user-admin", Name: "admin"}
+		message := im.Message{ID: "message-1", SenderID: sender.ID, Content: "hello"}
+		if ok := opts.ParticipantBridge.EnqueueMessageEvent(room, sender, message, "manager"); !ok {
+			return fmt.Errorf("message was not delivered to built-in IM adapter")
+		}
+		select {
+		case event := <-handled:
+			if event.MessageID != message.ID {
+				return fmt.Errorf("handled message = %q, want %q", event.MessageID, message.ID)
+			}
+		case <-time.After(time.Second):
+			return fmt.Errorf("built-in IM adapter did not handle message")
+		}
+		select {
+		case event := <-handled:
+			return fmt.Errorf("message was handled more than once: %q", event.MessageID)
+		case <-time.After(20 * time.Millisecond):
+		}
+		return nil
+	}
+
+	if err := serveForeground(context.Background(), testContext(), config.Config{
+		Server: config.ServerConfig{ListenAddr: "127.0.0.1:18080"},
+	}, "json"); err != nil {
+		t.Fatalf("serveForeground() error = %v", err)
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("built-in IM adapter source was not started")
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("built-in IM adapter source was not closed")
+	}
+}
+
+func TestChannelBindingCoordinatorRoutesToChannelOwner(t *testing.T) {
+	t.Parallel()
+
+	var csgclawCalls, feishuCalls int
+	csgclawSource := &fakeCSGClawAdapterSource{reconcile: func(context.Context) error {
+		csgclawCalls++
+		return nil
+	}}
+	feishuManager := &fakeFeishuBindingManager{reconcile: func(context.Context) error {
+		feishuCalls++
+		return nil
+	}}
+	activator := newChannelBindingCoordinator(csgclawSource, feishuManager)
+	target := agent.Agent{ID: "agent-1"}
+	if err := activator.RefreshAgentChannel(context.Background(), target, " CSGCLAW "); err != nil {
+		t.Fatalf("refresh csgclaw: %v", err)
+	}
+	if err := activator.RefreshAgentChannel(context.Background(), target, " FEISHU "); err != nil {
+		t.Fatalf("refresh feishu: %v", err)
+	}
+	if csgclawCalls != 1 || feishuCalls != 1 {
+		t.Fatalf("refresh calls = (csgclaw=%d, feishu=%d), want (1, 1)", csgclawCalls, feishuCalls)
+	}
+	if err := activator.RefreshAgentChannel(context.Background(), target, "unknown"); err == nil {
+		t.Fatal("refresh unknown channel succeeded")
+	}
+	feishuOnly := newChannelBindingCoordinator(nil, feishuManager)
+	if err := feishuOnly.RefreshAgentChannel(context.Background(), target, csgclawchannel.ChannelID); err == nil {
+		t.Fatal("refresh without csgclaw manager succeeded")
+	}
+}
+
+func TestServeForegroundPreservesBootstrapDefaultTemplates(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	origEnsureCLIProxy, origShutdownCLIProxy := EnsureCLIProxy, ShutdownCLIProxy
+	EnsureCLIProxy = func(context.Context) error { return nil }
+	ShutdownCLIProxy = func(context.Context) error { return nil }
+	t.Cleanup(func() { EnsureCLIProxy, ShutdownCLIProxy = origEnsureCLIProxy, origShutdownCLIProxy })
+	origRunServer := RunServer
+	origNewAgentService := NewAgentService
+	origEnsureBootstrapManager := EnsureBootstrapManager
+	origStartConfiguredAgents := StartConfiguredAgents
+	t.Cleanup(func() {
+		RunServer = origRunServer
+		NewAgentService = origNewAgentService
+		EnsureBootstrapManager = origEnsureBootstrapManager
+		StartConfiguredAgents = origStartConfiguredAgents
+	})
+	RunServer = func(opts server.Options) error {
+		if opts.OnReady != nil {
+			go opts.OnReady(nil, nil)
+		}
+		return nil
+	}
+	EnsureBootstrapManager = func(context.Context, *agent.Controller) error { return nil }
+	StartConfiguredAgents = func(context.Context, *agent.Controller) error { return nil }
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:  "127.0.0.1:18080",
+			AccessToken: "pc-secret",
+		},
+		Models: config.SingleProfileLLM(config.ModelConfig{
+			BaseURL: "http://llm.test",
+			APIKey:  "sk-secret",
+			ModelID: "model-test",
+		}),
+		Bootstrap: config.BootstrapConfig{
+			DefaultManagerTemplate: "local.review-manager",
+			DefaultWorkerTemplate:  "local.review-worker",
+		},
+	}
+	NewAgentService = func(got config.Config, _ feishu.AgentCredentialProvider) (*agent.Controller, error) {
+		if got.Bootstrap.DefaultManagerTemplate != "local.review-manager" {
+			t.Fatalf("default manager template = %q, want preserved template", got.Bootstrap.DefaultManagerTemplate)
+		}
+		if got.Bootstrap.DefaultWorkerTemplate != "local.review-worker" {
+			t.Fatalf("default worker template = %q, want preserved template", got.Bootstrap.DefaultWorkerTemplate)
+		}
+		return &agent.Controller{}, nil
+	}
+
+	if err := serveForeground(context.Background(), testContext(), cfg, "json"); err != nil {
+		t.Fatalf("serveForeground() error = %v", err)
+	}
+}
+
+func TestFormatEffectiveConfigPrintsExpandedMaskedEnvValues(t *testing.T) {
+	t.Setenv("PORT", "18080")
+	t.Setenv("IP", "1.2.3.4")
+	t.Setenv("ACCESS_TOKEN", "pc-env-secret")
+	t.Setenv("MODEL_SELECTOR", "remote.gpt-env")
+	t.Setenv("MODEL_BASE_HOST", "models.example.test")
+	t.Setenv("MODEL_API_KEY", "sk-env-secret")
+	t.Setenv("MODEL_ID", "gpt-env")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `[server]
+listen_addr = "0.0.0.0:${PORT}"
+advertise_base_url = "http://${IP}:${PORT}"
+access_token = "${ACCESS_TOKEN}"
+no_auth = true
+
+[models]
+default = "${MODEL_SELECTOR}"
+
+[models.providers.remote]
+base_url = "https://${MODEL_BASE_HOST}/v1"
+api_key = "${MODEL_API_KEY}"
+models = ["${MODEL_ID}"]
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	got := formatEffectiveConfig(cfg)
+	for _, want := range []string{
+		`listen_addr = "0.0.0.0:18080"`,
+		`advertise_base_url = "http://1.2.3.4:18080"`,
+		`access_token = "pc*********et"`,
+		`no_auth = true`,
+		`default_manager_template = "builtin.manager-codex"`,
+		`default_worker_template = "builtin.openclaw-worker"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("effective config missing %q:\n%s", want, got)
+		}
+	}
+	for _, leaked := range []string{
+		"${PORT}",
+		"${ACCESS_TOKEN}",
+		"${MODEL_API_KEY}",
+		"pc-env-secret",
+		"sk-env-secret",
+	} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("effective config leaked %q:\n%s", leaked, got)
+		}
+	}
+}
+
+func TestLoadConfigRewritesLegacyBootstrapTemplateRefs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `[server]
+listen_addr = "127.0.0.1:18080"
+
+[bootstrap]
+default_manager_template = "builtin/picoclaw-manager"
+default_worker_template = "builtin/picoclaw-worker"
+
+[models]
+default = "default.gpt-test"
+
+[models.providers.default]
+base_url = "http://127.0.0.1:4000"
+api_key = "sk"
+models = ["gpt-test"]
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+	if got, want := cfg.Bootstrap.DefaultManagerTemplate, "builtin.manager-codex"; got != want {
+		t.Fatalf("cfg.Bootstrap.DefaultManagerTemplate = %q, want %q", got, want)
+	}
+	if got, want := cfg.Bootstrap.DefaultWorkerTemplate, "builtin.openclaw-worker"; got != want {
+		t.Fatalf("cfg.Bootstrap.DefaultWorkerTemplate = %q, want %q", got, want)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	saved := string(data)
+	for _, want := range []string{
+		`default_manager_template = "builtin.manager-codex"`,
+		`default_worker_template = "builtin.openclaw-worker"`,
+	} {
+		if !strings.Contains(saved, want) {
+			t.Fatalf("saved config missing %q:\n%s", want, saved)
+		}
+	}
+}
+
+func TestLoadConfigCreatesBackupBeforeMigrationRewrite(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".csgclaw")
+	path := filepath.Join(root, "config.toml")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	original := `[server]
+listen_addr = "127.0.0.1:18080"
+
+[bootstrap]
+default_manager_template = "builtin/picoclaw-manager"
+default_worker_template = "builtin/picoclaw-worker"
+
+[models]
+default = "default.gpt-test"
+
+[models.providers.default]
+base_url = "http://127.0.0.1:4000"
+api_key = "sk"
+models = ["gpt-test"]
+`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := loadConfig(path); err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	}
+
+	backups := findStoreBackups(t, home)
+	if len(backups) != 1 {
+		t.Fatalf("backup count = %d, want 1; entries = %#v", len(backups), backups)
+	}
+	backupConfig, err := os.ReadFile(filepath.Join(home, backups[0], "config.toml"))
+	if err != nil {
+		t.Fatalf("read backup config: %v", err)
+	}
+	if string(backupConfig) != original {
+		t.Fatalf("backup config was not the original config:\n%s", string(backupConfig))
+	}
+}
+
+func TestFormatEffectiveConfigFormatsSectionsWithoutExtraWhitespace(t *testing.T) {
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:       "0.0.0.0:18080",
+			AdvertiseBaseURL: "http://192.168.2.52:18080",
+			AccessToken:      "your_access_token",
+			NoAuth:           true,
+			ShowUpgrade:      true,
+		},
+		Models: config.SingleProfileLLM(config.ModelConfig{
+			BaseURL: "http://127.0.0.1:4000",
+			APIKey:  "sk-secret",
+			ModelID: "local.minimax-m2.5",
+		}),
+		Bootstrap: config.BootstrapConfig{
+			DefaultManagerTemplate: "builtin.manager-codex",
+			DefaultWorkerTemplate:  "builtin.openclaw-worker",
+		},
+		Sandbox: config.SandboxConfig{
+			Provider: config.BoxLiteProvider,
+		},
+		Hub: config.HubConfig{
+			DefaultRegistry:        "builtin",
+			DefaultPublishRegistry: "local",
+			Registries: []config.HubRegistryConfig{
+				{
+					Name:    "team",
+					Kind:    "remote",
+					URL:     "https://hub.example.com",
+					Token:   "hub-secret",
+					Enabled: true,
+				},
+				{
+					Name:    "local",
+					Kind:    "local",
+					Path:    "/tmp/hub",
+					Enabled: false,
+				},
+			},
+		},
+	}
+
+	want := `[server]
+listen_addr = "0.0.0.0:18080"
+advertise_base_url = "http://192.168.2.52:18080"
+access_token = "yo*************en"
+no_auth = true
+show_upgrade = true
+
+[bootstrap]
+default_manager_template = "builtin.manager-codex"
+default_worker_template = "builtin.openclaw-worker"
+
+[sandbox]
+provider = "boxlite"
+# using default debian registries: ["harbor.opencsg.com", "docker.io"]
+debian_registries_override = []
+
+[hub]
+default_registry = "builtin"
+default_publish_registry = "local"
+
+[[hub.registries]]
+name = "builtin"
+kind = "builtin"
+enabled = true
+
+[[hub.registries]]
+name = "local"
+kind = "local"
+path = "/tmp/hub"
+enabled = false
+`
+	if got := formatEffectiveConfig(cfg); got != want {
+		t.Fatalf("formatEffectiveConfig() mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func findStoreBackups(t *testing.T, parent string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	var backups []string
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), ".csgclaw_backup_") {
+			backups = append(backups, entry.Name())
+		}
+	}
+	return backups
+}
+
+func TestFormatEffectiveConfigIncludesDefaultHubRegistriesWhenOmitted(t *testing.T) {
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:       "127.0.0.1:18080",
+			AdvertiseBaseURL: "http://127.0.0.1:18080",
+			AccessToken:      "your_access_token",
+			ShowUpgrade:      true,
+		},
+		Bootstrap: config.BootstrapConfig{
+			DefaultManagerTemplate: "builtin.manager-codex",
+			DefaultWorkerTemplate:  "builtin.picoclaw-worker",
+		},
+		Sandbox: config.SandboxConfig{
+			Provider: config.BoxLiteProvider,
+		},
+		Hub: config.HubConfig{
+			DefaultRegistry:        "builtin",
+			DefaultPublishRegistry: "local",
+		},
+	}
+
+	got := formatEffectiveConfig(cfg)
+	for _, want := range []string{
+		`[[hub.registries]]`,
+		`name = "builtin"`,
+		`kind = "builtin"`,
+		`name = "local"`,
+		`kind = "local"`,
+		`enabled = true`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatEffectiveConfig() missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestSandboxServiceOptionsSupportsConfiguredProvider(t *testing.T) {
+	restoreBoxLite := stubBoxLiteAvailable(t)
+	defer restoreBoxLite()
+
+	opts, err := sandboxServiceOptions(config.SandboxConfig{
+		Provider:                 config.BoxLiteProvider,
+		DebianRegistriesOverride: []string{"registry.a"},
+	})
+	if err != nil {
+		t.Fatalf("sandboxServiceOptions() error = %v", err)
+	}
+	if len(opts) != 1 {
+		t.Fatalf("len(opts) = %d, want 1", len(opts))
+	}
+}
+
+func TestNewAgentServiceRejectsUnsupportedSandboxProvider(t *testing.T) {
+	_, err := newAgentService(config.Config{
+		Sandbox: config.SandboxConfig{
+			Provider: "not-a-sandbox-backend",
+		},
+	}, nil)
+	if err == nil {
+		t.Fatal("newAgentService() error = nil, want unsupported sandbox provider")
+	}
+	if !strings.Contains(err.Error(), `unsupported sandbox provider "not-a-sandbox-backend"`) {
+		t.Fatalf("newAgentService() error = %q, want unsupported sandbox provider", err)
+	}
+}
+
+func TestNewAgentServiceAllowsMissingConfiguredBoxLiteAtStartup(t *testing.T) {
+	prevLookPath := sandboxprovidersTestOnlyLookPath(t, func(string) (string, error) {
+		return "", fmt.Errorf("not found")
+	})
+	defer prevLookPath()
+
+	prevStatPath := sandboxprovidersTestOnlyStatPath(t, func(string) (os.FileInfo, error) {
+		return nil, os.ErrNotExist
+	})
+	defer prevStatPath()
+
+	t.Setenv("HOME", t.TempDir())
+
+	svc, err := newAgentService(config.Config{
+		Sandbox: config.SandboxConfig{
+			Provider: config.BoxLiteProvider,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("newAgentService() error = %v, want host-only startup to succeed", err)
+	}
+	defer svc.Close()
+}
+
+func TestNewAgentServiceAllowsMissingConfiguredDockerAtStartup(t *testing.T) {
+	prevLookPath := sandboxprovidersTestOnlyLookPath(t, func(string) (string, error) {
+		return "", fmt.Errorf("not found")
+	})
+	defer prevLookPath()
+
+	prevStatPath := sandboxprovidersTestOnlyStatPath(t, func(string) (os.FileInfo, error) {
+		return nil, os.ErrNotExist
+	})
+	defer prevStatPath()
+	t.Setenv("HOME", t.TempDir())
+
+	svc, err := newAgentService(config.Config{
+		Sandbox: config.SandboxConfig{
+			Provider: config.DockerProvider,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("newAgentService() error = %v, want host-only startup to succeed", err)
+	}
+	defer svc.Close()
+}
+
+func TestNewAgentServiceRegistersCodexRuntime(t *testing.T) {
+	restoreBoxLite := stubBoxLiteAvailable(t)
+	defer restoreBoxLite()
+	t.Setenv("HOME", t.TempDir())
+
+	svc, err := newAgentService(config.Config{
+		Sandbox: config.SandboxConfig{
+			Provider: config.BoxLiteProvider,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("newAgentService() error = %v", err)
+	}
+	if _, err := svc.Runtime(agentruntime.KindCodex); err != nil {
+		t.Fatalf("svc.Runtime(codex) error = %v", err)
+	}
+}
+
+func csgHubLiteServeConfig(baseURL string) config.Config {
+	return config.Config{
+		Server: config.ServerConfig{
+			ListenAddr:  "127.0.0.1:18080",
+			AccessToken: "pc-secret",
+			ShowUpgrade: true,
+		},
+		Models: config.LLMConfig{
+			Default:        "csghub-lite.Qwen/Qwen3-0.6B-GGUF",
+			DefaultProfile: "csghub-lite.Qwen/Qwen3-0.6B-GGUF",
+			Providers: map[string]config.ProviderConfig{
+				"csghub-lite": {
+					BaseURL: baseURL,
+					APIKey:  "local",
+					Models:  []string{"Qwen/Qwen3-0.6B-GGUF"},
+				},
+			},
+		},
+		Bootstrap: config.BootstrapConfig{
+			DefaultManagerTemplate: "builtin.manager-codex",
+			DefaultWorkerTemplate:  "builtin.picoclaw-worker",
+		},
+	}
+}
+
+func sandboxprovidersTestOnlyLookPath(t *testing.T, fn func(string) (string, error)) func() {
+	t.Helper()
+	prev := sandboxproviders.LookPathForTest(fn)
+	return prev
+}
+
+func sandboxprovidersTestOnlyStatPath(t *testing.T, fn func(string) (os.FileInfo, error)) func() {
+	t.Helper()
+	prev := sandboxproviders.StatPathForTest(fn)
+	return prev
+}
+
+func stubBoxLiteAvailable(t *testing.T) func() {
+	t.Helper()
+	boxlitePath := filepath.Join(t.TempDir(), "boxlite")
+	if err := os.WriteFile(boxlitePath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(boxlite) error = %v", err)
+	}
+	return sandboxprovidersTestOnlyLookPath(t, func(name string) (string, error) {
+		if name == "boxlite" {
+			return boxlitePath, nil
+		}
+		return "", fmt.Errorf("not found")
+	})
+}
+
+func stubServeDependencies(t *testing.T) func() {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	origRunServer := RunServer
+	origNewAgentService := NewAgentService
+	origNewIMService := NewIMService
+	origNewFeishuService := NewFeishuService
+	origNewLLMService := NewLLMService
+	origEnsureBootstrapManager := EnsureBootstrapManager
+	origStartConfiguredAgents := StartConfiguredAgents
+	origStopRunningSandboxAgents := StopRunningSandboxAgents
+	origNewFeishuBindingManager := NewFeishuBindingManager
+	origNewCSGClawAdapterSource := NewCSGClawAdapterSource
+	origEnsureCLIProxy := EnsureCLIProxy
+	origShutdownCLIProxy := ShutdownCLIProxy
+	origDetectBootstrapState := DetectBootstrapState
+	origEnsureBootstrapState := EnsureBootstrapState
+	origCheckModelProvider := CheckModelProvider
+	origCheckCatalogModelProvider := CheckCatalogModelProvider
+	origOpenBrowser := OpenBrowser
+	origWaitForHealthy := WaitForHealthy
+	RunServer = func(opts server.Options) error {
+		if opts.OnReady != nil {
+			// The real server invokes OnReady before RunServer returns. Keep the
+			// stub's lifetime ordering faithful so dependency restoration cannot
+			// race with values captured by OnReady's background work.
+			opts.OnReady(nil, nil)
+		}
+		return nil
+	}
+	NewAgentService = func(config.Config, feishu.AgentCredentialProvider) (*agent.Controller, error) {
+		return &agent.Controller{}, nil
+	}
+	NewIMService = func(*im.Bus) (*im.Service, error) { return nil, nil }
+	NewFeishuService = func(feishu.Provider) (*feishu.Service, error) { return nil, nil }
+	NewLLMService = func(config.Config, *agent.Controller) (*llm.Service, error) { return nil, nil }
+	EnsureBootstrapManager = func(context.Context, *agent.Controller) error { return nil }
+	StartConfiguredAgents = func(context.Context, *agent.Controller) error { return nil }
+	StopRunningSandboxAgents = func(context.Context, *agent.Controller) error { return nil }
+	NewFeishuBindingManager = func(*feishu.Service, agentengine.Interface) (feishuBindingManager, error) {
+		return nil, nil
+	}
+	NewCSGClawAdapterSource = func(*agentengine.Engine, *agent.Controller, *im.Service, *im.Bus, *participant.Service, worklease.ParticipantWorkReporter, *im.ParticipantBridge, *csgclawinteraction.Coordinator) (csgclawAdapterSource, error) {
+		return nil, nil
+	}
+	EnsureCLIProxy = func(context.Context) error { return nil }
+	ShutdownCLIProxy = func(context.Context) error { return nil }
+	CheckModelProvider = checkModelProvider
+	CheckCatalogModelProvider = func(context.Context, agent.ModelProviderCheckInput) agent.ModelProviderCheckResult {
+		return agent.ModelProviderCheckResult{Status: agent.ModelProviderStatusFailed}
+	}
+	OpenBrowser = func(string) error { return nil }
+	WaitForHealthy = func(string, time.Duration) error { return nil }
+	DetectBootstrapState = func(internalonboard.DetectStateOptions) (internalonboard.DetectStateResult, error) {
+		return internalonboard.DetectStateResult{
+			ConfigExists:               true,
+			ConfigComplete:             true,
+			IMBootstrapComplete:        true,
+			ManagerAgentComplete:       true,
+			AdminParticipantComplete:   true,
+			ManagerParticipantComplete: true,
+		}, nil
+	}
+	EnsureBootstrapState = internalonboard.EnsureState
+	return func() {
+		RunServer = origRunServer
+		NewAgentService = origNewAgentService
+		NewIMService = origNewIMService
+		NewFeishuService = origNewFeishuService
+		NewLLMService = origNewLLMService
+		EnsureBootstrapManager = origEnsureBootstrapManager
+		StartConfiguredAgents = origStartConfiguredAgents
+		StopRunningSandboxAgents = origStopRunningSandboxAgents
+		NewFeishuBindingManager = origNewFeishuBindingManager
+		NewCSGClawAdapterSource = origNewCSGClawAdapterSource
+		EnsureCLIProxy = origEnsureCLIProxy
+		ShutdownCLIProxy = origShutdownCLIProxy
+		DetectBootstrapState = origDetectBootstrapState
+		EnsureBootstrapState = origEnsureBootstrapState
+		CheckModelProvider = origCheckModelProvider
+		CheckCatalogModelProvider = origCheckCatalogModelProvider
+		OpenBrowser = origOpenBrowser
+		WaitForHealthy = origWaitForHealthy
+	}
+}
+
+func TestServeForegroundConfiguresDesktopAgentShutdown(t *testing.T) {
+	restore := stubServeDependencies(t)
+	defer restore()
+	t.Setenv("HOME", t.TempDir())
+
+	shutdownCalled := false
+	StopRunningSandboxAgents = func(context.Context, *agent.Controller) error {
+		shutdownCalled = true
+		return nil
+	}
+	RunServer = func(opts server.Options) error {
+		if opts.BeforeShutdown == nil {
+			t.Fatal("BeforeShutdown is nil for Electron distribution")
+		}
+		return opts.BeforeShutdown(context.Background())
+	}
+
+	cfg := config.Config{Server: config.ServerConfig{ListenAddr: "127.0.0.1:18080"}}
+	if err := serveForegroundWithConfigPath(
+		context.Background(),
+		testContext(),
+		cfg,
+		"",
+		"json",
+		serveOptions{Distribution: "electron"},
+	); err != nil {
+		t.Fatalf("serveForegroundWithConfigPath() error = %v", err)
+	}
+	if !shutdownCalled {
+		t.Fatal("StopRunningSandboxAgents was not called")
+	}
+}
+
+func TestPartiallyMaskSecret(t *testing.T) {
+	cases := map[string]string{
+		"":          "",
+		"abc":       "***",
+		"abcd":      "****",
+		"abcde":     "ab*de",
+		"abcdef":    "ab**ef",
+		"sk-secret": "sk*****et",
+	}
+
+	for input, want := range cases {
+		if got := partiallyMaskSecret(input); got != want {
+			t.Fatalf("partiallyMaskSecret(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestAPIBaseURLDefaultsToLocalhost(t *testing.T) {
+	got := apiBaseURL(config.ServerConfig{ListenAddr: "0.0.0.0:19090"})
+	want := "http://127.0.0.1:19090"
+	if got != want {
+		t.Fatalf("apiBaseURL() = %q, want %q", got, want)
+	}
+}
+
+func TestAPIBaseURLKeepsExplicitListenHost(t *testing.T) {
+	got := apiBaseURL(config.ServerConfig{ListenAddr: "192.168.2.52:19090"})
+	want := "http://192.168.2.52:19090"
+	if got != want {
+		t.Fatalf("apiBaseURL() = %q, want %q", got, want)
+	}
+}
+
+func TestAPIBaseURLPrefersAdvertiseBaseURL(t *testing.T) {
+	got := apiBaseURL(config.ServerConfig{
+		ListenAddr:       "0.0.0.0:19090",
+		AdvertiseBaseURL: "http://example.test/base/",
+	})
+	want := "http://example.test/base"
+	if got != want {
+		t.Fatalf("apiBaseURL() = %q, want %q", got, want)
+	}
+}
+
+func TestAPIBaseURLFallsBackToSharedDefault(t *testing.T) {
+	got := apiBaseURL(config.ServerConfig{})
+	if got != config.DefaultAPIBaseURL() {
+		t.Fatalf("apiBaseURL() = %q, want %q", got, config.DefaultAPIBaseURL())
+	}
+}
+
+func TestServeAPIBaseURLUsesDesktopRendererEndpoint(t *testing.T) {
+	got := serveAPIBaseURL(
+		config.ServerConfig{ListenAddr: "0.0.0.0:59843"},
+		serveOptions{Desktop: &server.DesktopOptions{BaseURL: "http://127.0.0.1:59842/"}},
+	)
+	if want := "http://127.0.0.1:59842"; got != want {
+		t.Fatalf("serveAPIBaseURL() = %q, want %q", got, want)
+	}
+}
+
+func TestServeInternalBaseURLIgnoresAdvertiseBaseURL(t *testing.T) {
+	got := serveInternalBaseURL(config.ServerConfig{
+		ListenAddr:       "0.0.0.0:19090",
+		AdvertiseBaseURL: "https://gateway.example.test/sandbox",
+	}, serveOptions{})
+	if want := "http://127.0.0.1:19090"; got != want {
+		t.Fatalf("serveInternalBaseURL() = %q, want %q", got, want)
+	}
+}
+
+func TestServeInternalBaseURLUsesDesktopRendererEndpoint(t *testing.T) {
+	got := serveInternalBaseURL(
+		config.ServerConfig{ListenAddr: "0.0.0.0:59843"},
+		serveOptions{Desktop: &server.DesktopOptions{BaseURL: "http://127.0.0.1:59842/"}},
+	)
+	if want := "http://127.0.0.1:59842"; got != want {
+		t.Fatalf("serveInternalBaseURL() = %q, want %q", got, want)
+	}
+}
+
+func TestParseServeLogLevel(t *testing.T) {
+	cases := map[string]slog.Level{
+		"":        slog.LevelInfo,
+		"info":    slog.LevelInfo,
+		"DEBUG":   slog.LevelDebug,
+		"warn":    slog.LevelWarn,
+		"warning": slog.LevelWarn,
+		"error":   slog.LevelError,
+	}
+
+	for input, want := range cases {
+		got, err := parseServeLogLevel(input)
+		if err != nil {
+			t.Fatalf("parseServeLogLevel(%q) error = %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("parseServeLogLevel(%q) = %v, want %v", input, got, want)
+		}
+	}
+}
+
+func TestValidateModelConfigAllowsDynamicProfileSetupWhenIncomplete(t *testing.T) {
+	err := validateModelConfig(config.Config{})
+	if err != nil {
+		t.Fatalf("validateModelConfig() error = %v, want nil for UI-driven dynamic setup", err)
+	}
+}
+
+func TestStopCommandUsesPlatformProcessControl(t *testing.T) {
+	originalStop := stopServerProcessByPID
+	t.Cleanup(func() { stopServerProcessByPID = originalStop })
+
+	const pid = 4321
+	var stoppedPID int
+	stopServerProcessByPID = func(got int) error {
+		stoppedPID = got
+		return nil
+	}
+
+	pidPath := filepath.Join(t.TempDir(), "server.pid")
+	if err := os.WriteFile(pidPath, []byte("4321\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", pidPath, err)
+	}
+	var stdout bytes.Buffer
+	err := (stopCmd{}).Run(context.Background(), &command.Context{
+		Program: "csgclaw",
+		Stdout:  &stdout,
+		Stderr:  &bytes.Buffer{},
+	}, []string{"--pid", pidPath}, command.GlobalOptions{Output: "json"})
+	if err != nil {
+		t.Fatalf("stopCmd.Run() error = %v", err)
+	}
+	if stoppedPID != pid {
+		t.Fatalf("stopServerProcessByPID pid = %d, want %d", stoppedPID, pid)
+	}
+	if got := stdout.String(); !strings.Contains(got, `"status": "signaled"`) || !strings.Contains(got, `"pid": 4321`) {
+		t.Fatalf("stop output = %q, want signaled status and pid", got)
+	}
+}
+
+func TestStopCommandRemovesStalePIDFile(t *testing.T) {
+	originalStop := stopServerProcessByPID
+	t.Cleanup(func() { stopServerProcessByPID = originalStop })
+	stopServerProcessByPID = func(int) error { return os.ErrProcessDone }
+
+	pidPath := filepath.Join(t.TempDir(), "server.pid")
+	if err := os.WriteFile(pidPath, []byte("4321\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", pidPath, err)
+	}
+	err := (stopCmd{}).Run(context.Background(), testContext(), []string{"--pid", pidPath}, command.GlobalOptions{Output: "json"})
+	if err != nil {
+		t.Fatalf("stopCmd.Run() error = %v", err)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("pid file still exists, stat error = %v", err)
+	}
+}
+
+func testContext() *command.Context {
+	return &command.Context{
+		Program: "csgclaw",
+		Stdout:  &bytes.Buffer{},
+		Stderr:  &bytes.Buffer{},
+	}
+}
+
+type notifyingBuffer struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	needle string
+	seen   chan struct{}
+	once   sync.Once
+}
+
+func newNotifyingBuffer(needle string) *notifyingBuffer {
+	return &notifyingBuffer{
+		needle: needle,
+		seen:   make(chan struct{}),
+	}
+}
+
+func (b *notifyingBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n, err := b.buf.Write(p)
+	if strings.Contains(b.buf.String(), b.needle) {
+		b.once.Do(func() { close(b.seen) })
+	}
+	return n, err
+}
+
+func (b *notifyingBuffer) Seen() <-chan struct{} {
+	return b.seen
+}
+
+func (b *notifyingBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+type fakeFeishuBindingManager struct {
+	start     func(context.Context) error
+	reconcile func(context.Context) error
+	close     func()
+}
+
+type fakeCSGClawAdapterSource struct {
+	start     func(context.Context) error
+	reconcile func(context.Context) error
+	close     func()
+}
+
+func (s *fakeCSGClawAdapterSource) Start(ctx context.Context) error {
+	if s != nil && s.start != nil {
+		return s.start(ctx)
+	}
+	return nil
+}
+
+func (s *fakeCSGClawAdapterSource) Reconcile(ctx context.Context) error {
+	if s != nil && s.reconcile != nil {
+		return s.reconcile(ctx)
+	}
+	return nil
+}
+
+func (s *fakeCSGClawAdapterSource) Close() {
+	if s != nil && s.close != nil {
+		s.close()
+	}
+}
+
+func (m *fakeFeishuBindingManager) Start(ctx context.Context) error {
+	if m != nil && m.start != nil {
+		return m.start(ctx)
+	}
+	return nil
+}
+
+func (m *fakeFeishuBindingManager) Reconcile(ctx context.Context) error {
+	if m != nil && m.reconcile != nil {
+		return m.reconcile(ctx)
+	}
+	return nil
+}
+
+func (m *fakeFeishuBindingManager) Close() {
+	if m != nil && m.close != nil {
+		m.close()
+	}
+}

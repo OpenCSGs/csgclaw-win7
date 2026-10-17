@@ -1,0 +1,106 @@
+import { messages } from "@/shared/i18n/messages";
+import { LOCALE_STORAGE_KEY } from "@/shared/storage/keys";
+import type { LocaleCode, TranslateFn } from "@/models/conversations";
+
+type ErrorTranslationKey = keyof typeof messages.zh.errors;
+
+export function detectInitialLocale(): LocaleCode {
+  const stored = window.localStorage.getItem(LOCALE_STORAGE_KEY);
+  if (stored === "zh" || stored === "en") {
+    return stored;
+  }
+  return navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+export function createTranslator(locale: LocaleCode): TranslateFn {
+  return (key, params = {}) => {
+    const value = resolveTranslation(locale, key);
+    if (typeof value !== "string") {
+      return key;
+    }
+    return value.replace(/\{(\w+)\}/g, (_, name) => `${params[name] ?? ""}`);
+  };
+}
+
+export function resolveTranslation(locale: LocaleCode, key: string): unknown {
+  const catalog = locale === "zh" ? messages.zh : messages.en;
+  return key.split(".").reduce<unknown>((current, part) => {
+    if (!current || typeof current !== "object") {
+      return undefined;
+    }
+    return (current as Record<string, unknown>)[part];
+  }, catalog);
+}
+
+export function localizeRole(role: string, t: TranslateFn): string {
+  return t(`roles.${role}`) === `roles.${role}` ? role : t(`roles.${role}`);
+}
+
+// Legacy contract: function localizeTemplateSourceTag(source, locale)
+export function localizeTemplateSourceTag(source: unknown, locale: LocaleCode): string {
+  const value = String(source ?? "").trim();
+  if (!value) {
+    return "-";
+  }
+  if (locale === "zh") {
+    if (value === "builtin") {
+      return "内建";
+    }
+    if (value === "local") {
+      return "本地";
+    }
+    if (value === "official") {
+      return "官方";
+    }
+    if (value === "personal") {
+      return "个人";
+    }
+  }
+  return value;
+}
+
+export function localizeError(raw: unknown, t: TranslateFn): string {
+  const cleaned = String(raw ?? "").trim();
+  const errorKeys = Object.keys(messages.zh.errors) as ErrorTranslationKey[];
+  for (const key of errorKeys) {
+    if (cleaned.includes(key)) {
+      return t(`errors.${key}`);
+    }
+    const englishValue = messages.en.errors[key];
+    if (englishValue && cleaned.includes(englishValue)) {
+      return t(`errors.${key}`);
+    }
+    const prefix = `${key}:`;
+    if (cleaned.startsWith(prefix)) {
+      const suffix = cleaned.slice(prefix.length).trim();
+      return `${t(`errors.${key}`)} ${suffix}`;
+    }
+  }
+  return cleaned;
+}
+
+export function localizeAPIError(error: unknown, t: TranslateFn, fallback = ""): string {
+  if (error && typeof error === "object" && "code" in error) {
+    const code = String((error as { code?: unknown }).code || "").trim();
+    if (code) {
+      // This is a local fallback code used when the Hub did not provide a
+      // stable business code. Preserve its diagnostic message instead of
+      // replacing the only actionable reason with a generic translation.
+      if (code === "template_publish_failed" && "message" in error) {
+        const message = localizeError((error as { message?: unknown }).message, t);
+        if (message) {
+          return message;
+        }
+      }
+      const key = `errors.${code}`;
+      const localized = t(key);
+      if (localized !== key) {
+        return localized;
+      }
+    }
+  }
+  if (error && typeof error === "object" && "message" in error) {
+    return localizeError((error as { message?: unknown }).message, t) || fallback;
+  }
+  return localizeError(error, t) || fallback;
+}

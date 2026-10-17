@@ -1,0 +1,591 @@
+package delivery
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"csgclaw/internal/activity"
+	"csgclaw/internal/agentengine"
+	"csgclaw/internal/agentengine/contract"
+	"csgclaw/internal/channel"
+	channelrender "csgclaw/internal/channel/csgclaw/render"
+)
+
+const completedTurnWindow = 1024
+
+// Renderer owns channel-specific event rendering and transcript delivery.
+// Returning an error from Emit causes Agent Engine to cancel the active turn.
+type Renderer interface {
+	Emit(ctx context.Context, turn channel.TurnContext, event agentengine.TurnEvent) error
+	Complete(ctx context.Context, turn channel.TurnContext, result agentengine.TurnResult) error
+}
+
+// TranscriptStore is the narrow IM write surface used by the renderer.
+type TranscriptStore interface {
+	DeliverMessage(ctx context.Context, turn channel.TurnContext, text string) error
+	DeliverActivity(ctx context.Context, turn channel.TurnContext, event agentengine.TurnEvent) error
+}
+
+type finalMessageStore interface {
+	DeliverFinalMessage(ctx context.Context, turn channel.TurnContext, text string, files []agentengine.OutputFile) error
+}
+
+// ActivityDelivery is the legacy-compatible activity representation persisted
+// by the built-in IM adapter. Event remains available for delivery metadata.
+type ActivityDelivery struct {
+	MessageID      string
+	Text           string
+	Metadata       map[string]any
+	ThreadRootID   string
+	EnsureTurnRoot bool
+	Event          agentengine.TurnEvent
+}
+
+type renderedActivityStore interface {
+	DeliverRenderedActivity(context.Context, channel.TurnContext, ActivityDelivery) error
+}
+
+type failureStore interface {
+	DeliverFailure(context.Context, channel.TurnContext, string) error
+}
+
+// InteractionProjector owns trusted Channel routes and UI projection only.
+// All decisions and answers are resolved by Agent Engine.
+type InteractionProjector interface {
+	Bind(channel.TurnContext, agentengine.InteractionRequest) (agentengine.InteractionRequest, error)
+	Project(agentengine.TurnEvent) agentengine.TurnEvent
+	Observe(channel.TurnContext, agentengine.TurnEvent)
+}
+type RendererOption func(*TranscriptRenderer)
+
+func WithInteractionProjector(projector InteractionProjector) RendererOption {
+	return func(renderer *TranscriptRenderer) { renderer.interactions = projector }
+}
+
+// TranscriptRenderer maps Engine turn events onto the existing IM activity
+// and transcript contract. Rendering state is isolated by the complete Turn
+// identity so interleaved conversations cannot overwrite each other.
+type TranscriptRenderer struct {
+	store        TranscriptStore
+	interactions InteractionProjector
+
+	mu             sync.Mutex
+	turns          map[turnBufferKey]*turnRenderState
+	completed      map[turnBufferKey]uint64
+	completedOrder []turnBufferKey
+}
+
+type turnRenderState struct {
+	progress            *progressState
+	renderer            *channelrender.TurnRenderer
+	lastSequence        uint64
+	hasText             bool
+	structuredUserInput *activity.RequestUserInputArgs
+}
+
+type turnBufferKey struct {
+	bindingID       channel.BindingID
+	agentID         string
+	conversationKey agentengine.ConversationKey
+	turnID          agentengine.TurnID
+	sourceMessageID string
+}
+
+func NewTranscriptRenderer(store TranscriptStore, opts ...RendererOption) *TranscriptRenderer {
+	renderer := &TranscriptRenderer{
+		store: store,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(renderer)
+		}
+	}
+	return renderer
+}
+
+func (r *TranscriptRenderer) Emit(ctx context.Context, turn channel.TurnContext, event agentengine.TurnEvent) error {
+	if r == nil {
+		return nil
+	}
+	if event.Output == nil || (event.Output.Kind != contract.OutputItemImageGeneration && event.Output.Kind != contract.OutputItemVideoGeneration) {
+		if err := r.Start(ctx, turn); err != nil {
+			return err
+		}
+	}
+	if r.interactions != nil {
+		event = r.interactions.Project(event)
+	}
+	state, ok := r.acceptEvent(turn, event)
+	if !ok {
+		if event.Output != nil && event.Output.Kind == contract.OutputItemVideoGeneration {
+			return r.deliverLateVideoGeneration(ctx, turn, event)
+		}
+		if event.Kind == agentengine.TurnEventActivityUpdate {
+			return r.deliverLateInteraction(ctx, turn, event)
+		}
+		return nil
+	}
+
+	if state.progress != nil {
+		if err := state.progress.observe(ctx, event); err != nil {
+			return err
+		}
+		if event.Kind == agentengine.TurnEventToolCallStart || event.Kind == agentengine.TurnEventToolCallUpdate {
+			return nil
+		}
+	}
+	switch event.Kind {
+	case agentengine.TurnEventTextDelta:
+		if event.Text == "" || event.Phase == "commentary" {
+			return nil
+		}
+		r.mu.Lock()
+		state.renderer.ApplyText(activity.RuntimeEvent{Kind: activity.RuntimeEventTextDelta, Text: event.Text})
+		state.hasText = true
+		r.mu.Unlock()
+		return nil
+	case agentengine.TurnEventThoughtDelta:
+		// Thought deltas are projected through participant work status by the
+		// execution adapter. They are transient progress, not chat transcript.
+		return nil
+	case agentengine.TurnEventOutputItem:
+		if event.Output != nil && event.Output.Kind == contract.OutputItemImageGeneration {
+			task, ok := event.Output.Payload.(contract.ImageGenerationTask)
+			store, supported := r.store.(interface {
+				DeliverImageGeneration(context.Context, channel.TurnContext, contract.ImageGenerationTask) error
+			})
+			if !ok || !supported {
+				return fmt.Errorf("image delivery is unavailable")
+			}
+			return store.DeliverImageGeneration(ctx, turn, task)
+		}
+		if event.Output != nil && event.Output.Kind == contract.OutputItemVideoGeneration {
+			task, ok := event.Output.Payload.(contract.VideoGenerationTask)
+			store, supported := r.store.(interface {
+				DeliverVideoGeneration(context.Context, channel.TurnContext, contract.VideoGenerationTask) error
+			})
+			if !ok || !supported {
+				return fmt.Errorf("video delivery is unavailable")
+			}
+			return store.DeliverVideoGeneration(ctx, turn, task)
+		}
+		return r.captureOutputItem(state, event)
+	case agentengine.TurnEventInteractionRequest:
+		bound, err := r.bindInteraction(turn, event)
+		if err != nil {
+			return err
+		}
+		event = bound
+	}
+
+	runtimeEvent, renderable := normalizedRuntimeEvent(turn, event)
+	if !renderable {
+		if r.store != nil && (event.Kind == agentengine.TurnEventToolCallStart ||
+			event.Kind == agentengine.TurnEventToolCallUpdate ||
+			event.Kind == agentengine.TurnEventActivityUpdate ||
+			event.Kind == agentengine.TurnEventInteractionRequest) {
+			return r.store.DeliverActivity(ctx, turn, event)
+		}
+		return nil
+	}
+	r.mu.Lock()
+	rendered, renderedOK := state.renderer.RenderActivity(runtimeEvent, string(channel.ChannelCSGClaw), turn.RoomID, turn.ParticipantID)
+	r.mu.Unlock()
+	if !renderedOK {
+		if r.store != nil {
+			return r.store.DeliverActivity(ctx, turn, event)
+		}
+		return nil
+	}
+	if err := r.deliverRenderedActivity(ctx, turn, activityDelivery(turn, event, rendered)); err != nil {
+		return err
+	}
+	if r.interactions != nil {
+		r.interactions.Observe(turn, event)
+	}
+	return nil
+}
+
+func (r *TranscriptRenderer) deliverLateVideoGeneration(ctx context.Context, turn channel.TurnContext, event agentengine.TurnEvent) error {
+	task, ok := event.Output.Payload.(contract.VideoGenerationTask)
+	if !ok {
+		return nil
+	}
+	r.mu.Lock()
+	key := bufferKey(turn)
+	sequence, completed := r.completed[key]
+	if !completed || event.Sequence == 0 || event.Sequence <= sequence {
+		r.mu.Unlock()
+		return nil
+	}
+	r.completed[key] = event.Sequence
+	r.mu.Unlock()
+	store, supported := r.store.(interface {
+		DeliverVideoGeneration(context.Context, channel.TurnContext, contract.VideoGenerationTask) error
+	})
+	if !supported {
+		return fmt.Errorf("video delivery is unavailable")
+	}
+	return store.DeliverVideoGeneration(ctx, turn, task)
+}
+
+func (r *TranscriptRenderer) Complete(ctx context.Context, turn channel.TurnContext, result agentengine.TurnResult) error {
+	if r == nil {
+		return nil
+	}
+	state := r.finishState(turn)
+	if state != nil && state.progress != nil && result.Status != agentengine.TurnSucceeded {
+		return state.progress.finish(ctx, result, "", false)
+	}
+	if r.store == nil || result.Status == agentengine.TurnCanceled {
+		return nil
+	}
+	if state == nil {
+		state = newTurnRenderState(turn.Locale)
+	}
+	if result.Status == agentengine.TurnFailed {
+		state.renderer.DiscardStructuredOutput()
+		message := "turn failed"
+		if result.Error != nil && strings.TrimSpace(result.Error.Message) != "" {
+			message = strings.TrimSpace(result.Error.Message)
+			switch string(result.Error.Code) {
+			case "context_length_exceeded":
+				if strings.HasPrefix(turn.Locale, "zh") {
+					message = "本次内容超过模型容量，请拆分输入、检查模型容量设置或选择容量更大的模型。已有对话已保留。"
+				}
+			case "context_compaction_failed":
+				if strings.HasPrefix(turn.Locale, "zh") {
+					message = "暂时无法整理对话，已有记录已保留。请重试或选择容量更大的模型。"
+				}
+			}
+		}
+		if store, ok := r.store.(failureStore); ok {
+			return store.DeliverFailure(ctx, turn, message)
+		}
+		return r.store.DeliverMessage(ctx, turn, message)
+	}
+
+	if !state.hasText && strings.TrimSpace(result.Output) != "" {
+		state.renderer.ApplyText(activity.RuntimeEvent{Kind: activity.RuntimeEventTextDelta, Text: result.Output})
+	}
+	if state.progress != nil {
+		state.renderer.ReplaceText(state.progress.finalText(result.Output))
+	}
+	text := strings.TrimSpace(strings.Join(state.renderer.FinalMessages(), "\n\n"))
+	if state.progress != nil {
+		if err := state.progress.finish(ctx, result, text, true); err != nil {
+			return err
+		}
+	} else if store, ok := r.store.(finalMessageStore); ok && len(result.Files) > 0 {
+		if err := store.DeliverFinalMessage(ctx, turn, text, result.Files); err != nil {
+			return err
+		}
+	} else if text != "" {
+		if err := r.store.DeliverMessage(ctx, turn, text); err != nil {
+			return err
+		}
+	}
+	for index, request := range result.Interactions {
+		event := agentengine.TurnEvent{TurnID: turn.TurnID, Kind: agentengine.TurnEventInteractionRequest, Sequence: state.lastSequence + 1 + uint64(index), Interaction: &request}
+		bound, err := r.bindInteraction(turn, event)
+		if err != nil {
+			return err
+		}
+		event = bound
+		runtimeEvent, ok := normalizedRuntimeEvent(turn, event)
+		if !ok {
+			continue
+		}
+		rendered, ok := state.renderer.RenderActivity(runtimeEvent, string(channel.ChannelCSGClaw), turn.RoomID, turn.ParticipantID)
+		if !ok {
+			continue
+		}
+		if err := r.deliverRenderedActivity(ctx, turn, activityDelivery(turn, event, rendered)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *TranscriptRenderer) acceptEvent(turn channel.TurnContext, event agentengine.TurnEvent) (*turnRenderState, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := bufferKey(turn)
+	if _, completed := r.completed[key]; completed {
+		return nil, false
+	}
+	if r.turns == nil {
+		r.turns = make(map[turnBufferKey]*turnRenderState)
+	}
+	state := r.turns[key]
+	if state == nil {
+		state = newTurnRenderState(turn.Locale)
+		r.turns[key] = state
+	}
+	if event.Sequence > 0 {
+		if event.Sequence <= state.lastSequence {
+			return nil, false
+		}
+		state.lastSequence = event.Sequence
+	}
+	return state, true
+}
+
+func newTurnRenderState(locale string) *turnRenderState {
+	renderer := channelrender.NewTurnRenderer()
+	renderer.SetLocale(locale)
+	return &turnRenderState{renderer: renderer}
+}
+
+func (r *TranscriptRenderer) captureOutputItem(state *turnRenderState, event agentengine.TurnEvent) error {
+	if event.Output == nil {
+		return nil
+	}
+	switch event.Output.Kind {
+	case agentengine.OutputItemResourceLink:
+		link, ok := event.Output.Payload.(activity.ResourceLink)
+		if !ok {
+			return nil
+		}
+		r.mu.Lock()
+		state.renderer.ApplyStructuredOutput(activity.RuntimeEvent{
+			Kind: activity.RuntimeEventStructuredOutput,
+			Payload: activity.StructuredOutputArtifact{
+				ResourceLinks: []activity.ResourceLink{link},
+			},
+		})
+		r.mu.Unlock()
+	case agentengine.OutputItemRequestUserInput:
+		args, ok := requestUserInputArgs(event.Output.Payload)
+		if !ok {
+			return nil
+		}
+		r.mu.Lock()
+		state.structuredUserInput = cloneRequestUserInputArgs(&args)
+		state.renderer.ApplyStructuredOutput(activity.RuntimeEvent{
+			Kind: activity.RuntimeEventStructuredOutput,
+			Text: event.Text,
+			Payload: activity.StructuredOutputArtifact{
+				RequestUserInput: cloneRequestUserInputArgs(&args),
+			},
+		})
+		r.mu.Unlock()
+	}
+	return nil
+}
+
+func (r *TranscriptRenderer) bindInteraction(turn channel.TurnContext, event agentengine.TurnEvent) (agentengine.TurnEvent, error) {
+	if r.interactions == nil || event.Interaction == nil {
+		return event, nil
+	}
+	bound, err := r.interactions.Bind(turn, *event.Interaction)
+	if err != nil {
+		return event, err
+	}
+	event.Interaction = &bound
+	return event, nil
+}
+func (r *TranscriptRenderer) deliverLateInteraction(ctx context.Context, turn channel.TurnContext, event agentengine.TurnEvent) error {
+	if event.Activity == nil || event.Activity.Kind != string(activity.RuntimeEventUserInputResolved) {
+		return nil
+	}
+	r.mu.Lock()
+	key := bufferKey(turn)
+	sequence, completed := r.completed[key]
+	if !completed || event.Sequence == 0 || event.Sequence <= sequence {
+		r.mu.Unlock()
+		return nil
+	}
+	r.completed[key] = event.Sequence
+	r.mu.Unlock()
+	runtimeEvent, ok := normalizedRuntimeEvent(turn, event)
+	if !ok {
+		return nil
+	}
+	rendered, ok := channelrender.NewTurnRenderer().RenderActivity(runtimeEvent, string(channel.ChannelCSGClaw), turn.RoomID, turn.ParticipantID)
+	if !ok {
+		return nil
+	}
+	if err := r.deliverRenderedActivity(ctx, turn, activityDelivery(turn, event, rendered)); err != nil {
+		return err
+	}
+	if r.interactions != nil {
+		r.interactions.Observe(turn, event)
+	}
+	return nil
+}
+
+func (r *TranscriptRenderer) deliverRenderedActivity(ctx context.Context, turn channel.TurnContext, rendered ActivityDelivery) error {
+	if store, ok := r.store.(renderedActivityStore); ok {
+		return store.DeliverRenderedActivity(ctx, turn, rendered)
+	}
+	if r.store != nil {
+		return r.store.DeliverActivity(ctx, turn, rendered.Event)
+	}
+	return nil
+}
+
+func (r *TranscriptRenderer) finishState(turn channel.TurnContext) *turnRenderState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := bufferKey(turn)
+	state := r.turns[key]
+	delete(r.turns, key)
+	if r.completed == nil {
+		r.completed = make(map[turnBufferKey]uint64)
+	}
+	if _, exists := r.completed[key]; exists {
+		return state
+	}
+	var sequence uint64
+	if state != nil {
+		sequence = state.lastSequence
+	}
+	r.completed[key] = sequence
+	r.completedOrder = append(r.completedOrder, key)
+	if len(r.completedOrder) <= completedTurnWindow {
+		return state
+	}
+	oldest := r.completedOrder[0]
+	r.completedOrder = r.completedOrder[1:]
+	delete(r.completed, oldest)
+	return state
+}
+
+func normalizedRuntimeEvent(turn channel.TurnContext, event agentengine.TurnEvent) (activity.RuntimeEvent, bool) {
+	value := activity.RuntimeEvent{
+		RuntimeKind: "codex",
+		RuntimeID:   string(turn.BindingID),
+		SessionID:   activitySessionID(turn),
+		TurnID:      string(turn.TurnID),
+		ReceivedAt:  time.Now().UTC(),
+	}
+	switch event.Kind {
+	case agentengine.TurnEventToolCallStart, agentengine.TurnEventToolCallUpdate:
+		if event.Tool == nil {
+			return value, false
+		}
+		if event.Kind == agentengine.TurnEventToolCallStart {
+			value.Kind = activity.RuntimeEventToolCallStart
+		} else {
+			value.Kind = activity.RuntimeEventToolCallUpdate
+		}
+		value.ToolCallID = event.Tool.ID
+		value.ToolKind = event.Tool.Kind
+		value.ToolTitle = event.Tool.Title
+		value.ToolStatus = event.Tool.Status
+		value.ToolInputSummary = event.Tool.InputSummary
+		value.ToolOutputSummary = event.Tool.OutputSummary
+		value.Payload = event.Tool.Payload
+	case agentengine.TurnEventActivityUpdate:
+		if event.Activity == nil {
+			return value, false
+		}
+		value.Payload = event.Activity.Payload
+		switch activity.RuntimeEventKind(strings.TrimSpace(event.Activity.Kind)) {
+		case activity.RuntimeEventActionDecision:
+			value.Kind = activity.RuntimeEventActionDecision
+			value.ActionID = event.Activity.ID
+			value.ActionStatus = event.Activity.Status
+		case activity.RuntimeEventUserInputResolved:
+			value.Kind = activity.RuntimeEventUserInputResolved
+			value.UserInputID = event.Activity.ID
+			value.UserInputStatus = event.Activity.Status
+		default:
+			return value, false
+		}
+	case agentengine.TurnEventInteractionRequest:
+		if event.Interaction == nil {
+			return value, false
+		}
+		value.Payload = event.Interaction.Payload
+		switch event.Interaction.Kind {
+		case agentengine.InteractionPermission:
+			value.Kind = activity.RuntimeEventActionRequest
+			value.ActionID = event.Interaction.ID
+		case agentengine.InteractionUserInput:
+			value.Kind = activity.RuntimeEventUserInputRequest
+			value.UserInputID = event.Interaction.ID
+		default:
+			return value, false
+		}
+	default:
+		return value, false
+	}
+	return value, true
+}
+
+func activitySessionID(turn channel.TurnContext) string {
+	conversationKey := strings.TrimSpace(string(turn.ConversationKey))
+	turnID := strings.TrimSpace(string(turn.TurnID))
+	if turnID == "" {
+		return conversationKey
+	}
+	// Activity IDs must be stable within one Turn and distinct across Turns,
+	// even if a Runtime reuses a tool-call ID in the same conversation.
+	return conversationKey + "\x00" + turnID
+}
+
+func activityDelivery(turn channel.TurnContext, event agentengine.TurnEvent, rendered channelrender.RenderedActivity) ActivityDelivery {
+	delivery := ActivityDelivery{
+		MessageID: rendered.MessageID,
+		Text:      rendered.Text,
+		Metadata:  rendered.Metadata,
+		Event:     event,
+	}
+	delivery.ThreadRootID = turn.ThreadRootID
+	return delivery
+}
+
+func requestUserInputArgs(value any) (activity.RequestUserInputArgs, bool) {
+	switch typed := value.(type) {
+	case activity.RequestUserInputArgs:
+		return typed, true
+	case *activity.RequestUserInputArgs:
+		if typed != nil {
+			return *typed, true
+		}
+	}
+	return activity.RequestUserInputArgs{}, false
+}
+
+func userInputSnapshot(value any) (activity.UserInputSnapshot, bool) {
+	switch typed := value.(type) {
+	case activity.UserInputSnapshot:
+		return typed, true
+	case *activity.UserInputSnapshot:
+		if typed != nil {
+			return *typed, true
+		}
+	}
+	return activity.UserInputSnapshot{}, false
+}
+
+func cloneRequestUserInputArgs(input *activity.RequestUserInputArgs) *activity.RequestUserInputArgs {
+	if input == nil {
+		return nil
+	}
+	out := *input
+	out.Questions = append([]activity.RequestUserInputQuestion(nil), input.Questions...)
+	for index := range out.Questions {
+		out.Questions[index].Options = append([]activity.RequestUserInputOption(nil), input.Questions[index].Options...)
+	}
+	if input.AutoResolutionMS != nil {
+		value := *input.AutoResolutionMS
+		out.AutoResolutionMS = &value
+	}
+	return &out
+}
+
+func bufferKey(turn channel.TurnContext) turnBufferKey {
+	return turnBufferKey{
+		bindingID:       turn.BindingID,
+		agentID:         turn.AgentID,
+		conversationKey: turn.ConversationKey,
+		turnID:          turn.TurnID,
+		sourceMessageID: turn.SourceMessageID,
+	}
+}

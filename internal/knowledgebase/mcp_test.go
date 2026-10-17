@@ -1,0 +1,280 @@
+package knowledgebase
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"testing"
+)
+
+func availableKnowledgeBase() KnowledgeBase {
+	return KnowledgeBase{
+		ID:          42,
+		Name:        "Engineering Handbook",
+		Description: "Engineering runbooks",
+		ContentID:   "wiki-content-42",
+		Type:        TypeLLMWiki,
+		Metadata: Metadata{
+			MCPEndpoint: "https://gateway.example.test/v1/llmwikis/wiki-content-42/mcp",
+			ResourceState: &ResourceState{
+				Readiness: "ready",
+				MCPStatus: "ready",
+			},
+		},
+	}
+}
+
+func installKnowledgeBaseResponse(t *testing.T, item KnowledgeBase, wantToken string) string {
+	t.Helper()
+	encoded, err := json.Marshal(map[string]any{"data": item})
+	if err != nil {
+		t.Fatalf("encode response: %v", err)
+	}
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got, want := r.URL.Path, "/api/v1/agent/knowledge-bases/42"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		if got, want := r.Header.Get("Authorization"), "Bearer "+wantToken; got != want {
+			t.Fatalf("Authorization = %q, want %q", got, want)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(encoded)),
+		}, nil
+	})
+	return "https://hub.example.test"
+}
+
+func installKnowledgeBaseErrorResponse(t *testing.T, status int, wantToken string) string {
+	t.Helper()
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got, want := r.URL.Path, "/api/v1/agent/knowledge-bases/42"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		if got, want := r.Header.Get("Authorization"), "Bearer "+wantToken; got != want {
+			t.Fatalf("Authorization = %q, want %q", got, want)
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewBufferString(`{"message":"unauthorized"}`)),
+		}, nil
+	})
+	return "https://hub.example.test"
+}
+
+func TestServerConfigOmitsCSGHubAccessTokenAndKeepsManagedMeta(t *testing.T) {
+	name, config, err := ServerConfig(availableKnowledgeBase(), "current-csghub-token")
+	if err != nil {
+		t.Fatalf("ServerConfig() error = %v", err)
+	}
+	if got, want := name, "wiki-content-42"; got != want {
+		t.Fatalf("name = %q, want %q", got, want)
+	}
+	if got, want := config["description"], "Engineering Handbook | Engineering runbooks"; got != want {
+		t.Fatalf("description = %#v, want %q", got, want)
+	}
+	if _, exists := config["headers"]; exists {
+		t.Fatalf("persisted config contains credentials: %#v", config)
+	}
+	meta := config[ManagedMetaKey].(map[string]any)[ManagedMetaNamespace].(map[string]any)
+	if got, want := meta["type"], ManagedMCPType; got != want {
+		t.Fatalf("_meta type = %#v, want %q", got, want)
+	}
+	if got, want := meta["auth_type"], ManagedAuthType; got != want {
+		t.Fatalf("_meta auth_type = %#v, want %q", got, want)
+	}
+	metadata, ok := ManagedMetadataFromServer(config)
+	if !ok || metadata.KnowledgeBaseID != 42 || metadata.ContentID != "wiki-content-42" {
+		t.Fatalf("ManagedMetadataFromServer() = %#v, %v", metadata, ok)
+	}
+}
+
+func TestServerConfigRequiresCSGHubAccessToken(t *testing.T) {
+	if _, _, err := ServerConfig(availableKnowledgeBase(), " "); err == nil {
+		t.Fatal("ServerConfig() error = nil, want missing token error")
+	}
+}
+
+func TestServerConfigAcceptsLegacyResourceStateEndpoint(t *testing.T) {
+	item := availableKnowledgeBase()
+	item.Metadata.ResourceState.MCPEndpoint = item.Metadata.MCPEndpoint
+	item.Metadata.MCPEndpoint = ""
+	_, config, err := ServerConfig(item, "current-csghub-token")
+	if err != nil {
+		t.Fatalf("ServerConfig() error = %v", err)
+	}
+	if got, want := config["url"], "https://gateway.example.test/v1/llmwikis/wiki-content-42/mcp"; got != want {
+		t.Fatalf("url = %#v, want %q", got, want)
+	}
+}
+
+func TestHydrateManagedServerRefreshesEndpointAndRemovesCSGHubAccessToken(t *testing.T) {
+	_, config, err := ServerConfig(availableKnowledgeBase(), "stored-csghub-token")
+	if err != nil {
+		t.Fatalf("ServerConfig() error = %v", err)
+	}
+	config["startup_timeout_sec"] = 90
+	originalHeaders := map[string]any{
+		"authorization": "Bearer stored-csghub-token",
+		"X-Tenant-ID":   "tenant-a",
+	}
+	config["headers"] = originalHeaders
+	current := availableKnowledgeBase()
+	current.Metadata.MCPEndpoint = "https://current-gateway.example.test/v1/llmwikis/wiki-content-42/mcp"
+	hubURL := installKnowledgeBaseResponse(t, current, "current-csghub-token")
+	prepared, err := HydrateManagedServer(context.Background(), config, Connection{
+		CSGHubBaseURL:     hubURL,
+		AIGatewayBaseURL:  "https://must-not-be-used.example.test/v1",
+		CSGHubAccessToken: "current-csghub-token",
+	})
+	if err != nil {
+		t.Fatalf("HydrateManagedServer() error = %v", err)
+	}
+	if got, want := prepared["url"], "https://current-gateway.example.test/v1/llmwikis/wiki-content-42/mcp"; got != want {
+		t.Fatalf("url = %#v, want %q", got, want)
+	}
+	headers := prepared["headers"].(map[string]any)
+	if _, exists := headers["authorization"]; exists {
+		t.Fatalf("headers retained stale case-variant Authorization: %#v", headers)
+	}
+	if got, want := headers["X-Tenant-ID"], "tenant-a"; got != want {
+		t.Fatalf("X-Tenant-ID = %#v, want %q", got, want)
+	}
+	if got, want := prepared["startup_timeout_sec"], float64(90); got != want {
+		t.Fatalf("startup_timeout_sec = %#v, want %#v", got, want)
+	}
+	if got, want := originalHeaders["authorization"], "Bearer stored-csghub-token"; got != want {
+		t.Fatalf("original authorization = %#v, want %q", got, want)
+	}
+}
+
+func TestHydrateTemplateServersRefreshesEndpointWithoutPersistingRunnerToken(t *testing.T) {
+	originalLoader := loadInteractiveConnection
+	defer func() { loadInteractiveConnection = originalLoader }()
+	loadInteractiveConnection = func(context.Context) (Connection, bool, error) {
+		return Connection{}, false, nil
+	}
+	current := availableKnowledgeBase()
+	current.Metadata.MCPEndpoint = "https://runner-gateway.example.test/v1/llmwikis/wiki-content-42/mcp"
+	hubURL := installKnowledgeBaseResponse(t, current, "template-runner-token")
+	t.Setenv("CSGHUB_API_BASE_URL", hubURL)
+	t.Setenv("CSGHUB_USER_TOKEN", "template-runner-token")
+	t.Setenv("CSGHUB_AIGATEWAY_BASE_URL", "https://must-not-be-used.example.test/v1")
+
+	_, installed, err := ServerConfig(availableKnowledgeBase(), "publisher-token")
+	if err != nil {
+		t.Fatalf("ServerConfig() error = %v", err)
+	}
+	delete(installed, "headers")
+	installed["url"] = "https://untrusted-template.example.test/steal-token"
+
+	hydrated, err := HydrateTemplateServers(context.Background(), map[string]any{"wiki-content-42": installed})
+	if err != nil {
+		t.Fatalf("HydrateTemplateServers() error = %v", err)
+	}
+	entry := hydrated["wiki-content-42"].(map[string]any)
+	if got, want := entry["url"], "https://runner-gateway.example.test/v1/llmwikis/wiki-content-42/mcp"; got != want {
+		t.Fatalf("url = %#v, want %q", got, want)
+	}
+	if _, exists := entry["headers"]; exists {
+		t.Fatalf("hydrated config persisted runner credentials: %#v", entry)
+	}
+	if _, managed := ManagedMetadataFromServer(entry); !managed {
+		t.Fatalf("hydrated config lost managed _meta: %#v", entry)
+	}
+}
+
+func TestHydrateTemplateServersKeepsSanitizedSnapshotWhenHydrationFails(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*testing.T)
+	}{
+		{
+			name: "knowledge base unavailable",
+			configure: func(t *testing.T) {
+				current := availableKnowledgeBase()
+				current.Metadata.ResourceState = nil
+				t.Setenv("CSGHUB_API_BASE_URL", installKnowledgeBaseResponse(t, current, "template-runner-token"))
+				t.Setenv("CSGHUB_USER_TOKEN", "template-runner-token")
+			},
+		},
+		{
+			name: "runner token rejected",
+			configure: func(t *testing.T) {
+				t.Setenv("CSGHUB_API_BASE_URL", installKnowledgeBaseErrorResponse(t, http.StatusUnauthorized, "invalid-runner-token"))
+				t.Setenv("CSGHUB_USER_TOKEN", "invalid-runner-token")
+			},
+		},
+		{name: "runner token missing", configure: func(*testing.T) {}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			originalLoader := loadInteractiveConnection
+			t.Cleanup(func() { loadInteractiveConnection = originalLoader })
+			loadInteractiveConnection = func(context.Context) (Connection, bool, error) {
+				return Connection{}, false, nil
+			}
+			t.Setenv("CSGHUB_ACCESS_TOKEN", "")
+			t.Setenv("CSGHUB_USER_TOKEN", "")
+			test.configure(t)
+
+			_, installed, err := ServerConfig(availableKnowledgeBase(), "publisher-token")
+			if err != nil {
+				t.Fatalf("ServerConfig() error = %v", err)
+			}
+			delete(installed, "headers")
+			installed["url"] = "https://template.example.test/sanitized-snapshot"
+
+			hydrated, err := HydrateTemplateServers(context.Background(), map[string]any{"wiki-content-42": installed})
+			if err != nil {
+				t.Fatalf("HydrateTemplateServers() error = %v", err)
+			}
+			entry := hydrated["wiki-content-42"].(map[string]any)
+			if got, want := entry["url"], "https://template.example.test/sanitized-snapshot"; got != want {
+				t.Fatalf("url = %#v, want %q", got, want)
+			}
+			if _, exists := entry["headers"]; exists {
+				t.Fatalf("fallback config injected credentials: %#v", entry)
+			}
+			if _, managed := ManagedMetadataFromServer(entry); !managed {
+				t.Fatalf("fallback config lost managed metadata: %#v", entry)
+			}
+		})
+	}
+}
+
+func TestRuntimeServersUsesLocalProxyAuthenticationAndRemovesOnlyManagedMeta(t *testing.T) {
+	name, config, err := ServerConfig(availableKnowledgeBase(), "runner-token")
+	if err != nil {
+		t.Fatalf("ServerConfig() error = %v", err)
+	}
+	config[ManagedMetaKey].(map[string]any)["third-party"] = map[string]any{"trace": "keep"}
+	runtimeServers, err := RuntimeServers(map[string]any{name: config}, "http://127.0.0.1:18080", "internal-token")
+	if err != nil {
+		t.Fatalf("RuntimeServers() error = %v", err)
+	}
+	entry := runtimeServers[name].(map[string]any)
+	if got, want := entry["url"], "http://127.0.0.1:18080/api/v1/knowledge-bases/wiki-content-42/mcp"; got != want {
+		t.Fatalf("url = %#v, want %q", got, want)
+	}
+	headers := entry["headers"].(map[string]any)
+	if got, want := headers["Authorization"], "Bearer internal-token"; got != want {
+		t.Fatalf("Authorization = %#v, want %q", got, want)
+	}
+	if _, managed := ManagedMetadataFromServer(entry); managed {
+		t.Fatalf("runtime config retained managed metadata: %#v", entry)
+	}
+	meta := entry[ManagedMetaKey].(map[string]any)
+	if _, ok := meta["third-party"]; !ok {
+		t.Fatalf("runtime config removed unrelated _meta: %#v", entry)
+	}
+}

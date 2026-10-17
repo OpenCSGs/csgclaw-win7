@@ -1,0 +1,151 @@
+package codex
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	agentruntime "csgclaw/internal/runtime"
+)
+
+const (
+	localWorkspaceDirOptionKey = "local_workspace_dir"
+	executionModeOptionKey     = "execution_mode"
+	memoryModeOptionKey        = "memory_mode"
+	ExecutionModeStandard      = "standard"
+	ExecutionModeReadOnly      = "read_only"
+	MemoryModeEnabled          = "enabled"
+	MemoryModeDisabled         = "disabled"
+)
+
+type RuntimeOptions struct {
+	LocalWorkspaceDir string `json:"local_workspace_dir"`
+	ExecutionMode     string `json:"execution_mode"`
+	MemoryMode        string `json:"memory_mode"`
+}
+
+func DecodeRuntimeOptions(raw map[string]any) (RuntimeOptions, error) {
+	if len(raw) == 0 {
+		return defaultRuntimeOptions(), nil
+	}
+	if value, ok := raw["auto_compact"]; ok && value != "enabled" && value != true {
+		return RuntimeOptions{}, fmt.Errorf("this Codex runtime does not support disabling automatic context compaction")
+	}
+	opts := defaultRuntimeOptions()
+	if value, ok := raw[localWorkspaceDirOptionKey]; ok && value != nil {
+		text, ok := value.(string)
+		if !ok {
+			return RuntimeOptions{}, fmt.Errorf("%s must be a string", localWorkspaceDirOptionKey)
+		}
+		opts.LocalWorkspaceDir = strings.TrimSpace(text)
+	}
+	if value, ok := raw[executionModeOptionKey]; ok && value != nil {
+		text, ok := value.(string)
+		if !ok {
+			return RuntimeOptions{}, fmt.Errorf("%s must be a string", executionModeOptionKey)
+		}
+		mode := strings.ToLower(strings.TrimSpace(text))
+		if mode != "" {
+			switch mode {
+			case ExecutionModeStandard, ExecutionModeReadOnly:
+				opts.ExecutionMode = mode
+			default:
+				return RuntimeOptions{}, fmt.Errorf("%s must be %q or %q", executionModeOptionKey, ExecutionModeStandard, ExecutionModeReadOnly)
+			}
+		}
+	}
+	if value, ok := raw[memoryModeOptionKey]; ok && value != nil {
+		text, ok := value.(string)
+		if !ok {
+			return RuntimeOptions{}, fmt.Errorf("%s must be a string", memoryModeOptionKey)
+		}
+		mode := strings.ToLower(strings.TrimSpace(text))
+		if mode != "" {
+			switch mode {
+			case MemoryModeEnabled, MemoryModeDisabled:
+				opts.MemoryMode = mode
+			default:
+				return RuntimeOptions{}, fmt.Errorf("%s must be %q or %q", memoryModeOptionKey, MemoryModeEnabled, MemoryModeDisabled)
+			}
+		}
+	}
+	return opts, nil
+}
+
+func defaultRuntimeOptions() RuntimeOptions {
+	return RuntimeOptions{
+		ExecutionMode: ExecutionModeStandard,
+		MemoryMode:    MemoryModeEnabled,
+	}
+}
+
+func IsReadOnlyExecutionMode(raw map[string]any) bool {
+	opts, err := DecodeRuntimeOptions(raw)
+	return err == nil && opts.ExecutionMode == ExecutionModeReadOnly
+}
+
+func ResolveWorkspaceDir(agentHome string, raw map[string]any) (string, error) {
+	agentHome = strings.TrimSpace(agentHome)
+	if agentHome == "" {
+		return "", fmt.Errorf("agent home is required")
+	}
+	opts, err := DecodeRuntimeOptions(raw)
+	if err != nil {
+		return "", err
+	}
+	if opts.LocalWorkspaceDir != "" {
+		return opts.LocalWorkspaceDir, nil
+	}
+	return filepath.Join(agentHome, filepath.FromSlash(hostStateDirName), workspaceDirName), nil
+}
+
+func (r *Runtime) RuntimeOptionsSchema() []agentruntime.RuntimeOptionSchema {
+	return []agentruntime.RuntimeOptionSchema{
+		{
+			Key:           executionModeOptionKey,
+			Path:          executionModeOptionKey,
+			Label:         "Execution Mode",
+			LabelZh:       "运行模式",
+			LabelEn:       "Execution Mode",
+			Description:   "Standard mode can act on data; read-only mode can only analyze provided content and approved read-only data sources.",
+			DescriptionZh: "标准模式可操作数据；只读模式仅可分析已提供内容并查询允许的只读数据源。",
+			DescriptionEn: "Standard mode can act on data; read-only mode can only analyze provided content and approved read-only data sources.",
+			Type:          "select",
+			Options:       []string{ExecutionModeStandard, ExecutionModeReadOnly},
+			Choices: []agentruntime.RuntimeOptionChoice{
+				{
+					Value:         ExecutionModeStandard,
+					Label:         "Standard mode",
+					LabelZh:       "标准模式",
+					LabelEn:       "Standard mode",
+					Description:   "Can read and modify data and use tools allowed by the runtime environment.",
+					DescriptionZh: "可读取和修改数据，并使用运行环境允许的工具。",
+					DescriptionEn: "Can read and modify data and use tools allowed by the runtime environment.",
+				},
+				{
+					Value:         ExecutionModeReadOnly,
+					Label:         "Read-only mode",
+					LabelZh:       "只读模式",
+					LabelEn:       "Read-only mode",
+					Description:   "Can only analyze conversation content, load assigned Skill instructions, and query read-only data sources; cannot read local files, inspect environment variables, or run commands.",
+					DescriptionZh: "仅可分析对话内容、加载已分配 Skill 的主说明并查询只读数据源；不能读取本地文件、环境变量或执行命令。",
+					DescriptionEn: "Can only analyze conversation content, load assigned Skill instructions, and query read-only data sources; cannot read local files, inspect environment variables, or run commands.",
+				},
+			},
+			DefaultValue: ExecutionModeStandard,
+			Presentation: "codex_execution_mode",
+		},
+		{
+			Key:           localWorkspaceDirOptionKey,
+			Path:          localWorkspaceDirOptionKey,
+			Label:         "Local Workspace Dir",
+			LabelZh:       "本地工作目录",
+			LabelEn:       "Local Workspace Dir",
+			Description:   "Leave empty to use the default agent workspace.",
+			DescriptionZh: "留空时使用默认 Agent 工作目录。",
+			DescriptionEn: "Leave empty to use the default agent workspace.",
+			Type:          "directory",
+			Picker:        "optional",
+		},
+	}
+}

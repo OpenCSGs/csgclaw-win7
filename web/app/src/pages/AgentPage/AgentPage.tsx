@@ -1,0 +1,48 @@
+import { useLocation, useNavigate } from "react-router-dom";
+import { useWorkspaceControllerContext } from "@/hooks/workspace";
+import { WorkspacePaneTypes } from "@/models/routing";
+import { ConversationPage } from "@/pages/ConversationPage";
+import { AgentView } from "./components";
+
+export function AgentPage() {
+  const controller = useWorkspaceControllerContext();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const search = new URLSearchParams(location.search);
+
+  if (!controller.ready) {
+    return null;
+  }
+
+  const agentViewProps = controller.agentViewProps;
+  if (!agentViewProps?.item) {
+    if (controller.activePane.type === WorkspacePaneTypes.notifications) {
+      return (
+        <section className="entity-pane agent-detail-pane notification-participant-detail-pane">
+          <div className="empty-state shell-empty-state">
+            <strong>{controller.t("noNotificationBots")}</strong>
+          </div>
+        </section>
+      );
+    }
+    return <ConversationPage />;
+  }
+
+  return (
+    <AgentView
+      {...agentViewProps}
+      item={agentViewProps.item}
+      requestedProfileTab={search.get("tab") === "connectors" ? "apps" : search.get("tab") || undefined}
+      requestedAppID={search.get("connector") || undefined}
+      requestedAddAppID={search.get("add_connector") || undefined}
+      onProfileTabChange={(tab, appID) => {
+        const next = new URLSearchParams(location.search);
+        next.set("tab", tab === "apps" || tab === "mcp" ? "connectors" : tab);
+        next.delete("add_connector");
+        if (appID) next.set("connector", appID);
+        else next.delete("connector");
+        void navigate({ pathname: location.pathname, search: next.toString() });
+      }}
+    />
+  );
+}

@@ -1,0 +1,735 @@
+# Release on tag v* / workflow_dispatch.
+#
+# Builds release archives; csgclaw bundles include the Linux sandbox CLI.
+#
+# <version> is the git tag (v*) or workflow_dispatch input.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Alpha only (for example v0.2.1-alpha.1); beta/stable releases must use tags"
+        required: true
+      desktop_target:
+        description: "Single desktop target to package"
+        required: true
+        type: choice
+        default: darwin-arm64
+        options:
+          - darwin-arm64
+          - darwin-amd64
+          - windows-amd64
+          - linux-amd64
+          - linux-arm64
+
+permissions:
+  contents: read
+
+env:
+  BOXLITE_CLI_VERSION: v0.9.0
+  OSSUTIL_VERSION: "2.3.0"
+  OSSUTIL_LINUX_AMD64_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
+
+jobs:
+  prepare:
+    # The Win7 repository publishes through win7-compat.yml instead.
+    if: github.repository == 'OpenCSGs/csgclaw'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      desktop_matrix: ${{ steps.set-matrix.outputs.desktop_matrix }}
+      version: ${{ steps.release_meta.outputs.version }}
+      release_channel: ${{ steps.release_meta.outputs.release_channel }}
+      oss_manifest_url: ${{ steps.release_meta.outputs.oss_manifest_url }}
+      commit: ${{ steps.release_meta.outputs.commit }}
+      build_time: ${{ steps.release_meta.outputs.build_time }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: desktop/package.json
+
+      - name: Validate manual alpha version
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if ! validation_error="$(node scripts/desktop-release-artifacts.mjs validate-manual-alpha "${DISPATCH_VERSION}" 2>&1)"; then
+            echo "::error title=Invalid manual release version::${validation_error}"
+            exit 1
+          fi
+
+      - name: Build matrix from release-platforms.txt
+        id: set-matrix
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          DESKTOP_TARGET: ${{ github.event.inputs.desktop_target }}
+        run: |
+          python3 <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          from pathlib import Path
+
+          rows = []
+          desktop_rows = []
+          release_event = os.environ["RELEASE_EVENT"]
+          requested_desktop_target = os.environ.get("DESKTOP_TARGET", "").strip()
+          desktop_runners = {
+              ("linux", "amd64"): "ubuntu-24.04",
+              ("linux", "arm64"): "ubuntu-24.04-arm",
+              ("darwin", "arm64"): "macos-15",
+              ("darwin", "amd64"): "macos-15-intel",
+              ("windows", "amd64"): "windows-2025",
+          }
+          for line in Path("scripts/release-platforms.txt").read_text().splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              parts = line.split()
+              if len(parts) != 2:
+                  raise SystemExit(f"bad platform line: {line!r}")
+              goos, goarch = parts
+              row = {"goos": goos, "goarch": goarch}
+              rows.append(row)
+              target = f"{goos}-{goarch}"
+              if release_event == "workflow_dispatch" and target != requested_desktop_target:
+                  continue
+              try:
+                  desktop_rows.append({**row, "runner": desktop_runners[(goos, goarch)]})
+              except KeyError:
+                  raise SystemExit(f"no desktop runner configured for {goos}/{goarch}")
+          if release_event == "workflow_dispatch" and len(desktop_rows) != 1:
+              raise SystemExit(f"unsupported desktop target: {requested_desktop_target!r}")
+          print("matrix=" + json.dumps({"include": rows}))
+          print("desktop_matrix=" + json.dumps({"include": desktop_rows}))
+          PY
+
+      - name: Resolve release metadata
+        id: release_meta
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${DISPATCH_VERSION}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          release_channel="$(node scripts/desktop-release-artifacts.mjs channel "${version}")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_channel=${release_channel}" >> "$GITHUB_OUTPUT"
+          echo "oss_manifest_url=https://opencsg-public-resource.oss-cn-beijing.aliyuncs.com/csgclaw-desktop/channels/${release_channel}/downloads.json" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  web:
+    if: ${{ github.repository == 'OpenCSGs/csgclaw' && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: web/app/package.json
+
+      - name: Enable Corepack
+        shell: bash
+        run: corepack enable
+
+      - name: Resolve pnpm store path
+        id: pnpm_store
+        shell: bash
+        working-directory: web/app
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm_store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('web/app/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install Web UI dependencies
+        shell: bash
+        working-directory: web/app
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Web UI
+        shell: bash
+        working-directory: web/app
+        run: |
+          mkdir -p ../static-dist
+          pnpm build
+          test -f ../static-dist/index.html
+
+      - name: Upload Web UI static assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-static-dist
+          path: web/static-dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    if: ${{ github.event_name == 'push' }}
+    needs: [prepare, web]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare Web UI embed directory
+        shell: bash
+        run: |
+          rm -rf web/static-dist
+          mkdir -p web/static-dist
+
+      - name: Download Web UI static assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-static-dist
+          path: web/static-dist
+
+      - name: Verify builtin agent image refs
+        shell: bash
+        run: |
+          shopt -s nullglob
+          manifests=(internal/template/embed/*/*/agent.toml)
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo "no builtin agent manifests found under internal/template/embed" >&2
+            exit 1
+          fi
+          for manifest in "${manifests[@]}"; do
+            runtime_kind="$(awk -F ' *= *' '$1 == "runtime_kind" { gsub(/"/, "", $2); print $2; exit }' "${manifest}")"
+            case "${runtime_kind}" in
+              openclaw|picoclaw) ;;
+              *) continue ;;
+            esac
+
+            if ! grep -Eq '^ref = "[^"]+"' "${manifest}"; then
+              echo "missing image ref in ${manifest}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Package release archives (one platform)
+        shell: bash
+        run: |
+          chmod +x scripts/release-build-all.sh
+          VERSION="${{ needs.prepare.outputs.version }}" \
+          COMMIT="${{ needs.prepare.outputs.commit }}" \
+          BUILD_TIME="${{ needs.prepare.outputs.build_time }}" \
+          DIST_DIR=dist \
+          GOCACHE="${{ github.workspace }}/.gocache" \
+          BOXLITE_CLI_VERSION="${{ env.BOXLITE_CLI_VERSION }}" \
+          ./scripts/release-build-all.sh "${{ matrix.goos }}" "${{ matrix.goarch }}"
+
+      - name: Upload platform artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  desktop-build:
+    needs: [prepare]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.desktop_matrix) }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+      BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
+      CSGCLAW_DESKTOP_UPDATE_BASE_URL: https://opencsg-public-resource.oss-cn-beijing.aliyuncs.com/csgclaw-desktop/channels/${{ needs.prepare.outputs.release_channel }}/updates
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: web/app/package.json
+
+      - name: Enable Corepack
+        shell: bash
+        run: corepack enable
+
+      - name: Resolve pnpm store path
+        id: pnpm_store
+        shell: bash
+        working-directory: desktop
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore pnpm store cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm_store.outputs.path }}
+          key: ${{ runner.os }}-${{ runner.arch }}-pnpm-${{ hashFiles('web/app/pnpm-lock.yaml', 'desktop/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-pnpm-
+
+      - name: Install Linux package tools
+        if: ${{ matrix.goos == 'linux' }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends fakeroot dpkg
+
+      - name: Configure macOS signing
+        if: ${{ matrix.goos == 'darwin' }}
+        shell: bash
+        env:
+          CI_MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.CSGCLAW_MACOS_CERTIFICATE_P12_BASE64 }}
+          CI_MACOS_CERTIFICATE_PASSWORD: ${{ secrets.CSGCLAW_MACOS_CERTIFICATE_PASSWORD }}
+          EXPECTED_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "${CI_MACOS_CERTIFICATE_P12_BASE64:-}" ] || [ -z "${CI_MACOS_CERTIFICATE_PASSWORD:-}" ]; then
+            echo "::error::Configure CSGCLAW_MACOS_CERTIFICATE_P12_BASE64 and CSGCLAW_MACOS_CERTIFICATE_PASSWORD."
+            exit 1
+          fi
+          if [ -z "${EXPECTED_APPLE_TEAM_ID:-}" ]; then
+            echo "::error::Configure APPLE_TEAM_ID so the imported signing identity can be validated."
+            exit 1
+          fi
+
+          certificate_path="${RUNNER_TEMP}/csgclaw-signing.p12"
+          keychain_path="${RUNNER_TEMP}/csgclaw-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          {
+            echo "CSGCLAW_CI_MACOS_KEYCHAIN=${keychain_path}"
+            echo "CSGCLAW_CI_MACOS_CERTIFICATE_PATH=${certificate_path}"
+          } >> "$GITHUB_ENV"
+          node --input-type=module -e 'import fs from "node:fs"; fs.writeFileSync(process.argv[1], Buffer.from(process.env.CI_MACOS_CERTIFICATE_P12_BASE64, "base64"), { mode: 0o600 });' "${certificate_path}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${certificate_path}" -k "${keychain_path}" -P "${CI_MACOS_CERTIFICATE_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${keychain_password}" "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}"
+
+          identity_output="$(security find-identity -v -p codesigning "${keychain_path}")"
+          sign_identity="$(
+            printf '%s\n' "${identity_output}" |
+              sed -nE 's/^[[:space:]]*[0-9]+\) [0-9A-Fa-f]+ "(Developer ID Application:.*)"$/\1/p'
+          )"
+          identity_count="$(printf '%s\n' "${sign_identity}" | awk 'NF { count += 1 } END { print count + 0 }')"
+          if [ "${identity_count}" -ne 1 ]; then
+            echo "::error::Expected exactly one valid Developer ID Application identity in the imported P12; found ${identity_count}."
+            printf '%s\n' "${identity_output}"
+            exit 1
+          fi
+          case "${sign_identity}" in
+            *"(${EXPECTED_APPLE_TEAM_ID})") ;;
+            *)
+              echo "::error::The imported Developer ID identity does not belong to APPLE_TEAM_ID ${EXPECTED_APPLE_TEAM_ID}."
+              exit 1
+              ;;
+          esac
+
+          echo "CSGCLAW_MACOS_SIGN_IDENTITY=${sign_identity}" >> "$GITHUB_ENV"
+
+      - name: Package macOS desktop artifacts
+        if: ${{ matrix.goos == 'darwin' }}
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "::error::Configure APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID for macOS notarization."
+            exit 1
+          fi
+          make desktop-package TARGET_OS="${{ matrix.goos }}" TARGET_ARCH="${{ matrix.goarch }}"
+
+      - name: Notarize and verify macOS disk image
+        if: ${{ matrix.goos == 'darwin' }}
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          app_path="$(find desktop/out -type d -name 'CSGClaw.app' -print -quit)"
+          if [ -z "${app_path}" ]; then
+            echo "::error::No packaged CSGClaw.app was produced."
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          xcrun stapler validate "${app_path}"
+
+          dmg_paths="$(find desktop/out/make -type f -name '*.dmg' -print)"
+          dmg_count="$(printf '%s\n' "${dmg_paths}" | awk 'NF { count += 1 } END { print count + 0 }')"
+          if [ "${dmg_count}" -ne 1 ]; then
+            echo "::error::Expected exactly one macOS DMG; found ${dmg_count}."
+            exit 1
+          fi
+          dmg_path="${dmg_paths}"
+
+          codesign --force --timestamp \
+            --identifier 'com.opencsg.csgclaw.desktop.dmg' \
+            --sign "${CSGCLAW_MACOS_SIGN_IDENTITY}" \
+            "${dmg_path}"
+          xcrun notarytool submit "${dmg_path}" \
+            --apple-id "${APPLE_ID}" \
+            --password "${APPLE_PASSWORD}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --wait
+          xcrun stapler staple "${dmg_path}"
+          xcrun stapler validate "${dmg_path}"
+          hdiutil verify "${dmg_path}"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "${dmg_path}"
+
+      - name: Configure Windows signing
+        if: ${{ matrix.goos == 'windows' }}
+        shell: pwsh
+        env:
+          CI_WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.CSGCLAW_WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          CI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.CSGCLAW_WINDOWS_CERTIFICATE_PASSWORD }}
+          CI_WINDOWS_SIGN_TOOL: ${{ secrets.CSGCLAW_WINDOWS_SIGN_TOOL }}
+          CI_WINDOWS_SIGN_PARAMS: ${{ secrets.CSGCLAW_WINDOWS_SIGN_PARAMS }}
+        run: |
+          Remove-Item Env:CSGCLAW_WINDOWS_CERTIFICATE_FILE -ErrorAction SilentlyContinue
+          Remove-Item Env:CSGCLAW_WINDOWS_CERTIFICATE_PASSWORD -ErrorAction SilentlyContinue
+          Remove-Item Env:CSGCLAW_WINDOWS_SIGN_TOOL -ErrorAction SilentlyContinue
+          Remove-Item Env:CSGCLAW_WINDOWS_SIGN_PARAMS -ErrorAction SilentlyContinue
+
+          if ($env:CI_WINDOWS_CERTIFICATE_PFX_BASE64 -and $env:CI_WINDOWS_CERTIFICATE_PASSWORD) {
+            $certificatePath = Join-Path $env:RUNNER_TEMP "csgclaw-signing.pfx"
+            [System.IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CI_WINDOWS_CERTIFICATE_PFX_BASE64))
+            "CSGCLAW_WINDOWS_CERTIFICATE_FILE=$certificatePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "CSGCLAW_WINDOWS_CERTIFICATE_PASSWORD=$env:CI_WINDOWS_CERTIFICATE_PASSWORD" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+          if ($env:CI_WINDOWS_SIGN_TOOL -and $env:CI_WINDOWS_SIGN_PARAMS) {
+            "CSGCLAW_WINDOWS_SIGN_TOOL=$env:CI_WINDOWS_SIGN_TOOL" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "CSGCLAW_WINDOWS_SIGN_PARAMS=$env:CI_WINDOWS_SIGN_PARAMS" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Configure Windows remote releases
+        if: ${{ matrix.goos == 'windows' }}
+        shell: bash
+        run: |
+          remote_releases_url="${CSGCLAW_DESKTOP_UPDATE_BASE_URL}/win32/x64"
+          if curl --fail --silent --output /dev/null "${remote_releases_url}/RELEASES"; then
+            echo "CSGCLAW_WINDOWS_REMOTE_RELEASES_URL=${remote_releases_url}" >> "$GITHUB_ENV"
+          else
+            echo "::notice::No previous Windows RELEASES index exists; creating a full initial Squirrel package without delta history."
+          fi
+
+      - name: Package Unix desktop artifacts
+        if: ${{ matrix.goos == 'linux' }}
+        shell: bash
+        run: |
+          make desktop-package TARGET_OS="${{ matrix.goos }}" TARGET_ARCH="${{ matrix.goarch }}"
+
+      - name: Package Windows desktop artifacts
+        if: ${{ matrix.goos == 'windows' }}
+        shell: pwsh
+        run: .\scripts\build.cmd desktop-package
+
+      - name: Stage Unix release assets
+        if: ${{ matrix.goos != 'windows' }}
+        shell: bash
+        run: |
+          node scripts/collect-desktop-release-assets.mjs "$VERSION" "${{ matrix.goos }}" "${{ matrix.goarch }}" desktop/out/make dist
+
+      - name: Stage Windows release assets
+        if: ${{ matrix.goos == 'windows' }}
+        shell: pwsh
+        run: node scripts/collect-desktop-release-assets.mjs $env:VERSION "${{ matrix.goos }}" "${{ matrix.goarch }}" desktop/out/make dist
+
+      - name: Remove temporary macOS keychain
+        if: ${{ always() && matrix.goos == 'darwin' }}
+        shell: bash
+        run: |
+          if [ -n "${CSGCLAW_CI_MACOS_KEYCHAIN:-}" ]; then
+            security delete-keychain "${CSGCLAW_CI_MACOS_KEYCHAIN}" || true
+          fi
+          if [ -n "${CSGCLAW_CI_MACOS_CERTIFICATE_PATH:-}" ]; then
+            rm -f "${CSGCLAW_CI_MACOS_CERTIFICATE_PATH}"
+          fi
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-store-build:
+    if: ${{ github.event_name == 'push' && needs.prepare.outputs.release_channel == 'release' }}
+    needs: [prepare]
+    uses: ./.github/workflows/windows-store-msix.yml
+    permissions:
+      actions: write
+      contents: read
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
+  merge-and-release:
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' && needs.desktop-build.result == 'success' && (needs.windows-store-build.result == 'success' || needs.windows-store-build.result == 'skipped') }}
+    needs: [prepare, build, desktop-build, windows-store-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download all desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download Microsoft Store artifact
+        if: ${{ needs.windows-store-build.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-store-dist-windows-amd64
+          path: dist
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          prerelease: ${{ needs.prepare.outputs.release_channel == 'beta' }}
+          files: dist/csgclaw*
+
+  publish-desktop-oss:
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.merge-and-release.result == 'success' }}
+    needs: [prepare, merge-and-release]
+    concurrency:
+      group: desktop-oss-${{ needs.prepare.outputs.release_channel }}
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: write
+      contents: read
+    environment:
+      name: oss-publish
+      url: ${{ needs.prepare.outputs.oss_manifest_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: desktop/package.json
+
+      - name: Download desktop release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-dist-*
+          path: desktop-release
+          merge-multiple: true
+
+      - name: Download Server and CLI release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: desktop-release
+          merge-multiple: true
+
+      - name: Install ossutil
+        shell: bash
+        run: |
+          archive="${RUNNER_TEMP}/ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
+          extract_dir="${RUNNER_TEMP}/ossutil"
+          bin_dir="${RUNNER_TEMP}/ossutil-bin"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${archive}" \
+            "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
+          printf '%s  %s\n' "${OSSUTIL_LINUX_AMD64_SHA256}" "${archive}" | sha256sum --check -
+          unzip -q "${archive}" -d "${extract_dir}"
+          install -Dm755 \
+            "${extract_dir}/ossutil-${OSSUTIL_VERSION}-linux-amd64/ossutil" \
+            "${bin_dir}/ossutil"
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+
+      - name: Validate OSS credentials
+        shell: bash
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: |
+          if [ -z "${OSS_ACCESS_KEY_ID}" ] || [ -z "${OSS_ACCESS_KEY_SECRET}" ]; then
+            echo "::error::Configure OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET in the selected GitHub environment."
+            exit 1
+          fi
+
+      - name: Publish desktop installers to OSS
+        shell: bash
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: |
+          make desktop-oss-publish \
+            VERSION="${{ needs.prepare.outputs.version }}" \
+            DESKTOP_OSS_CHANNEL="${{ needs.prepare.outputs.release_channel }}" \
+            DESKTOP_OSS_RELEASE_DIR=desktop-release \
+            DESKTOP_OSS_REQUIRE_PACKAGES=1
+
+      - name: Delete artifacts from successful workflow run
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          mapfile -t artifact_ids < <(
+            gh api --paginate \
+              "repos/${GH_REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+              --jq '.artifacts[].id'
+          )
+
+          printf 'Deleting %d artifacts from workflow run %s\n' "${#artifact_ids[@]}" "${RUN_ID}"
+          for artifact_id in "${artifact_ids[@]}"; do
+            deleted=false
+            for attempt in 1 2 3; do
+              if gh api --method DELETE --silent \
+                "repos/${GH_REPO}/actions/artifacts/${artifact_id}"; then
+                deleted=true
+                break
+              fi
+              sleep $((attempt * 2))
+            done
+
+            if [[ "${deleted}" != true ]]; then
+              echo "::warning::Failed to delete artifact ${artifact_id} after 3 attempts. It will expire through the one-day retention policy."
+              exit 1
+            fi
+          done
+
+  publish-manual-desktop-packages:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [prepare, desktop-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
+    environment:
+      name: oss-publish
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: desktop/package.json
+
+      - name: Download selected desktop package
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-dist-${{ github.event.inputs.desktop_target }}
+          path: desktop-release
+
+      - name: Install ossutil
+        shell: bash
+        run: |
+          archive="${RUNNER_TEMP}/ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
+          extract_dir="${RUNNER_TEMP}/ossutil"
+          bin_dir="${RUNNER_TEMP}/ossutil-bin"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${archive}" \
+            "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
+          printf '%s  %s\n' "${OSSUTIL_LINUX_AMD64_SHA256}" "${archive}" | sha256sum --check -
+          unzip -q "${archive}" -d "${extract_dir}"
+          install -Dm755 \
+            "${extract_dir}/ossutil-${OSSUTIL_VERSION}-linux-amd64/ossutil" \
+            "${bin_dir}/ossutil"
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+
+      - name: Validate OSS credentials
+        shell: bash
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: |
+          if [ -z "${OSS_ACCESS_KEY_ID}" ] || [ -z "${OSS_ACCESS_KEY_SECRET}" ]; then
+            echo "::error::Configure OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET in the selected GitHub environment."
+            exit 1
+          fi
+
+      - name: Upload selected desktop packages to OSS
+        shell: bash
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: |
+          make desktop-oss-upload-packages \
+            VERSION="${{ needs.prepare.outputs.version }}" \
+            DESKTOP_OSS_TARGETS="${{ github.event.inputs.desktop_target }}" \
+            DESKTOP_OSS_RELEASE_DIR=desktop-release
+
+      - name: Delete artifacts from successful workflow run
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          mapfile -t artifact_ids < <(
+            gh api --paginate \
+              "repos/${GH_REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+              --jq '.artifacts[].id'
+          )
+
+          printf 'Deleting %d artifacts from workflow run %s\n' "${#artifact_ids[@]}" "${RUN_ID}"
+          for artifact_id in "${artifact_ids[@]}"; do
+            deleted=false
+            for attempt in 1 2 3; do
+              if gh api --method DELETE --silent \
+                "repos/${GH_REPO}/actions/artifacts/${artifact_id}"; then
+                deleted=true
+                break
+              fi
+              sleep $((attempt * 2))
+            done
+
+            if [[ "${deleted}" != true ]]; then
+              echo "::warning::Failed to delete artifact ${artifact_id} after 3 attempts. It will expire through the one-day retention policy."
+              exit 1
+            fi
+          done

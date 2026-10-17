@@ -1,0 +1,726 @@
+# CSGClaw CLI 文档
+
+本文档补充 [architecture.md](./architecture.md) 中的 CLI 章节。`architecture.md` 说明了 `csgclaw` 与 `csgclaw-cli` 的职责边界，而本文档记录当前代码中已经实现的命令、参数、默认值与实际行为。
+
+## CLI 定位
+
+`csgclaw` 是完整的本地运维 CLI，用于管理初始化、本地服务生命周期、Agent 运行时，以及共享的协作命令。
+
+`csgclaw-cli` 是轻量级 HTTP 客户端，主要面向 participant、Agent 和脚本。它只暴露协作相关命令，不负责初始化、配置文件管理或本地服务生命周期。
+
+两个 CLI 都是本地 API 的薄客户端，不会直接操作 BoxLite、底层存储或渠道 SDK。
+
+## 通用约定
+
+### 输出格式
+
+- `--output table` 输出适合人读的表格或纯文本。
+- `--output json` 输出结构化 JSON。
+- `-o` 是 `--output` 的简写。
+- 全局参数（`--output`、`-o`、`--endpoint`、`--token`）必须写在子命令**之前**（例如 `csgclaw-cli --output json template list`，不要写成 `csgclaw-cli template list --output json`）。
+- 如果不显式传入 `--output`：
+  - 输出到终端时，默认是 `table`
+  - 输出被管道或重定向时，默认是 `json`
+- 特殊情况：
+  - `csgclaw serve`、`csgclaw stop`、`csgclaw agent logs` 默认总是 `table`
+  - `csgclaw-cli --version` 默认是 `table`
+
+### 环境变量
+
+两个 CLI 都支持：
+
+- `CSGCLAW_BASE_URL`：默认 API 地址
+- `CSGCLAW_ACCESS_TOKEN`：默认 API Token
+
+如果同时传入 `--endpoint` 或 `--token`，命令行参数优先生效。
+
+### 渠道
+
+大多数协作命令都支持 `--channel`：
+
+- `csgclaw`
+- `feishu`
+
+如果不传，默认值是 `csgclaw`。
+
+### 配置与本地路径
+
+`csgclaw` 额外支持 `--config`，默认读取 `~/.csgclaw/config.toml`。
+
+常用默认路径如下：
+
+- 配置文件：`~/.csgclaw/config.toml`
+- 守护进程日志：`~/.csgclaw/server.log`
+- 守护进程 PID：`~/.csgclaw/server.pid`
+- agents、participants、model providers、teams 的 root state：`~/.csgclaw/state.json`
+- task 状态：`~/.csgclaw/tasks`
+- 内置 IM 状态：`~/.csgclaw/im/state.json`
+
+### IM 状态损坏或丢失
+
+如果启动报 `decode im bootstrap`，错误会指出无法解析的 IM 状态文件路径。
+不要删除该文件或重新初始化；先停止服务，并完整保留 `.csgclaw` 数据目录，在副本上排查或联系支持。
+Windows 上默认目录为 `%USERPROFILE%\.csgclaw`。
+如有已确认可用的备份，应恢复同一备份中的 IM 状态及对应会话、线程和附件数据，避免混用不同时间的文件。
+
+IM 状态保存使用同目录临时文件，写入并同步成功后替换原文件，避免直接截断正在使用的状态文件。
+如果状态文件缺失但仍存在会话、线程或附件文件，启动会停止并保留数据，防止把旧安装误判为新安装后清理历史记录。
+该保护不会自动重建已经损坏或被删除的数据，也不替代完整备份。
+房间或 Worker 在界面上消失并不等于所有 Agent 数据都已删除；IM 索引和根目录 Agent 状态需要分别检查。
+
+## `csgclaw`
+
+### 全局参数
+
+用法：
+
+```bash
+csgclaw [global-flags] <command> [args]
+```
+
+全局参数：
+
+- `--endpoint string`：HTTP 服务地址。默认来自 `CSGCLAW_BASE_URL`。
+- `--token string`：API 鉴权 Token。默认来自 `CSGCLAW_ACCESS_TOKEN`。
+- `--output string`：`table` 或 `json`。
+- `--config string`：配置文件路径。
+- `--version`、`-V`：打印版本并退出。
+
+顶层命令：
+
+- `serve`
+- `stop`
+- `upgrade`
+- `agent`
+- `model`
+- `participant`
+- `pt`
+- `user`
+- `room`
+- `member`
+- `message`
+- `completion`
+
+### Shell 补全
+
+两个 CLI 都可以生成 `bash`、`zsh` 和 `fish` 的 shell 补全脚本。
+
+示例：
+
+```bash
+csgclaw completion bash
+csgclaw completion zsh
+csgclaw completion fish
+```
+
+### `csgclaw serve`
+
+启动本地 HTTP 服务。
+
+用法：
+
+```bash
+csgclaw serve [-d|--daemon] [flags]
+```
+
+参数：
+
+- `--daemon`、`-d`：后台运行。
+- `--browser`：启动后自动打开浏览器。
+- `--no-browser`：明确禁止自动打开浏览器；这是默认行为，并且优先于 `--browser`。
+- `--no-auth-detect`：禁用启动时的 auth/model 自动检测，让 Manager Profile 配置流程保持未完成，便于手动测试。
+- `--log-level string`：日志级别，支持 `debug`、`info`、`warn`、`error`，默认 `info`。
+- `--log string`：后台模式日志路径，仅 daemon 模式有效。默认 `~/.csgclaw/server.log`。
+- `--pid string`：后台模式 PID 文件路径，仅 daemon 模式有效。默认 `~/.csgclaw/server.pid`。
+
+行为说明：
+
+- 从 `--config` 或 `~/.csgclaw/config.toml` 加载配置。
+- 如果本地配置或 bootstrap 状态不完整，启动前会自动初始化本地状态。
+- 启动前会校验最终模型配置是否完整。
+- 对 `csghub-lite` 会做连通性预检查。
+- 使用 `--no-auth-detect` 时，启动会跳过 CLI auth 自动导入和 Manager Profile provider/model 自动检测；已保存的完整 Manager Profile 不会被覆盖。
+- Codex CLI 会随 CSGClaw 安装包一起提供，并始终从安装包中启动，不依赖系统中已有的 Codex。
+- 前台模式下会打印生效配置和 IM 访问地址。
+- 只有设置 `--browser` 时才会自动打开浏览器。
+- 后台模式会拉起隐藏的 `_serve` 内部入口，并等待 `/healthz` 健康检查成功。
+
+示例：
+
+```bash
+csgclaw serve
+csgclaw serve --browser
+csgclaw serve --no-auth-detect --no-browser
+csgclaw serve --daemon
+csgclaw serve --config /path/to/config.toml
+csgclaw --endpoint http://127.0.0.1:18080 serve
+```
+
+### `csgclaw stop`
+
+停止后台运行的本地服务。
+
+用法：
+
+```bash
+csgclaw stop [flags]
+```
+
+参数：
+
+- `--pid string`：PID 文件路径。默认 `~/.csgclaw/server.pid`。
+
+行为说明：
+
+- 从 PID 文件读取进程号并发送 `SIGTERM`。
+- 如果进程已经不存在，会删除失效的 PID 文件并返回对应状态。
+
+### `csgclaw upgrade`
+
+检查最新版本，并在需要时安装升级。
+
+用法：
+
+```bash
+csgclaw upgrade [flags]
+```
+
+参数：
+
+- `--check`：只检查更新，不下载也不安装。
+- `--no-restart`：安装新 bundle，但不重启本地服务。
+
+行为说明：
+
+- `csgclaw upgrade --check` 会输出当前版本、最新版本、是否可升级，以及匹配到的 asset 名称。
+- `csgclaw upgrade` 会下载当前平台对应的 release archive，完成校验，安装完整官方 bundle，并在检测到 daemon 运行时自动重启。
+- `csgclaw upgrade --no-restart` 会安装新 bundle，但不会影响当前正在运行的 daemon 进程。
+- 自动安装只支持官方 bundle 布局，也就是当前可执行文件能够解析回独占的 `csgclaw/bin/csgclaw` 或 `csgclaw/bin/csgclaw.exe` 目录树。升级器绝不会整体替换 `~/.local`、`/usr/local` 这类共享目录。
+- Windows 平台的 release asset 使用 `.zip`；当前其他支持的平台使用 `.tar.gz`。
+- 自动重启只支持默认 PID 路径 `~/.csgclaw/server.pid`。如果 daemon 是用自定义 PID 或其他启动参数拉起的，请改用 `--no-restart` 后手动重启。
+
+常见失败场景：
+
+- 源码构建或手工复制单个二进制的安装方式可以使用 `--check`，但自动安装会被拒绝，因为没有可独占替换的 bundle 根目录。
+- 如果曾把二进制手工复制到 `~/.local/bin`，可重新执行 `curl -fsSL https://csgclaw.opencsg.com/install.sh | bash` 完成迁移。安装器会把受管 bundle 放到 `~/.local/lib/csgclaw`，并且只把 `~/.local/bin/csgclaw` 替换为软链接，不会改动 `~/.local/bin` 中的其他文件。
+- 如果下载后的 archive 没通过 size 或 SHA256 校验，CLI 会在安装前中止，并提示稍后重试或反馈 release 异常。
+- 如果 release archive 结构不合法，或者缺少 `bin/csgclaw` / `bin/csgclaw.exe`，CLI 会在安装前中止。
+- `bin/boxlite` 现在是可选的。没有它的 bundle 仍然是合法官方 bundle，并且在 `[sandbox].provider` 未设置时默认回退到 Docker。
+- 如果自动重启阶段无法使用默认 PID 路径，请重新执行 `csgclaw upgrade --no-restart`，然后手动运行 `csgclaw stop` 和 `csgclaw serve --daemon`。
+
+示例：
+
+```bash
+csgclaw upgrade --check
+csgclaw upgrade
+csgclaw upgrade --no-restart
+```
+
+### `csgclaw model auth`
+
+管理模型 Provider 通过嵌入式 CLIProxyAPI 使用的本地 Codex 和 Claude Code 鉴权。
+
+用法：
+
+```bash
+csgclaw model auth login <provider> [flags]
+csgclaw model auth logout <provider>
+```
+
+Provider：
+
+- `codex`
+- `claude-code`
+
+参数：
+
+- `--no-browser`：打印 OAuth URL，而不是自动打开浏览器。
+
+行为说明：
+
+- `codex` 会优先复用 `~/.codex/auth.json`，没有可用 token 时再启动 OAuth。
+- `claude-code` 会在 macOS 上优先探测 Keychain，没有可用 token 时再启动 OAuth。
+- 鉴权文件会写入 CSGClaw 管理的 CLIProxy auth 目录，默认是 `~/.csgclaw/auth`。
+- `logout` 会禁用本地 CLIProxy 鉴权记录，并阻止同一个 Codex home auth 或 Claude Keychain 记录被立刻重新导入。
+- 模型 Provider 鉴权放在 `csgclaw model auth` 下，不和服务端自身 API 鉴权混在一起。
+
+示例：
+
+```bash
+csgclaw model auth login codex
+csgclaw model auth login claude-code --no-browser
+csgclaw model auth logout codex
+```
+
+### `csgclaw agent`
+
+管理运行时 Agent。
+
+用法：
+
+```bash
+csgclaw agent <subcommand> [flags]
+```
+
+子命令：
+
+- `list`
+- `create`
+- `start`
+- `stop`
+- `delete`
+- `logs`
+
+#### `csgclaw agent list`
+
+用法：
+
+```bash
+csgclaw agent list [flags]
+```
+
+参数：
+
+- `--filter string`：按 Agent 状态过滤列表结果。
+
+#### `csgclaw agent create`
+
+用法：
+
+```bash
+csgclaw agent create [flags]
+csgclaw agent create [-r|--replace] --id <id> [flags]
+```
+
+参数：
+
+- `--replace`、`-r`：原地替换一个已存在的 Agent。
+- `--force`、`-f`：原地替换时跳过确认。
+- `--id string`：Agent ID。
+- `--name string`：Agent 名称。
+- `--description string`：Agent 描述。
+- `--image string`：Agent 镜像。
+- `--profile string`：Agent 使用的 LLM profile。
+- `--runtime string`：Agent runtime kind，例如 `picoclaw_sandbox` 或 `codex`。
+
+行为说明：
+
+- 不带 `--replace` 时，命令会创建一个新 Agent。
+- 带 `--replace` 时，必须传入 `--id`。
+- 带 `--replace` 时，CLI 会发送一次带有 `replace: true` 的 create 请求，并在 `field_mask` 中列出本次显式传入的字段。
+- API/service 会读取现有 Agent，保留未被 mask 选中的字段，应用 mask 中的字段，然后执行重建。
+- 原地替换默认会要求确认，除非传入 `--force`。
+- `image` 字段也遵循同样的 field-mask 行为：未显式传入时保留原值，显式传入 `--image` 时覆盖原值。
+- `runtime` 字段在 replace 时也遵循同样的 field-mask 行为：未显式传入时保留原 runtime kind，显式传入 `--runtime` 时覆盖原值。
+
+#### `csgclaw agent delete`
+
+用法：
+
+```bash
+csgclaw agent delete <id>
+csgclaw agent delete --all [-f|--force]
+```
+
+参数：
+
+- `--all`、`-a`：删除全部 Agent。
+- `--force`、`-f`：删除全部 Agent 时跳过确认。
+
+行为说明：
+
+- 不带 `--all` 时，必须且只能传入一个 Agent ID。
+- 带 `--all` 时，不能再传位置参数 ID。
+- 批量删除默认会要求确认，只有传入 `--force` 才会跳过。
+
+#### `csgclaw agent start`
+
+用法：
+
+```bash
+csgclaw agent start <id>
+```
+
+#### `csgclaw agent stop`
+
+用法：
+
+```bash
+csgclaw agent stop <id>
+```
+
+#### `csgclaw agent logs`
+
+用法：
+
+```bash
+csgclaw agent logs <id> [-f|--follow] [-n lines]
+```
+
+参数：
+
+- `-f`、`--follow`：持续跟随日志输出。
+- `-n int`：拉取的日志行数，默认 `20`。
+
+行为说明：
+
+- `-n` 必须大于 `0`。
+- 只有非 follow 模式支持 `--output json`。
+- `--output json --follow` 会直接报错。
+
+示例：
+
+```bash
+csgclaw agent list
+csgclaw agent list --filter running
+csgclaw agent create --name alice --description "frontend worker" --profile openai.gpt-5.4-mini
+csgclaw agent create --name alice --runtime codex --profile codex.gpt-5.4
+csgclaw agent create -r --id agent-alice
+csgclaw agent create --replace --id agent-alice --runtime codex --force
+csgclaw agent create --replace --id agent-alice --name alice-v2 --profile openai.gpt-5.4-mini --force
+csgclaw agent start agent-alice
+csgclaw agent stop agent-alice
+csgclaw agent logs agent-alice -n 50
+csgclaw agent logs agent-alice --follow
+csgclaw agent delete agent-alice
+csgclaw agent delete --all --force
+```
+
+说明：
+
+- `--runtime codex` 使用 CSGClaw 可执行文件同目录内置的 Codex CLI；不会查找系统 `PATH`，也不会使用用户单独安装的 Codex。
+
+### `csgclaw user`
+
+管理渠道用户。
+
+用法：
+
+```bash
+csgclaw user <subcommand> [flags]
+```
+
+子命令：
+
+- `list`
+- `create`
+- `delete`
+
+#### `csgclaw user list`
+
+用法：
+
+```bash
+csgclaw user list [flags]
+```
+
+参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+
+#### `csgclaw user create`
+
+用法：
+
+```bash
+csgclaw user create [flags]
+```
+
+参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--id string`：用户 ID。
+- `--name string`：用户名。
+- `--role string`：用户角色。
+- `--avatar string`：头像缩写，仅 `feishu` 使用。
+
+行为说明：
+
+- `--name` 为必填。
+- `csgclaw` 与 `feishu` 会走不同的后端路由和请求体结构。
+
+#### `csgclaw user delete`
+
+用法：
+
+```bash
+csgclaw user delete <id> [flags]
+```
+
+参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+
+示例：
+
+```bash
+csgclaw user list
+csgclaw user list --channel feishu
+csgclaw user create --name Alice --role worker
+csgclaw user create --channel feishu --name Alice --role manager --avatar AL
+csgclaw user delete alice
+```
+
+### `csgclaw` 中共享的协作命令组
+
+以下命令组与 `csgclaw-cli` 共享同一套实现，因此参数和行为完全一致。
+
+#### `participant`
+
+用法：
+
+```bash
+csgclaw participant <subcommand> [flags]
+csgclaw pt <subcommand> [flags]
+```
+
+子命令：
+
+- `list`
+- `create`
+- `bind`
+- `delete`
+
+`participant list` 参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--type string`：按 `human`、`agent` 或 `notification` 过滤。
+- `--agent-id string`：按绑定的 Agent ID 过滤。
+
+`participant create` 参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--id string`：participant ID。
+- `--name string`：必填，participant 显示名。
+- `--description string`：participant metadata 描述；`--bind create` 时也会作为 Agent 描述。
+- `--type string`：`human`、`agent` 或 `notification`，默认 `agent`。
+- `--channel-user-ref string`：渠道用户身份，例如本地 user ID 或飞书 open_id。
+- `--channel-user-kind string`：渠道用户身份类型，例如 `local_user_id` 或 `open_id`。
+- `--channel-app-ref string`：渠道 app/config 引用，例如飞书 app_id。
+- `--bind string`：Agent 绑定模式：`create`、`reuse` 或 `none`，默认 `none`。
+- `--agent-id string`：`--bind reuse` 时的 Agent ID；`--bind create` 时也可指定要创建的 Agent ID。
+- `--role string`：`--bind create` 时的 Agent role。
+- `--runtime string`：`--bind create` 时的 Agent runtime kind。
+- `--image string`：`--bind create` 时的 Agent image。
+- `--from-template string`：`--bind create` 时使用的 `template list` 原始模板 ID；远端 ID 格式为 `<namespace>/<name>`。
+- `--model-id string`：`--bind create` 时的 Agent model ID。
+- `--env KEY=VALUE`：`--bind create` 时的 Agent image 环境变量，可重复传入。
+
+`participant delete` 用法与参数：
+
+```bash
+csgclaw participant delete <id> [flags]
+```
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--delete-agent string`：Agent 清理模式，支持 `if_unreferenced`。
+
+`participant bind` 用于写入 Feishu participant 的凭证。
+当前仅支持 Feishu。
+
+`participant bind` 参数：
+
+- `--channel string`：仅支持 `feishu`，默认 `feishu`。
+- `--feishu-kind string`：`human` 或 `bot`。
+- `--admin`：绑定 Feishu 管理员 human。
+- `--open-id string`：当 `--feishu-kind human` 且 `--admin` 时必填。
+- `--name string`：admin participant 的显示名，可选。
+- `--agent string`：bot 绑定的目标 Agent。
+- `--app-id string`：bot 的 Feishu app id。
+- `--app-secret-file string`：从文件读取 app secret。
+- `--app-secret-env string`：从环境变量读取 app secret。
+- `--app-secret-stdin`：从 stdin 读取 app secret。
+- `--restart`：保存后重建目标 Agent。manager 重建成功时返回 `restart_status=manager_recreated`。
+
+`participant bind` 行为说明：
+
+- `--feishu-kind` 必须是 `human` 或 `bot`，且只允许一种。
+- `--feishu-kind human` 需要 `--admin` 和 `--open-id`。
+- `--feishu-kind bot` 需要 `--agent`、`--app-id`。
+- bot 绑定时，`--app-secret-file`、`--app-secret-env`、`--app-secret-stdin` 只能三选一。
+- `--restart` 默认关闭；不传时仅写配置。传入后会重建目标 Agent。
+- `pt bind` 与 `participant bind` 完全等价。
+
+#### `room`
+
+用法：
+
+```bash
+csgclaw room <subcommand> [flags]
+```
+
+子命令：
+
+- `list`
+- `create`
+- `delete`
+
+`room list` 参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+
+`room create` 参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--title string`：房间标题。
+- `--description string`：房间描述。
+- `--creator-id string`：创建者 participant ID，例如 `manager`。
+- `--member-ids string`：逗号分隔的 participant ID 列表，例如 `manager,dev`。
+- `--locale string`：房间 locale。
+
+`csgclaw-cli` 设计约束：创建 room 时只暴露 CSGClaw participant ID，不暴露 channel user ID、agent ID、飞书 open_id、飞书 app_id 或应用凭证。Feishu 渠道由 adapter 在内部把 participant ID 兑换为已配置的飞书应用凭证和渠道标识。飞书建群需要真人 owner ID 时，代码仍使用配置里的 `admin_open_id`，CLI 调用方仍只传 participant ID。
+
+`room delete` 用法与参数：
+
+```bash
+csgclaw room delete <id> [flags]
+```
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+
+#### `member`
+
+用法：
+
+```bash
+csgclaw member <subcommand> [flags]
+```
+
+子命令：
+
+- `list`
+- `create`
+
+`member list` 参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--room-id string`：目标房间 ID。
+
+`member create` 参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--room-id string`：目标房间 ID。
+- `--user-id string`：必填，要加入房间的 participant ID，例如 `dev`。
+- `--inviter-id string`：邀请人 participant ID，例如 `manager`。
+- `--locale string`：房间 locale。
+
+`member create` 行为说明：
+
+- `--user-id` 为必填。
+- `csgclaw-cli` 的成员操作在所有渠道下都应使用 participant ID。飞书 open_id 和 app_id 是渠道内部实现细节。
+
+#### `message`
+
+用法：
+
+```bash
+csgclaw message <subcommand> [flags]
+```
+
+子命令：
+
+- `list`
+- `create`
+
+`message list` 参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--room-id string`：必填。
+
+`message create` 参数：
+
+- `--channel string`：`csgclaw` 或 `feishu`，默认 `csgclaw`。
+- `--room-id string`：必填。
+- `--sender-id string`：必填，发送方 participant ID。
+- `--content string`：必填。
+- `--mention-id string`：可选，被提及 participant ID。
+
+`message list` 行为说明：
+
+- `--room-id` 为必填。
+
+示例：
+
+```bash
+csgclaw participant list
+csgclaw participant create --name alice --bind create --role worker --model-id gpt-5.4-mini
+csgclaw participant bind --channel feishu --feishu-kind human --admin --open-id ou_xxx
+csgclaw pt bind --channel feishu --feishu-kind bot --agent u-manager --app-id cli_xxx --app-secret-env FEISHU_APP_SECRET
+csgclaw room create --title "release-room" --creator-id manager --member-ids manager,alice
+csgclaw member create --room-id room-1 --user-id alice --inviter-id manager
+csgclaw message list --room-id room-1
+csgclaw message create --channel csgclaw --room-id room-1 --sender-id manager --content hello
+```
+
+## `csgclaw-cli`
+
+### 全局参数
+
+用法：
+
+```bash
+csgclaw-cli [global-flags] <command> [args]
+```
+
+全局参数：
+
+- `--endpoint string`：HTTP 服务地址。默认来自 `CSGCLAW_BASE_URL`。
+- `--token string`：API 鉴权 Token。默认来自 `CSGCLAW_ACCESS_TOKEN`。
+- `--output string`：`table` 或 `json`。
+- `--version`、`-V`：打印版本并退出。
+
+顶层命令：
+
+- `participant`
+- `pt`
+- `room`
+- `member`
+- `message`
+- `completion`
+
+### Shell 补全
+
+示例：
+
+```bash
+csgclaw-cli completion bash
+csgclaw-cli completion zsh
+csgclaw-cli completion fish
+```
+
+### 命令组
+
+`csgclaw-cli` 与 `csgclaw` 复用完全相同的实现，包含：
+
+- `participant list`
+- `participant create`
+- `participant delete`
+- `pt list`
+- `pt create`
+- `pt delete`
+- `participant bind`
+- `pt bind`
+- `room list`
+- `room create`
+- `room delete`
+- `member list`
+- `member create`
+- `message list`
+- `message create`
+
+因此，上述命令在两个 CLI 中的参数、默认值、校验逻辑和 JSON 输出结构完全一致。
+
+示例：
+
+```bash
+csgclaw-cli participant list --channel feishu --type agent
+csgclaw-cli pt create --name manager --channel feishu --type agent --bind create --role manager
+csgclaw-cli participant bind --channel feishu --feishu-kind human --admin --open-id ou_xxx
+csgclaw-cli pt bind --channel feishu --feishu-kind bot --agent u-manager --app-id cli_xxx --app-secret-stdin
+csgclaw-cli room create --channel feishu --title "ops-room" --creator-id manager --member-ids manager,dev
+csgclaw-cli member list --channel feishu --room-id oc_x
+csgclaw-cli member create --channel feishu --room-id oc_x --user-id dev --inviter-id manager
+csgclaw-cli message create --channel feishu --room-id oc_x --sender-id manager --mention-id dev --content hello
+```
+
+`csgclaw-cli` 是面向 participant 的 CLI。room、member、message 命令不应要求调用方理解或传入 agent ID、飞书 open_id、飞书 app_id、App ID/App Secret 或其他渠道凭证。各 channel adapter 负责把 participant ID 转换成目标渠道需要的标识。

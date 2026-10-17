@@ -1,0 +1,318 @@
+import {
+  MODEL_PROVIDER_IDS,
+  modelProviderConfigUsesOpenCSG,
+  modelProviderDisplayNameExists,
+  modelProviderCatalogForAgentAvailability,
+  modelProviderCatalogWithModels,
+  modelProviderCatalogForOpenCSGState,
+  modelProviderOptionsFromCatalog,
+  modelProviderSelectOptionsFromCatalog,
+  normalizeModelProviderCatalog,
+  parseModelProviderModelsText,
+  providerStatusTone,
+} from "@/models/modelProviders";
+
+describe("model provider catalog helpers", () => {
+  it.each(["codex", "claude_code"])("keeps failed %s unavailable despite cached or discovered models", (id) => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [{ id, builtin: true, status: "failed", models: ["cached-model"], image_models: ["cached-image"] }],
+    });
+    const staleOptions = [
+      {
+        value: `${id}.discovered-model`,
+        label: "discovered-model",
+        providerID: id,
+        providerDisplayName: id,
+        providerAvatar: "",
+        modelID: "discovered-model",
+      },
+    ];
+    const refreshed = modelProviderCatalogWithModels(catalog, id, ["discovered-model"]);
+    expect(modelProviderOptionsFromCatalog(refreshed)).toEqual([]);
+    expect(modelProviderSelectOptionsFromCatalog(refreshed, staleOptions)).toMatchObject([
+      { id, disabled: true, models: [], imageModels: [] },
+    ]);
+    const recovered = normalizeModelProviderCatalog({
+      providers: [{ id, builtin: true, status: "connected", models: ["available-model"] }],
+    });
+    expect(modelProviderSelectOptionsFromCatalog(recovered)).toMatchObject([{ id, models: ["available-model"] }]);
+    expect(modelProviderSelectOptionsFromCatalog(recovered)[0].disabled).not.toBe(true);
+  });
+
+  it("uses only the canonical OpenCSG model provider id for authentication guards", () => {
+    expect(MODEL_PROVIDER_IDS.OpenCSG).toBe("opencsg");
+    expect(modelProviderConfigUsesOpenCSG({ model_provider_id: "opencsg" })).toBe(true);
+    expect(modelProviderConfigUsesOpenCSG({ model_provider_id: " opencsg " })).toBe(true);
+    expect(modelProviderConfigUsesOpenCSG({ model_provider_id: "csghub" })).toBe(false);
+    expect(modelProviderConfigUsesOpenCSG({ model_provider_id: "open-csg" })).toBe(false);
+    expect(modelProviderConfigUsesOpenCSG(undefined)).toBe(false);
+  });
+
+  it("normalizes builtins before custom OpenAI-compatible providers", () => {
+    const catalog = normalizeModelProviderCatalog({
+      default_selector: "openai.gpt-4.1",
+      providers: [
+        {
+          id: "opencsg",
+          kind: "opencsg",
+          builtin: true,
+          display_name: "OpenCSG",
+          base_url: "https://ai.space.opencsg.com/v1",
+          models: ["opencsg/deepseek-v4"],
+        },
+        {
+          id: "openai",
+          kind: "openai_compatible",
+          display_name: "Team OpenAI",
+          api_key_set: true,
+          models: ["gpt-4.1"],
+        },
+        {
+          id: "codex",
+          kind: "codex",
+          builtin: true,
+          display_name: "Codex",
+          models: ["gpt-5.5"],
+          status: "connected",
+        },
+        {
+          id: "csghub-lite",
+          kind: "csghub_lite",
+          builtin: true,
+          display_name: "CSGHub Lite",
+          base_url: "http://127.0.0.1:11435/v1",
+          models: ["qwen3"],
+        },
+        {
+          id: "claude_code",
+          kind: "claude_code",
+          builtin: true,
+          display_name: "Claude Code",
+          models: ["claude-sonnet"],
+        },
+      ],
+    } as Record<string, unknown>);
+
+    expect(catalog.providers.map((provider) => provider.id)).toEqual([
+      "opencsg",
+      "csghub-lite",
+      "codex",
+      "claude_code",
+      "openai",
+    ]);
+    expect(catalog.builtinProviders.map((provider) => provider.id)).toEqual([
+      "opencsg",
+      "csghub-lite",
+      "codex",
+      "claude_code",
+    ]);
+    expect(catalog.customProviders.map((provider) => provider.id)).toEqual(["openai"]);
+    expect("default_selector" in catalog).toBe(false);
+  });
+
+  it("creates grouped model options from catalog providers", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [
+        {
+          id: "codex",
+          kind: "codex",
+          builtin: true,
+          display_name: "Codex",
+          models: ["gpt-5.5"],
+        },
+      ],
+    });
+
+    expect(modelProviderOptionsFromCatalog(catalog)).toEqual([
+      {
+        value: "codex.gpt-5.5",
+        label: "Codex / gpt-5.5",
+        providerID: "codex",
+        providerDisplayName: "Codex",
+        providerAvatar: "model-providers/codex.svg",
+        modelID: "gpt-5.5",
+        builtin: true,
+      },
+    ]);
+  });
+
+  it("filters Codex from agent provider choices when Codex CLI is unavailable", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [
+        {
+          id: "codex",
+          kind: "codex",
+          builtin: true,
+          display_name: "Codex",
+          models: ["gpt-5.5"],
+        },
+        {
+          id: "opencsg",
+          kind: "opencsg",
+          builtin: true,
+          display_name: "OpenCSG",
+          models: ["deepseek-v4"],
+        },
+      ],
+    });
+
+    const filtered = modelProviderCatalogForAgentAvailability(catalog, { codexAvailable: false });
+
+    expect(filtered?.providers.map((provider) => provider.id)).toEqual(["opencsg"]);
+    expect(modelProviderOptionsFromCatalog(filtered).map((option) => option.providerID)).toEqual(["opencsg"]);
+    expect(modelProviderSelectOptionsFromCatalog(filtered).map((option) => option.id)).toEqual(["opencsg"]);
+  });
+
+  it("uses the selected OpenCSG environment and hides cached models while signed out", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [
+        {
+          id: "opencsg",
+          kind: "opencsg",
+          builtin: true,
+          display_name: "OpenCSG",
+          base_url: "https://ai.space.opencsg.com/v1",
+          models: ["prod-model"],
+          status: "connected",
+          message: "connected",
+          last_checked_at: "2026-07-16T09:00:00Z",
+        },
+      ],
+    });
+
+    const signedOut = modelProviderCatalogForOpenCSGState(catalog, {
+      aiGatewayBaseURL: "https://aigateway.opencsg-stg.com/v1/",
+      authenticationRequiredMessage: "需要登录 OpenCSG",
+      authenticated: false,
+    });
+
+    expect(signedOut?.providers[0]).toMatchObject({
+      base_url: "https://aigateway.opencsg-stg.com/v1",
+      models: [],
+      status: "failed",
+      message: "需要登录 OpenCSG",
+    });
+    expect(signedOut?.providers[0]?.last_checked_at).toBeUndefined();
+    expect(signedOut?.builtinProviders[0]).toBe(signedOut?.providers[0]);
+  });
+
+  it("maps OpenCSG aliases and avatar as a built-in provider", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [{ id: "open-csg", display_name: "OpenCSG", builtin: true, models: ["deepseek-v4"] }],
+    });
+
+    expect(catalog.providers[0]).toMatchObject({
+      id: "opencsg",
+      builtin: true,
+      display_name: "OpenCSG",
+    });
+    expect(modelProviderOptionsFromCatalog(catalog)[0]).toMatchObject({
+      providerAvatar: "model-providers/opencsg.svg",
+      providerID: "opencsg",
+      value: "opencsg.deepseek-v4",
+    });
+  });
+
+  it("keeps unicode custom provider ids visible in the catalog", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [
+        {
+          id: "智谱",
+          display_name: "智谱",
+          base_url: "https://open.bigmodel.cn/api/paas/v4",
+          models: ["glm-5.2"],
+        },
+      ],
+    });
+
+    expect(catalog.providers).toHaveLength(1);
+    expect(catalog.providers[0]).toMatchObject({
+      id: "智谱",
+      display_name: "智谱",
+      preset: "zhipu",
+    });
+  });
+
+  it("infers custom provider presets from persisted metadata and base URLs", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [
+        { id: "team-openai", display_name: "Team OpenAI", preset: "openai", models: [] },
+        { id: "team-zhipu", display_name: "Team Zhipu", base_url: "https://open.bigmodel.cn/api/paas/v4", models: [] },
+        { id: "team-custom", display_name: "Team Custom", base_url: "https://proxy.internal/v1", models: [] },
+      ],
+    });
+
+    expect(catalog.providers.map((provider) => provider.preset)).toEqual(["custom", "openai", "zhipu"]);
+  });
+
+  it("maps provider statuses to sidebar dot tones", () => {
+    expect(providerStatusTone("connected")).toBe("online");
+    expect(providerStatusTone("failed")).toBe("warning");
+    expect(providerStatusTone("unknown")).toBe("neutral");
+    expect(providerStatusTone("unknown", { builtin: true })).toBe("online");
+  });
+
+  it("detects duplicate provider display names", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [
+        { id: "codex", display_name: "Codex", builtin: true, models: [] },
+        { id: "openai", display_name: "OpenAI API", models: [] },
+      ],
+    });
+
+    expect(modelProviderDisplayNameExists(catalog, " openai   api ")).toBe(true);
+    expect(modelProviderDisplayNameExists(catalog, "Codex")).toBe(true);
+  });
+
+  it("parses model text from comma and newline separated input", () => {
+    expect(parseModelProviderModelsText("gpt-4.1, gpt-4.1\n gpt-4.1-mini \n\nqwen3")).toEqual([
+      "gpt-4.1",
+      "gpt-4.1-mini",
+      "qwen3",
+    ]);
+  });
+
+  it("merges discovered model options into catalog providers that have no persisted models yet", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [{ id: "codex", display_name: "Codex", builtin: true, models: [] }],
+    });
+
+    const options = modelProviderSelectOptionsFromCatalog(catalog, [
+      {
+        value: "codex.gpt-5.5",
+        label: "Codex / gpt-5.5",
+        providerID: "codex",
+        providerDisplayName: "Codex",
+        providerAvatar: "model-providers/codex.svg",
+        modelID: "gpt-5.5",
+        builtin: true,
+      },
+    ]);
+
+    expect(options).toMatchObject([{ id: "codex", displayName: "Codex", models: ["gpt-5.5"] }]);
+  });
+
+  it("replaces stale provider models with a successful live discovery", () => {
+    const catalog = normalizeModelProviderCatalog({
+      providers: [
+        {
+          id: "csghub-lite",
+          display_name: "CSGHub Lite",
+          builtin: true,
+          models: ["stale-model"],
+        },
+        { id: "codex", display_name: "Codex", builtin: true, models: ["gpt-5.5"] },
+      ],
+    });
+
+    const refreshed = modelProviderCatalogWithModels(catalog, "csghub_lite", [
+      "Qwen/Qwen3-0.6B-GGUF",
+      "Qwen/Qwen3-0.6B-GGUF",
+    ]);
+
+    expect(refreshed?.providers.find((provider) => provider.id === "csghub-lite")?.models).toEqual([
+      "Qwen/Qwen3-0.6B-GGUF",
+    ]);
+    expect(refreshed?.providers.find((provider) => provider.id === "codex")?.models).toEqual(["gpt-5.5"]);
+  });
+});

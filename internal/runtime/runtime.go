@@ -1,0 +1,174 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"time"
+
+	"csgclaw/internal/config"
+	"csgclaw/internal/modelcap"
+)
+
+// ErrReadinessNotSupported reports that a runtime does not expose a separate
+// application-level readiness signal. Callers must not infer that the runtime
+// is unhealthy from this error; its lifecycle state remains authoritative.
+var ErrReadinessNotSupported = errors.New("runtime readiness check is not supported")
+
+const (
+	KindPicoClawSandbox = "picoclaw_sandbox"
+	KindOpenClawSandbox = "openclaw_sandbox"
+	KindCodex           = "codex"
+	KindDSH             = "dsh"
+)
+
+// Runtime owns the lightweight execution lifecycle for an agent runtime.
+//
+// New should stay focused on instantiating or reopening the runtime execution
+// object and returning a handle. Host-side preparation such as workspace
+// seeding, config materialization, or runtime directory setup belongs behind
+// the optional Provisioner capability instead of being folded into New.
+type Runtime interface {
+	Kind() string
+	Layout(agentHome string) Layout
+
+	New(ctx context.Context, spec Spec) (Handle, error)
+	Start(ctx context.Context, h Handle) (State, error)
+	Stop(ctx context.Context, h Handle) (State, error)
+	Delete(ctx context.Context, h Handle) error
+	State(ctx context.Context, h Handle) (State, error)
+	Info(ctx context.Context, h Handle) (Info, error)
+}
+
+type LogStreamer interface {
+	StreamLogs(ctx context.Context, h Handle, opts LogOptions) error
+}
+
+// ReadinessChecker is an optional runtime capability for checking whether a
+// running agent can accept work. It is intentionally separate from Info:
+// Info reports lifecycle state, while readiness is an observation that may be
+// transient, slow, or unavailable for a concrete runtime provider.
+type ReadinessChecker interface {
+	CheckReadiness(ctx context.Context, h Handle) error
+}
+
+// AvailabilityChecker validates Runtime dependencies without creating a process.
+type AvailabilityChecker interface{ CheckAvailability(context.Context) error }
+
+// DefaultImageProvider supplies an Adapter-owned image default.
+type DefaultImageProvider interface{ DefaultImage() string }
+
+// HydrateTrustPersistedStopped reports whether hydrate should keep a persisted "stopped"
+// agent status instead of overwriting it from runtime Info (some in-process runtimes
+// always report "running" from Info/State).
+func HydrateTrustPersistedStopped(r Runtime) bool {
+	type trustPersisted interface {
+		HydrateTrustPersistedStopped() bool
+	}
+	v, ok := r.(trustPersisted)
+	return ok && v.HydrateTrustPersistedStopped()
+}
+
+type Handle struct {
+	RuntimeID string `json:"runtime_id"`
+	HandleID  string `json:"handle_id,omitempty"`
+}
+
+type Info struct {
+	HandleID  string
+	State     State
+	CreatedAt time.Time
+}
+
+type State string
+
+const (
+	StateUnknown    State = "unknown"
+	StateCreated    State = "created"
+	StateRunning    State = "running"
+	StatePaused     State = "paused"
+	StateRestarting State = "restarting"
+	StateRemoving   State = "removing"
+	StateStopped    State = "stopped"
+	StateExited     State = "exited"
+	StateDead       State = "dead"
+	StateFailed     State = "failed"
+)
+
+type Profile struct {
+	ModelMetadata   modelcap.Resolved
+	AutoCompact     *bool
+	Provider        string
+	BaseURL         string
+	APIKey          string
+	ModelID         string
+	InputModalities []string
+	ReasoningEffort string
+	Env             map[string]string
+}
+
+func (p Profile) Normalized() Profile {
+	p.Provider = strings.TrimSpace(p.Provider)
+	p.ModelID = strings.TrimSpace(p.ModelID)
+	p.BaseURL = strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	p.APIKey = strings.TrimSpace(p.APIKey)
+	p.ReasoningEffort = config.NormalizeReasoningEffort(p.ReasoningEffort)
+	p.InputModalities = normalizeInputModalities(p.InputModalities)
+	if len(p.Env) == 0 {
+		p.Env = nil
+		return p
+	}
+	env := make(map[string]string, len(p.Env))
+	for key, value := range p.Env {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		env[key] = strings.TrimSpace(value)
+	}
+	if len(env) == 0 {
+		p.Env = nil
+		return p
+	}
+	p.Env = env
+	return p
+}
+
+func normalizeInputModalities(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if (value != "text" && value != "image") || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+type Spec struct {
+	RuntimeID string
+	AgentID   string
+	AgentName string
+	Image     string
+	Profile   Profile
+}
+
+type LogOptions struct {
+	Follow bool
+	Tail   int
+	Writer io.Writer
+}
+
+type Layout struct {
+	WorkspaceRoot    string
+	SkillsRoot       string
+	InstructionsPath string
+	HostLogPaths     []string
+}

@@ -1,0 +1,384 @@
+package apitypes
+
+import (
+	"encoding/json"
+	"io"
+	"time"
+)
+
+type LegacyBot struct {
+	ID                   string         `json:"id"`
+	Name                 string         `json:"name"`
+	Description          string         `json:"description,omitempty"`
+	Type                 string         `json:"type,omitempty"`
+	Role                 string         `json:"role"`
+	Channel              string         `json:"channel"`
+	AgentID              string         `json:"agent_id"`
+	UserID               string         `json:"user_id"`
+	Available            bool           `json:"available"`
+	RuntimeOptions       map[string]any `json:"runtime_options,omitempty"`
+	RuntimeKind          string         `json:"runtime_kind,omitempty"`
+	Image                string         `json:"image,omitempty"`
+	Avatar               string         `json:"avatar,omitempty"`
+	Status               string         `json:"status,omitempty"`
+	Provider             string         `json:"provider,omitempty"`
+	ModelID              string         `json:"model_id,omitempty"`
+	ProfileComplete      bool           `json:"profile_complete,omitempty"`
+	EnvRestartRequired   bool           `json:"env_restart_required,omitempty"`
+	ImageUpgradeRequired bool           `json:"image_upgrade_required,omitempty"`
+	CreatedAt            time.Time      `json:"created_at"`
+}
+
+type User struct {
+	ID           string        `json:"id"`
+	Name         string        `json:"name"`
+	Description  string        `json:"description,omitempty"`
+	Locale       string        `json:"locale,omitempty"`
+	Role         string        `json:"role"`
+	Avatar       string        `json:"avatar"`
+	IsOnline     bool          `json:"is_online"`
+	LastSeen     string        `json:"last_seen,omitempty"`
+	AccentHex    string        `json:"accent_hex"`
+	Participants []Participant `json:"participants,omitempty"`
+	CreatedAt    time.Time     `json:"created_at,omitempty"`
+}
+
+type CreateUserRequest struct {
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Role        string `json:"role,omitempty"`
+}
+
+type UpdateUserRequest struct {
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
+	Role        *string `json:"role,omitempty"`
+	Avatar      *string `json:"avatar,omitempty"`
+	Locale      *string `json:"locale,omitempty"`
+}
+
+type Mention struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
+type Message struct {
+	ID              string              `json:"id"`
+	ClientMessageID string              `json:"client_message_id,omitempty"`
+	SenderID        string              `json:"sender_id"`
+	Kind            string              `json:"kind,omitempty"`
+	Content         string              `json:"content"`
+	Event           *EventPayload       `json:"event,omitempty"`
+	Metadata        map[string]any      `json:"metadata,omitempty"`
+	CreatedAt       time.Time           `json:"created_at"`
+	Mentions        []Mention           `json:"mentions"`
+	RelatesTo       *MessageRelation    `json:"relates_to,omitempty"`
+	Thread          *ThreadSummary      `json:"thread,omitempty"`
+	Attachments     []MessageAttachment `json:"attachments,omitempty"`
+}
+
+type MessageAttachment struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Kind          string    `json:"kind"`
+	MediaType     string    `json:"media_type"`
+	SizeBytes     int64     `json:"size_bytes"`
+	SHA256        string    `json:"sha256"`
+	CreatedAt     time.Time `json:"created_at"`
+	DownloadURL   string    `json:"download_url"`
+	PreviewURL    string    `json:"preview_url,omitempty"`
+	Width         int       `json:"width,omitempty"`
+	Height        int       `json:"height,omitempty"`
+	WorkspacePath string    `json:"workspace_path,omitempty"`
+}
+
+type MessageAttachmentUpload struct {
+	Name      string `json:"name,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      []byte `json:"-"`
+
+	// Open supplies a request-scoped upload without buffering it in Data.
+	// The consumer closes the returned reader; the caller owns the source lifetime.
+	Open      func() (io.ReadCloser, error) `json:"-"`
+	SizeBytes int64                         `json:"-"`
+}
+
+type CreateMessageRequest struct {
+	DiagnosticStart time.Time                 `json:"-"`
+	RoomID          string                    `json:"room_id"`
+	ClientMessageID string                    `json:"client_message_id,omitempty"`
+	SenderID        string                    `json:"sender_id"`
+	Content         string                    `json:"content"`
+	Locale          string                    `json:"locale,omitempty"`
+	MentionID       string                    `json:"mention_id,omitempty"`
+	Metadata        map[string]any            `json:"metadata,omitempty"`
+	RelatesTo       *MessageRelation          `json:"relates_to,omitempty"`
+	Attachments     []MessageAttachmentUpload `json:"attachments,omitempty"`
+}
+
+type MessageRelation struct {
+	RelType string `json:"rel_type"`
+	EventID string `json:"event_id"`
+}
+
+type ThreadSummary struct {
+	RootID                  string               `json:"root_id"`
+	ReplyCount              int                  `json:"reply_count"`
+	LatestReply             *Message             `json:"latest_reply,omitempty"`
+	Participants            []Mention            `json:"participants,omitempty"`
+	CurrentUserParticipated bool                 `json:"current_user_participated"`
+	Context                 ThreadContextSummary `json:"context_summary"`
+}
+
+type ThreadContextSummary struct {
+	RootExcerpt  string `json:"root_excerpt"`
+	MessageCount int    `json:"message_count"`
+	BeforeCount  int    `json:"before_count"`
+	AfterCount   int    `json:"after_count"`
+}
+
+type ThreadState struct {
+	RootMessageID string               `json:"root_message_id"`
+	CreatedAt     time.Time            `json:"created_at"`
+	Context       []Message            `json:"context"`
+	Summary       ThreadContextSummary `json:"summary"`
+}
+
+type StartThreadRequest struct {
+	RoomID        string `json:"room_id,omitempty"`
+	RootMessageID string `json:"root_message_id"`
+}
+
+type ThreadView struct {
+	RoomID  string        `json:"room_id"`
+	Root    Message       `json:"root"`
+	Context []Message     `json:"context,omitempty"`
+	Replies []Message     `json:"replies,omitempty"`
+	Summary ThreadSummary `json:"summary"`
+}
+
+type ThreadListResponse struct {
+	Threads  []ThreadView `json:"threads"`
+	NextFrom string       `json:"next_from,omitempty"`
+}
+
+type ThreadRelationsResponse struct {
+	Chunk []Message `json:"chunk"`
+}
+
+type EventPayload struct {
+	Key       string   `json:"key"`
+	ActorID   string   `json:"actor_id,omitempty"`
+	Title     string   `json:"title,omitempty"`
+	TargetIDs []string `json:"target_ids,omitempty"`
+}
+
+// RoomType controls how messages are routed inside a group room. An empty type
+// is read as RoomTypeFree so rooms created before this field existed keep their
+// mention-driven behavior.
+type RoomType string
+
+const (
+	RoomTypeFree     RoomType = "free"
+	RoomTypeOnDemand RoomType = "on_demand"
+)
+
+func NormalizeRoomType(value RoomType) RoomType {
+	if value == "" {
+		return RoomTypeFree
+	}
+	return value
+}
+
+func (room Room) IsOnDemand() bool {
+	return NormalizeRoomType(room.Type) == RoomTypeOnDemand
+}
+
+type Room struct {
+	Type            RoomType      `json:"type,omitempty"`
+	ManagerID       string        `json:"manager_id,omitempty"`
+	ID              string        `json:"id"`
+	Title           string        `json:"title"`
+	Subtitle        string        `json:"subtitle"`
+	Description     string        `json:"description,omitempty"`
+	Locale          string        `json:"locale,omitempty"`
+	SessionID       string        `json:"session_id,omitempty"`
+	SessionAgentID  string        `json:"session_agent_id,omitempty"`
+	IsDirect        bool          `json:"is_direct,omitempty"`
+	NotifyAllAgents bool          `json:"notify_all_agents"`
+	Members         []string      `json:"members"`
+	MemberNames     []string      `json:"member_names,omitempty"`
+	Messages        []Message     `json:"messages"`
+	Threads         []ThreadState `json:"threads,omitempty"`
+}
+
+type CreateRoomTaskRequest struct {
+	Title           string `json:"title"`
+	Body            string `json:"body"`
+	SourceMessageID string `json:"source_message_id"`
+}
+
+type CreateRoomRequest struct {
+	Type        RoomType `json:"type"`
+	ManagerID   string   `json:"manager_id,omitempty"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	CreatorID   string   `json:"creator_id"`
+	MemberIDs   []string `json:"member_ids"`
+	Locale      string   `json:"locale"`
+}
+
+type UpdateRoomRequest struct {
+	NotifyAllAgents *bool `json:"notify_all_agents,omitempty"`
+}
+
+type AddRoomMembersRequest struct {
+	RoomID    string   `json:"room_id,omitempty"`
+	InviterID string   `json:"inviter_id"`
+	UserIDs   []string `json:"user_ids"`
+	Locale    string   `json:"locale"`
+}
+
+type VersionResponse struct {
+	Version string `json:"version"`
+}
+
+// UpgradeStatus reports the installed channel derived from CurrentVersion. A
+// pending one-shot switch target is intentionally not part of the public status.
+type UpgradeStatus struct {
+	CurrentVersion               string     `json:"current_version"`
+	Channel                      string     `json:"channel"`
+	LatestVersion                string     `json:"latest_version,omitempty"`
+	UpdateAvailable              bool       `json:"update_available"`
+	Checking                     bool       `json:"checking"`
+	Upgrading                    bool       `json:"upgrading"`
+	ManualRestartRequired        bool       `json:"manual_restart_required,omitempty"`
+	AutoUpgradeSupported         bool       `json:"auto_upgrade_supported"`
+	AutoUpgradeUnsupportedReason string     `json:"auto_upgrade_unsupported_reason,omitempty"`
+	LastCheckedAt                *time.Time `json:"last_checked_at,omitempty"`
+	LastError                    string     `json:"last_error,omitempty"`
+	LastErrorKind                string     `json:"last_error_kind,omitempty"`
+	LastErrorLogPath             string     `json:"last_error_log_path,omitempty"`
+}
+
+// UpdateUpgradeChannelRequest identifies the target of a one-shot switch.
+type UpdateUpgradeChannelRequest struct {
+	Channel string `json:"channel"`
+}
+
+type UpgradeActionResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+type ServerRestartResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+type ServerRestartStatusResponse struct {
+	ManualRestartRequired bool   `json:"manual_restart_required,omitempty"`
+	Message               string `json:"message,omitempty"`
+	LastError             string `json:"last_error,omitempty"`
+}
+
+type ConfigSettingsResponse struct {
+	Path                      string   `json:"path"`
+	ListenAddr                string   `json:"listen_addr"`
+	AdvertiseBaseURL          string   `json:"advertise_base_url,omitempty"`
+	AdvertiseBaseURLEffective string   `json:"advertise_base_url_effective,omitempty"`
+	AccessToken               string   `json:"access_token,omitempty"`
+	AccessTokenSet            bool     `json:"access_token_set,omitempty"`
+	AccessTokenPreview        string   `json:"access_token_preview,omitempty"`
+	ShowUpgrade               bool     `json:"show_upgrade"`
+	SandboxProvider           string   `json:"sandbox_provider"`
+	SupportedSandboxProviders []string `json:"supported_sandbox_providers,omitempty"`
+	HubLocalPath              string   `json:"hub_local_path"`
+	HubOfficialURLEffective   string   `json:"hub_official_url_effective,omitempty"`
+	DefaultManagerTemplate    string   `json:"default_manager_template"`
+	DefaultWorkerTemplate     string   `json:"default_worker_template"`
+}
+
+type UpdateConfigSettingsRequest struct {
+	ListenAddr             string `json:"listen_addr"`
+	AdvertiseBaseURL       string `json:"advertise_base_url,omitempty"`
+	AccessToken            string `json:"access_token,omitempty"`
+	ShowUpgrade            bool   `json:"show_upgrade"`
+	SandboxProvider        string `json:"sandbox_provider"`
+	HubLocalPath           string `json:"hub_local_path,omitempty"`
+	DefaultManagerTemplate string `json:"default_manager_template"`
+	DefaultWorkerTemplate  string `json:"default_worker_template"`
+}
+
+// UnmarshalJSON keeps room payload decoding backward-compatible with legacy participants fields.
+func (r *Room) UnmarshalJSON(data []byte) error {
+	type roomAlias Room
+	type roomJSON struct {
+		roomAlias
+		Participants []string `json:"participants"`
+	}
+
+	var decoded roomJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = Room(decoded.roomAlias)
+	if len(r.Members) == 0 && len(decoded.Participants) > 0 {
+		r.Members = append([]string(nil), decoded.Participants...)
+	}
+	return nil
+}
+
+// UnmarshalJSON keeps create-room request decoding backward-compatible with legacy participant_ids.
+func (r *CreateRoomRequest) UnmarshalJSON(data []byte) error {
+	type createRoomAlias CreateRoomRequest
+	type createRoomJSON struct {
+		createRoomAlias
+		ParticipantIDs []string `json:"participant_ids"`
+	}
+
+	var decoded createRoomJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = CreateRoomRequest(decoded.createRoomAlias)
+	if len(r.MemberIDs) == 0 && len(decoded.ParticipantIDs) > 0 {
+		r.MemberIDs = append([]string(nil), decoded.ParticipantIDs...)
+	}
+	return nil
+}
+
+// UnmarshalJSON keeps message payload decoding backward-compatible with legacy string mentions.
+func (m *Message) UnmarshalJSON(data []byte) error {
+	type messageAlias Message
+	type messageJSON struct {
+		messageAlias
+		Mentions json.RawMessage `json:"mentions"`
+	}
+
+	var decoded messageJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*m = Message(decoded.messageAlias)
+	if len(decoded.Mentions) == 0 || string(decoded.Mentions) == "null" {
+		return nil
+	}
+
+	var mentions []Mention
+	if err := json.Unmarshal(decoded.Mentions, &mentions); err == nil {
+		m.Mentions = mentions
+		return nil
+	}
+
+	var legacy []string
+	if err := json.Unmarshal(decoded.Mentions, &legacy); err != nil {
+		return err
+	}
+	m.Mentions = make([]Mention, 0, len(legacy))
+	for _, id := range legacy {
+		m.Mentions = append(m.Mentions, Mention{ID: id})
+	}
+	return nil
+}

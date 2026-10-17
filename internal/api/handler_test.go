@@ -1,0 +1,9360 @@
+package api
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"csgclaw/internal/agentengine"
+	agent "csgclaw/internal/agentengine/agents"
+	"csgclaw/internal/agentengine/enginetest"
+	"csgclaw/internal/apitypes"
+	"csgclaw/internal/app/runtimewiring"
+	"csgclaw/internal/auth"
+	"csgclaw/internal/channel/feishu"
+	"csgclaw/internal/config"
+	"csgclaw/internal/im"
+	"csgclaw/internal/knowledgebase"
+	"csgclaw/internal/llm"
+	"csgclaw/internal/mcp"
+	"csgclaw/internal/modelprovider"
+	"csgclaw/internal/participant"
+	agentruntime "csgclaw/internal/runtime"
+	codexruntime "csgclaw/internal/runtime/codex"
+	runtimeinstructions "csgclaw/internal/runtime/instructions"
+	"csgclaw/internal/runtime/openclawsandbox"
+	"csgclaw/internal/runtime/picoclawsandbox"
+	larkextension "csgclaw/internal/runtimeextension/larkcli"
+	"csgclaw/internal/sandbox"
+	"csgclaw/internal/sandbox/sandboxtest"
+	"csgclaw/internal/sandboxproviders"
+	skillsystem "csgclaw/internal/skill/system"
+	hub "csgclaw/internal/template"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+type fakeCompatRuntime struct {
+	kind    string
+	schemas []agentruntime.RuntimeOptionSchema
+	new     func(context.Context, agentruntime.Spec) (agentruntime.Handle, error)
+	start   func(context.Context, agentruntime.Handle) (agentruntime.State, error)
+	stop    func(context.Context, agentruntime.Handle) (agentruntime.State, error)
+	del     func(context.Context, agentruntime.Handle) error
+	info    func(context.Context, agentruntime.Handle) (agentruntime.Info, error)
+}
+
+func (f fakeCompatRuntime) RuntimeExtensionDriver(kind string) (agentruntime.ExtensionDriver, bool) {
+	if !supportsAgentLarkCLI(f.kind) || kind != larkextension.Kind {
+		return nil, false
+	}
+	return fakeLarkCLIExtensionDriver{runtimeKind: f.Kind()}, true
+}
+
+type fakeLarkCLIExtensionDriver struct {
+	runtimeKind string
+}
+
+var larkCLICommandContext = exec.CommandContext
+
+func (fakeLarkCLIExtensionDriver) ObserveExtension(ctx context.Context, _ string, _ agentruntime.ExtensionDesired) (agentruntime.ExtensionResult, error) {
+	if _, err := testLarkCLIPath(ctx); err != nil {
+		return agentruntime.ExtensionResult{State: agentruntime.ExtensionStateUnavailable, Reason: "executable_unavailable", Message: err.Error(), CheckedAt: time.Now().UTC()}, nil
+	}
+	return agentruntime.ExtensionResult{State: agentruntime.ExtensionStateConfigured, CheckedAt: time.Now().UTC(), RuntimeLoaded: true}, nil
+}
+
+func testLarkCLIPath(ctx context.Context) (string, error) {
+	path, err := larkCLILookPath("lark-cli")
+	if err != nil || strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("lark-cli is not installed or not on PATH. Install lark-cli on this host and retry")
+	}
+	cmd := larkCLICommandContext(ctx, path, "-v")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("lark-cli cannot be started: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return path, nil
+}
+
+type fakeReadinessCompatRuntime struct {
+	fakeCompatRuntime
+	readiness func(context.Context, agentruntime.Handle) error
+}
+
+type getErrorEngine struct {
+	agentengine.Interface
+	agents agentengine.AgentInterface
+}
+
+func (e getErrorEngine) Agents() agentengine.AgentInterface { return e.agents }
+
+type getErrorAgents struct {
+	agentengine.AgentInterface
+	err error
+}
+
+func (a getErrorAgents) Get(context.Context, string, agentengine.AgentGetOptions) (agentengine.Agent, error) {
+	return agentengine.Agent{}, a.err
+}
+
+type fakeSandboxAvailabilityProvider struct {
+	name string
+	err  error
+}
+
+type noOpChannelBindingReconciler struct{}
+
+func (noOpChannelBindingReconciler) RefreshAgentChannel(context.Context, agent.Agent, string) error {
+	return nil
+}
+
+func TestWriteAgentOperationErrorSanitizesWrappedUpstreamError(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	err := fmt.Errorf("validate Codex provider Responses API: %w", &modelprovider.ResponsesAPIStatusError{
+		Operation:  "responses",
+		BaseURL:    "https://aigateway.example/v1",
+		Status:     "503 Service Unavailable",
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       `{"error":{"code":"model_unavailable","message":"model gpt-test has no upstream"}}`,
+	})
+
+	writeAgentOperationError(recorder, err, http.StatusBadRequest)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	rawBody := recorder.Body.String()
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if payload.Error.Code != "model_unavailable" || !strings.Contains(payload.Error.Message, "temporarily unavailable") {
+		t.Fatalf("body = %#v, want structured model_unavailable error", payload)
+	}
+	if strings.Contains(rawBody, "aigateway") || strings.Contains(rawBody, "gpt-test") {
+		t.Fatalf("body exposes upstream diagnostics: %q", rawBody)
+	}
+}
+
+func TestWriteAgentOperationErrorSanitizesSandboxUnavailable(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	err := fmt.Errorf("remove agent box: docker inspect: %w: platform-specific connection details", sandbox.ErrUnavailable)
+
+	writeAgentOperationError(recorder, err, http.StatusBadRequest)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if payload.Error.Code != "docker_unavailable" {
+		t.Fatalf("error = %+v, want docker_unavailable", payload.Error)
+	}
+	if strings.Contains(payload.Error.Message, "platform-specific") {
+		t.Fatalf("message exposes platform diagnostics: %q", payload.Error.Message)
+	}
+}
+
+func TestWriteAgentOperationErrorSanitizesAgentHomeCleanupFailure(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	err := fmt.Errorf("%w: unlinkat /Users/example/.csgclaw/agents/agent-1/boxlite/images: directory not empty", agent.ErrHomeCleanup)
+
+	writeAgentOperationError(recorder, err, http.StatusBadRequest)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusConflict)
+	}
+	if strings.Contains(recorder.Body.String(), "/Users/example") || !strings.Contains(recorder.Body.String(), "agent_home_cleanup_failed") {
+		t.Fatalf("body = %q, want sanitized cleanup error", recorder.Body.String())
+	}
+}
+
+func TestWriteAgentOperationErrorIncludesBillingURLForInsufficientBalance(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	err := &modelprovider.ResponsesAPIStatusError{
+		Status:     "402 Payment Required",
+		StatusCode: http.StatusPaymentRequired,
+		Body:       `{"error":{"code":"insufficient_balance","message":"Insufficient balance"}}`,
+	}
+
+	writeAgentOperationErrorWithBillingURL(
+		recorder,
+		err,
+		http.StatusBadRequest,
+		"https://opencsg-stg.com/settings/billing",
+	)
+
+	var payload struct {
+		Error struct {
+			Code       string `json:"code"`
+			BillingURL string `json:"billing_url"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if payload.Error.Code != "insufficient_balance" || payload.Error.BillingURL != "https://opencsg-stg.com/settings/billing" {
+		t.Fatalf("error = %+v, want insufficient balance with billing URL", payload.Error)
+	}
+}
+
+func TestWriteAgentOperationErrorOnlyUsesNotFoundForAPIResources(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "agent resource", err: errors.New(`agent "agent-missing" not found`), wantStatus: http.StatusNotFound},
+		{name: "missing bundled cli", err: errors.New("bundled Codex CLI not found next to executable"), wantStatus: http.StatusBadRequest},
+		{name: "missing docker executable", err: errors.New("docker executable not found"), wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			writeAgentOperationError(recorder, tt.err, http.StatusBadRequest)
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func (p fakeSandboxAvailabilityProvider) Name() string {
+	return p.name
+}
+
+func (p fakeSandboxAvailabilityProvider) Open(context.Context, string) (sandbox.Runtime, error) {
+	return nil, nil
+}
+
+func (p fakeSandboxAvailabilityProvider) ListImages(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
+func (p fakeSandboxAvailabilityProvider) CheckAvailability(context.Context) error {
+	return p.err
+}
+
+func (f fakeReadinessCompatRuntime) CheckReadiness(ctx context.Context, h agentruntime.Handle) error {
+	if f.readiness != nil {
+		return f.readiness(ctx, h)
+	}
+	return agentruntime.ErrReadinessNotSupported
+}
+
+type failingMCPServersListRuntime struct {
+	fakeCompatRuntime
+	err error
+}
+
+type snapshotMCPServersRuntime struct {
+	fakeCompatRuntime
+	servers   map[string]any
+	listCalls int
+}
+
+func (f *snapshotMCPServersRuntime) ListMCPServers(context.Context, agentruntime.Handle, agentruntime.MCPServersSnapshot) (agentruntime.MCPServersSnapshot, error) {
+	f.listCalls++
+	return agentruntime.MCPServersSnapshot{Servers: f.servers}, nil
+}
+
+func (*snapshotMCPServersRuntime) ValidateMCPServers(context.Context, agentruntime.MCPServersSnapshot) error {
+	return nil
+}
+
+func (*snapshotMCPServersRuntime) MCPServersRestartRequired(agentruntime.MCPServersChange) (bool, error) {
+	return false, nil
+}
+
+func (f *snapshotMCPServersRuntime) ReconcileMCPServers(_ context.Context, _ agentruntime.Handle, change agentruntime.MCPServersChange) error {
+	f.servers = change.Current.Servers
+	return nil
+}
+
+func (f failingMCPServersListRuntime) ListMCPServers(context.Context, agentruntime.Handle, agentruntime.MCPServersSnapshot) (agentruntime.MCPServersSnapshot, error) {
+	return agentruntime.MCPServersSnapshot{}, f.err
+}
+
+func init() {
+	locateCodexCLI = func() (string, error) { return "/opt/csgclaw/bin/codex", nil }
+	_ = agent.TestOnlySetDefaultControllerOption(func(s *agent.Controller) error {
+		if err := runtimewiring.WithPicoClawSandboxRuntime(nil)(s); err != nil {
+			return err
+		}
+		if err := runtimewiring.WithOpenClawSandboxRuntime(nil)(s); err != nil {
+			return err
+		}
+		return agent.WithRuntime(fakeCompatRuntime{kind: agent.RuntimeKindCodex})(s)
+	})
+	_ = codexruntime.TestOnlySetResponsesAPIProbe(func(context.Context, string, string, string, map[string]string) error {
+		return nil
+	})
+}
+
+func testFeishuBotInfoResolver(t *testing.T, openIDsByAppID map[string]string) func(context.Context, feishu.AppConfig) (feishu.BotInfo, error) {
+	t.Helper()
+	return func(_ context.Context, app feishu.AppConfig) (feishu.BotInfo, error) {
+		openID, ok := openIDsByAppID[app.AppID]
+		if !ok {
+			t.Fatalf("unexpected Feishu app_id %q", app.AppID)
+		}
+		return feishu.BotInfo{OpenID: openID}, nil
+	}
+}
+
+func (f fakeCompatRuntime) Kind() string {
+	if strings.TrimSpace(f.kind) != "" {
+		return strings.TrimSpace(f.kind)
+	}
+	return agent.RuntimeKindPicoClawSandbox
+}
+
+func (f fakeCompatRuntime) Layout(agentHome string) agentruntime.Layout {
+	switch f.Kind() {
+	case agent.RuntimeKindPicoClawSandbox:
+		workspace := filepath.Join(picoclawsandbox.Root(agentHome), picoclawsandbox.HostWorkspaceDir)
+		return agentruntime.Layout{
+			WorkspaceRoot: workspace,
+			SkillsRoot:    filepath.Join(workspace, "skills"),
+			HostLogPaths:  []string{picoclawsandbox.HostGatewayLogPath(agentHome)},
+		}
+	case agent.RuntimeKindOpenClawSandbox:
+		workspace := filepath.Join(openclawsandbox.Root(agentHome), openclawsandbox.HostWorkspaceDir)
+		return agentruntime.Layout{
+			WorkspaceRoot: workspace,
+			SkillsRoot:    filepath.Join(workspace, "skills"),
+			HostLogPaths:  []string{openclawsandbox.HostGatewayLogPath(agentHome)},
+		}
+	case agent.RuntimeKindCodex:
+		return agentruntime.Layout{
+			WorkspaceRoot: filepath.Join(agentHome, ".codex", "workspace"),
+			SkillsRoot:    filepath.Join(agentHome, ".codex", "home", "skills"),
+			HostLogPaths:  []string{filepath.Join(agentHome, ".codex", "home", "stderr.log")},
+		}
+	case agent.RuntimeKindDSH:
+		return agentruntime.Layout{
+			WorkspaceRoot: filepath.Join(agentHome, ".dsh", "workspace"),
+			SkillsRoot:    filepath.Join(agentHome, ".dsh", "home", "skills"),
+			HostLogPaths:  []string{filepath.Join(agentHome, ".dsh", "stderr.log")},
+		}
+	default:
+		return agentruntime.Layout{}
+	}
+}
+
+func (f fakeCompatRuntime) New(ctx context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+	if f.new != nil {
+		return f.new(ctx, spec)
+	}
+	return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "box-" + spec.AgentName}, nil
+}
+
+func (f fakeCompatRuntime) Start(ctx context.Context, h agentruntime.Handle) (agentruntime.State, error) {
+	if f.start != nil {
+		return f.start(ctx, h)
+	}
+	return agentruntime.StateRunning, nil
+}
+
+func (f fakeCompatRuntime) Stop(ctx context.Context, h agentruntime.Handle) (agentruntime.State, error) {
+	if f.stop != nil {
+		return f.stop(ctx, h)
+	}
+	return agentruntime.StateStopped, nil
+}
+
+func (f fakeCompatRuntime) Delete(ctx context.Context, h agentruntime.Handle) error {
+	if f.del != nil {
+		return f.del(ctx, h)
+	}
+	return nil
+}
+
+func (f fakeCompatRuntime) State(context.Context, agentruntime.Handle) (agentruntime.State, error) {
+	return agentruntime.StateRunning, nil
+}
+
+func (f fakeCompatRuntime) Info(ctx context.Context, h agentruntime.Handle) (agentruntime.Info, error) {
+	if f.info != nil {
+		return f.info(ctx, h)
+	}
+	return agentruntime.Info{HandleID: h.HandleID, State: agentruntime.StateRunning}, nil
+}
+
+func (f fakeCompatRuntime) EnsureGatewayConfig(string, string, string) error {
+	return nil
+}
+
+func (f fakeCompatRuntime) ProjectsGuestPath() string {
+	return ""
+}
+
+func (f fakeCompatRuntime) RuntimeOptionsSchema() []agentruntime.RuntimeOptionSchema {
+	return append([]agentruntime.RuntimeOptionSchema(nil), f.schemas...)
+}
+
+type apiFakeCodexBinaryProvider struct{}
+
+func (apiFakeCodexBinaryProvider) Ensure(context.Context) (string, error) {
+	return "/tmp/codex", nil
+}
+
+type apiFakeCodexManager struct {
+	mu       sync.Mutex
+	sessions map[string]*apiFakeCodexProcess
+}
+
+type apiFakeCodexProcess struct {
+	cmd     *exec.Cmd
+	session *codexruntime.Session
+}
+
+func (m *apiFakeCodexManager) Start(_ context.Context, spec codexruntime.SessionSpec) (*codexruntime.Session, error) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAPIFakeCodexProcess$")
+	cmd.Env = append(os.Environ(), "CSGCLAW_API_FAKE_CODEX_PROCESS=1")
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	session := &codexruntime.Session{
+		RuntimeID:    spec.RuntimeID,
+		AgentID:      spec.AgentID,
+		AgentName:    spec.AgentName,
+		SessionID:    "session-" + spec.AgentID,
+		BinaryPath:   spec.BinaryPath,
+		RuntimeDir:   spec.RuntimeDir,
+		WorkspaceDir: spec.WorkspaceDir,
+		HomeDir:      spec.HomeDir,
+		CodexHomeDir: spec.CodexHomeDir,
+		StderrPath:   spec.StderrPath,
+		ProcessID:    cmd.Process.Pid,
+		CreatedAt:    now,
+		StartedAt:    now,
+	}
+	m.mu.Lock()
+	if m.sessions == nil {
+		m.sessions = make(map[string]*apiFakeCodexProcess)
+	}
+	m.sessions[spec.RuntimeID] = &apiFakeCodexProcess{cmd: cmd, session: session}
+	m.mu.Unlock()
+	return session, nil
+}
+
+func (m *apiFakeCodexManager) Stop(_ context.Context, handle codexruntime.SessionHandle) error {
+	m.mu.Lock()
+	process := m.sessions[handle.RuntimeID]
+	delete(m.sessions, handle.RuntimeID)
+	m.mu.Unlock()
+	if process == nil || process.cmd == nil || process.cmd.Process == nil {
+		return os.ErrNotExist
+	}
+	_ = process.cmd.Process.Kill()
+	_ = process.cmd.Wait()
+	return nil
+}
+
+func (m *apiFakeCodexManager) LiveSession(handle codexruntime.SessionHandle) (*codexruntime.Session, error) {
+	return m.Session(handle)
+}
+
+func (m *apiFakeCodexManager) Session(handle codexruntime.SessionHandle) (*codexruntime.Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	process := m.sessions[handle.RuntimeID]
+	if process == nil || process.session == nil {
+		return nil, os.ErrNotExist
+	}
+	cloned := *process.session
+	return &cloned, nil
+}
+
+func (*apiFakeCodexManager) Prompt(context.Context, codexruntime.SessionHandle, codexruntime.PromptRequest) (codexruntime.PromptResponse, error) {
+	return codexruntime.PromptResponse{}, os.ErrNotExist
+}
+
+func (m *apiFakeCodexManager) close() {
+	m.mu.Lock()
+	var handles []codexruntime.SessionHandle
+	for runtimeID := range m.sessions {
+		handles = append(handles, codexruntime.SessionHandle{RuntimeID: runtimeID})
+	}
+	m.mu.Unlock()
+	for _, handle := range handles {
+		_ = m.Stop(context.Background(), handle)
+	}
+}
+
+func TestAPIFakeCodexProcess(t *testing.T) {
+	if os.Getenv("CSGCLAW_API_FAKE_CODEX_PROCESS") != "1" {
+		return
+	}
+	select {}
+}
+
+type fakeCodexBridgeController struct {
+	ensureCalls  []agent.Agent
+	refreshCalls []agentBindingRefreshCall
+	stopCalls    []string
+	ensureErr    error
+	refreshErr   error
+}
+
+type agentBindingRefreshCall struct {
+	agent   agent.Agent
+	channel string
+}
+
+func (f *fakeCodexBridgeController) EnsureAgent(_ context.Context, a agent.Agent) error {
+	f.ensureCalls = append(f.ensureCalls, a)
+	return f.ensureErr
+}
+
+func (f *fakeCodexBridgeController) RefreshAgentChannel(_ context.Context, a agent.Agent, channel string) error {
+	f.refreshCalls = append(f.refreshCalls, agentBindingRefreshCall{agent: a, channel: channel})
+	return f.refreshErr
+}
+
+func (f *fakeCodexBridgeController) StopAgent(agentID string) {
+	f.stopCalls = append(f.stopCalls, agentID)
+}
+
+func TestHandleFeishuUsersCreateAndList(t *testing.T) {
+	srv := &Handler{feishu: feishu.NewService()}
+
+	createReq := strings.NewReader(`{"id":"fsu-alice","name":"Alice","role":"worker"}`)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/channels/feishu/users", createReq))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/channels/feishu/users", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got []im.User
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "fsu-alice" || got[0].Name != "Alice" {
+		t.Fatalf("users = %+v, want fsu-alice", got)
+	}
+}
+
+func TestHandleVersion(t *testing.T) {
+	srv := &Handler{}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/version", nil)
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var got apitypes.VersionResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Version == "" {
+		t.Fatal("version is empty")
+	}
+}
+
+func TestHandleVersionMethodNotAllowed(t *testing.T) {
+	srv := &Handler{}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/version", nil)
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusMethodNotAllowed, rec.Body.String())
+	}
+}
+
+func TestHandleLocalDirectoryPickerReturnsSelectedPath(t *testing.T) {
+	srv := &Handler{
+		localDirectoryPicker: func(context.Context) (string, error) {
+			return "/tmp/project", nil
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/local/directory-picker", strings.NewReader(`{}`))
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got directoryPickerResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Path != "/tmp/project" {
+		t.Fatalf("path = %q, want %q", got.Path, "/tmp/project")
+	}
+}
+
+func TestHandleLocalDirectoryPickerCancelReturnsNoContent(t *testing.T) {
+	srv := &Handler{
+		localDirectoryPicker: func(context.Context) (string, error) {
+			return "", errDirectorySelectionCanceled
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/local/directory-picker", strings.NewReader(`{}`))
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+}
+
+func TestHandleLocalDirectoryPickerUnsupportedReturnsNotImplemented(t *testing.T) {
+	srv := &Handler{
+		localDirectoryPicker: func(context.Context) (string, error) {
+			return "", errDirectoryPickerUnsupported
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/local/directory-picker", strings.NewReader(`{}`))
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNotImplemented, rec.Body.String())
+	}
+}
+
+func TestBootstrapConfigViewUsesServerUpgradeVisibility(t *testing.T) {
+	tests := []struct {
+		name        string
+		configValue bool
+		showUpgrade bool
+	}{
+		{name: "shown", configValue: true, showUpgrade: true},
+		{name: "hidden", configValue: false, showUpgrade: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := bootstrapConfigView(context.Background(), config.Config{
+				Server: config.ServerConfig{ShowUpgrade: tt.configValue},
+			}, nil, nil)
+
+			if got.ShowUpgrade != tt.showUpgrade {
+				t.Fatalf("ShowUpgrade = %t, want %t", got.ShowUpgrade, tt.showUpgrade)
+			}
+		})
+	}
+}
+
+func TestBootstrapConfigViewIncludesManagerCodexRuntimeReadiness(t *testing.T) {
+	origLocateCodexCLI := locateCodexCLI
+	locateCodexCLI = func() (string, error) { return "/usr/local/bin/codex", nil }
+	t.Cleanup(func() {
+		locateCodexCLI = origLocateCodexCLI
+	})
+
+	got := bootstrapConfigView(context.Background(), config.Config{}, nil, nil)
+
+	if got.ManagerRuntime.Name != agent.RuntimeNameCodex {
+		t.Fatalf("ManagerRuntime.Name = %q, want %q", got.ManagerRuntime.Name, agent.RuntimeNameCodex)
+	}
+	if got.ManagerRuntime.Label != "Codex CLI" || got.ManagerRuntime.SandboxEnabled {
+		t.Fatalf("ManagerRuntime label/sandbox = %q/%t, want Codex CLI/false", got.ManagerRuntime.Label, got.ManagerRuntime.SandboxEnabled)
+	}
+	if !got.ManagerRuntime.Installed {
+		t.Fatalf("ManagerRuntime.Installed = false, want true: %+v", got.ManagerRuntime)
+	}
+	if got.ManagerRuntime.OS == "" || got.ManagerRuntime.DocsURL == "" {
+		t.Fatalf("ManagerRuntime OS/docs_url missing: %+v", got.ManagerRuntime)
+	}
+}
+
+func TestBootstrapConfigViewReportsMissingManagerCodexCLI(t *testing.T) {
+	origLocateCodexCLI := locateCodexCLI
+	locateCodexCLI = func() (string, error) { return "", errors.New("codex missing") }
+	t.Cleanup(func() {
+		locateCodexCLI = origLocateCodexCLI
+	})
+
+	got := bootstrapConfigView(context.Background(), config.Config{}, nil, nil)
+
+	if got.ManagerRuntime.Installed {
+		t.Fatalf("ManagerRuntime.Installed = true, want false: %+v", got.ManagerRuntime)
+	}
+	if !strings.Contains(strings.ToLower(got.ManagerRuntime.Message), "codex") {
+		t.Fatalf("ManagerRuntime.Message = %q, want codex warning", got.ManagerRuntime.Message)
+	}
+	if got.ManagerRuntime.InstallGuidance == "" || got.ManagerRuntime.DocsURL == "" || got.ManagerRuntime.OS == "" {
+		t.Fatalf("ManagerRuntime missing install metadata: %+v", got.ManagerRuntime)
+	}
+}
+
+func TestBootstrapConfigViewReportsUnavailableSandboxRuntimeChoices(t *testing.T) {
+	t.Cleanup(sandboxproviders.LookPathForTest(func(string) (string, error) {
+		return "", os.ErrNotExist
+	}))
+	t.Cleanup(sandboxproviders.StatPathForTest(func(string) (os.FileInfo, error) {
+		return nil, os.ErrNotExist
+	}))
+
+	got := bootstrapConfigView(context.Background(), config.Config{
+		Sandbox: config.SandboxConfig{Provider: config.BoxLiteProvider},
+	}, nil, nil)
+
+	for _, choice := range got.WorkerRuntimeChoices {
+		if !choice.SandboxEnabled {
+			continue
+		}
+		if choice.Installed {
+			t.Fatalf("sandbox choice %q Installed = true, want false: %+v", choice.Name, choice)
+		}
+		if !strings.Contains(strings.ToLower(choice.Message), "boxlite") {
+			t.Fatalf("sandbox choice %q Message = %q, want boxlite warning", choice.Name, choice.Message)
+		}
+	}
+}
+
+func TestBootstrapConfigViewReportsStoppedDockerRuntimeChoices(t *testing.T) {
+	origAvailability := sandboxProviderAvailability
+	origProvider := sandboxProviderForRuntime
+	sandboxProviderAvailability = func(config.SandboxConfig) error {
+		return nil
+	}
+	sandboxProviderForRuntime = func(config.SandboxConfig) (sandbox.Provider, error) {
+		return fakeSandboxAvailabilityProvider{
+			name: config.DockerProvider,
+			err:  fmt.Errorf("%w: docker engine stopped", sandbox.ErrUnavailable),
+		}, nil
+	}
+	t.Cleanup(func() {
+		sandboxProviderAvailability = origAvailability
+		sandboxProviderForRuntime = origProvider
+	})
+
+	got := bootstrapConfigView(context.Background(), config.Config{
+		Sandbox: config.SandboxConfig{Provider: config.DockerProvider},
+	}, nil, nil)
+
+	for _, choice := range got.WorkerRuntimeChoices {
+		if !choice.SandboxEnabled {
+			continue
+		}
+		if choice.Installed {
+			t.Fatalf("sandbox choice %q Installed = true, want false: %+v", choice.Name, choice)
+		}
+		if !strings.Contains(choice.Message, "Docker is not running") {
+			t.Fatalf("sandbox choice %q Message = %q, want Docker startup guidance", choice.Name, choice.Message)
+		}
+		if choice.MessageCode != "docker_unavailable" {
+			t.Fatalf("sandbox choice %q MessageCode = %q, want docker_unavailable", choice.Name, choice.MessageCode)
+		}
+		if strings.Contains(strings.ToLower(choice.Message), "gateway") {
+			t.Fatalf("sandbox choice %q Message = %q, should not mention gateway", choice.Name, choice.Message)
+		}
+	}
+}
+
+func TestFriendlySandboxRuntimeMessageReportsDockerTimeout(t *testing.T) {
+	got := friendlySandboxRuntimeMessage(
+		config.SandboxConfig{Provider: config.DockerProvider},
+		fmt.Errorf("docker command canceled: %w", context.DeadlineExceeded),
+	)
+	if !strings.Contains(got, "Docker availability check timed out") {
+		t.Fatalf("friendlySandboxRuntimeMessage() = %q, want Docker timeout guidance", got)
+	}
+	if strings.Contains(strings.ToLower(got), "deadline exceeded") {
+		t.Fatalf("friendlySandboxRuntimeMessage() leaks implementation detail: %q", got)
+	}
+}
+
+func TestHandlerBootstrapConfigIncludesRuntimeOptionSchemas(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	svc, err := agent.NewController(
+		config.ModelConfig{},
+		config.ServerConfig{},
+		"manager-image:test",
+		statePath,
+		agent.WithRuntime(fakeCompatRuntime{
+			kind: agent.RuntimeKindCodex,
+			schemas: []agentruntime.RuntimeOptionSchema{
+				{
+					Key:     "local_workspace_dir",
+					Path:    "local_workspace_dir",
+					Label:   "Local Workspace Dir",
+					LabelZh: "本地工作目录",
+					LabelEn: "Local Workspace Dir",
+					Type:    "directory",
+				},
+			},
+		}),
+		agent.WithRuntime(fakeCompatRuntime{
+			kind: agent.RuntimeKindDSH,
+			schemas: []agentruntime.RuntimeOptionSchema{
+				{
+					Key:          "permission_mode",
+					Path:         "permission_mode",
+					Label:        "Permission Mode",
+					LabelZh:      "运行模式",
+					LabelEn:      "Permission Mode",
+					Type:         "select",
+					Options:      []string{"workspace-write", "read-only"},
+					DefaultValue: "workspace-write",
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config/bootstrap", nil)
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got bootstrapConfigResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got.RuntimeOptionSchemas[agent.RuntimeKindCodex]) != 1 {
+		t.Fatalf("codex runtime option schemas = %#v, want one schema", got.RuntimeOptionSchemas)
+	}
+	if got.RuntimeOptionSchemas[agent.RuntimeKindCodex][0].Path != "local_workspace_dir" {
+		t.Fatalf("schema path = %q, want local_workspace_dir", got.RuntimeOptionSchemas[agent.RuntimeKindCodex][0].Path)
+	}
+	if len(got.RuntimeOptionSchemas[agent.RuntimeKindDSH]) != 1 {
+		t.Fatalf("dsh runtime option schemas = %#v, want one schema", got.RuntimeOptionSchemas)
+	}
+	if got.RuntimeOptionSchemas[agent.RuntimeKindDSH][0].Path != "permission_mode" {
+		t.Fatalf("DSH schema path = %q, want permission_mode", got.RuntimeOptionSchemas[agent.RuntimeKindDSH][0].Path)
+	}
+}
+
+func TestBootstrapConfigIncludesBuiltinOpenClawRuntimeDefaultImage(t *testing.T) {
+	hubSvc, err := hub.NewService(config.HubConfig{Registries: []config.HubRegistryConfig{{Name: config.DefaultOfficialHubRegistryName, Kind: config.HubRegistryKindRemote, Enabled: false}}}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	got := bootstrapConfigView(context.Background(), config.Config{}, hubSvc, nil)
+
+	openclawImage := got.RuntimeDefaultImages[agent.RuntimeNameOpenClaw]
+	if openclawImage == "" {
+		t.Fatalf("RuntimeDefaultImages[%q] = empty; defaults=%#v", agent.RuntimeNameOpenClaw, got.RuntimeDefaultImages)
+	}
+	if !strings.Contains(openclawImage, "/opencsghq/openclaw:") {
+		t.Fatalf("RuntimeDefaultImages[%q] = %q, want builtin OpenClaw image", agent.RuntimeNameOpenClaw, openclawImage)
+	}
+}
+
+func TestHandleAgentIncludesRuntimeOptionSchemas(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{
+			ID:             "u-codex",
+			Name:           "codex-worker",
+			RuntimeID:      "rt-u-codex",
+			RuntimeKind:    agent.RuntimeKindCodex,
+			RuntimeOptions: map[string]any{"local_workspace_dir": "/tmp/project"},
+			Role:           agent.RoleWorker,
+			Status:         string(agentruntime.StateRunning),
+			CreatedAt:      time.Date(2026, 6, 13, 8, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	svc, err := agent.NewController(
+		config.ModelConfig{},
+		config.ServerConfig{},
+		"manager-image:test",
+		statePath,
+		agent.WithRuntime(fakeCompatRuntime{
+			kind: agent.RuntimeKindCodex,
+			schemas: []agentruntime.RuntimeOptionSchema{
+				{
+					Key:           "local_workspace_dir",
+					Path:          "local_workspace_dir",
+					Label:         "Local Workspace Dir",
+					LabelZh:       "本地工作目录",
+					LabelEn:       "Local Workspace Dir",
+					Description:   "Leave empty to use the default agent workspace.",
+					DescriptionZh: "留空时使用默认 Agent 工作目录。",
+					DescriptionEn: "Leave empty to use the default agent workspace.",
+					Type:          "directory",
+					Picker:        "optional",
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-codex", nil)
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got agentResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.RuntimeOptions["local_workspace_dir"] != "/tmp/project" {
+		t.Fatalf("runtime options = %#v, want local_workspace_dir", got.RuntimeOptions)
+	}
+	if len(got.RuntimeOptionSchemas) != 1 {
+		t.Fatalf("runtime option schemas = %#v, want one schema", got.RuntimeOptionSchemas)
+	}
+	if got.RuntimeOptionSchemas[0].Type != "directory" {
+		t.Fatalf("schema type = %q, want directory", got.RuntimeOptionSchemas[0].Type)
+	}
+	if got.RuntimeOptionSchemas[0].LabelZh != "本地工作目录" {
+		t.Fatalf("schema zh label = %q, want 本地工作目录", got.RuntimeOptionSchemas[0].LabelZh)
+	}
+}
+
+func TestHandleManagerOmitsRuntimeOptionSchemas(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{
+			ID:          agent.ManagerUserID,
+			Name:        agent.ManagerName,
+			RuntimeID:   "rt-agent-manager",
+			RuntimeKind: agent.RuntimeKindCodex,
+			Role:        agent.RoleManager,
+			Status:      string(agentruntime.StateRunning),
+			CreatedAt:   time.Date(2026, 6, 13, 8, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	svc, err := agent.NewController(
+		config.ModelConfig{},
+		config.ServerConfig{},
+		"manager-image:test",
+		statePath,
+		agent.WithRuntime(fakeCompatRuntime{
+			kind: agent.RuntimeKindCodex,
+			schemas: []agentruntime.RuntimeOptionSchema{
+				{
+					Key:   "local_workspace_dir",
+					Path:  "local_workspace_dir",
+					Label: "Local Workspace Dir",
+					Type:  "directory",
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+agent.ManagerUserID, nil)
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got agentResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got.RuntimeOptionSchemas) != 0 || len(got.Runtime.OptionSchemas) != 0 {
+		t.Fatalf("manager runtime option schemas = %#v / %#v, want none", got.RuntimeOptionSchemas, got.Runtime.OptionSchemas)
+	}
+
+	patchRec := httptest.NewRecorder()
+	patchReq := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/v1/agents/"+agent.ManagerUserID,
+		strings.NewReader(`{"runtime_options":{"local_workspace_dir":"/tmp/manager"}}`),
+	)
+	patchReq.Header.Set("Content-Type", "application/json")
+	srv.Routes().ServeHTTP(patchRec, patchReq)
+	if patchRec.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH status = %d, want %d; body=%s", patchRec.Code, http.StatusBadRequest, patchRec.Body.String())
+	}
+	if !strings.Contains(patchRec.Body.String(), "manager runtime options are managed automatically") {
+		t.Fatalf("PATCH body = %q, want managed runtime options error", patchRec.Body.String())
+	}
+}
+
+func TestHandleFeishuRoomsMembers(t *testing.T) {
+	feishuSvc := feishu.NewServiceWithCreateChatAndAddMembers(
+		map[string]feishu.AppConfig{
+			"agent-manager": {AppID: "manager-app-id", AppSecret: "app-secret", AdminOpenID: "ou_admin"},
+			"fsu-alice":     {AppID: "alice-app-id", AppSecret: "alice-secret"},
+		},
+		func(_ context.Context, _ feishu.AppConfig, req feishu.CreateChatRequest) (feishu.CreateChatResponse, error) {
+			return feishu.CreateChatResponse{
+				ChatID:      "oc_alpha",
+				Name:        req.Title,
+				Description: req.Description,
+			}, nil
+		},
+		func(context.Context, feishu.AppConfig, feishu.AddChatMembersRequest) error { return nil },
+		func(context.Context, feishu.AppConfig, map[string]feishu.AppConfig, string) ([]im.User, error) {
+			return []im.User{
+				{ID: "fsu-admin", Name: "Admin"},
+				{ID: "fsu-alice", Name: "Alice"},
+			}, nil
+		},
+	)
+	feishuSvc.SetBotOpenIDResolver(testFeishuBotInfoResolver(t, map[string]string{
+		"manager-app-id": "fsu-admin",
+		"alice-app-id":   "fsu-alice",
+	}))
+	if _, err := feishuSvc.CreateUser(feishu.CreateUserRequest{ID: "fsu-admin", Name: "Admin"}); err != nil {
+		t.Fatalf("CreateUser(admin) error = %v", err)
+	}
+	if _, err := feishuSvc.CreateUser(feishu.CreateUserRequest{ID: "fsu-alice", Name: "Alice"}); err != nil {
+		t.Fatalf("CreateUser(alice) error = %v", err)
+	}
+	srv := &Handler{feishu: feishuSvc}
+
+	createReq := strings.NewReader(`{"title":"alpha","creator_id":"fsu-admin"}`)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/channels/feishu/rooms", createReq))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var room im.Room
+	if err := json.NewDecoder(rec.Body).Decode(&room); err != nil {
+		t.Fatalf("decode room: %v", err)
+	}
+
+	addReq := strings.NewReader(`{"user_ids":["fsu-alice"]}`)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/channels/feishu/rooms/"+room.ID+"/members", addReq))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/channels/feishu/rooms/"+room.ID+"/members", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("members status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var members []im.User
+	if err := json.NewDecoder(rec.Body).Decode(&members); err != nil {
+		t.Fatalf("decode members: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members = %+v, want two users", members)
+	}
+	if members[0].ID != "agent-manager" || members[1].ID != "fsu-alice" {
+		t.Fatalf("members = %+v, want bot ids", members)
+	}
+}
+
+func TestHandleRoomsMembersListsCsgclawMembers(t *testing.T) {
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "Admin", Role: "admin"},
+			{ID: "u-alice", Name: "Alice", Role: "worker"},
+		},
+		Rooms: []im.Room{
+			{ID: "room-1", Title: "Ops", Members: []string{"u-admin", "u-alice"}},
+		},
+	})
+	srv := &Handler{im: imSvc}
+
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/rooms/room-1/members", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("members status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var members []im.User
+	if err := json.NewDecoder(rec.Body).Decode(&members); err != nil {
+		t.Fatalf("decode members: %v", err)
+	}
+	if len(members) != 2 || members[0].ID != "user-admin" || members[1].ID != "user-alice" {
+		t.Fatalf("members = %+v, want room members", members)
+	}
+}
+
+func TestHandleRoomsMembersAddsCsgclawMember(t *testing.T) {
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "Admin", Role: "admin"},
+			{ID: "u-alice", Name: "Alice", Role: "worker"},
+		},
+		Rooms: []im.Room{
+			{ID: "room-1", Title: "Ops", Members: []string{"u-admin"}},
+		},
+	})
+	srv := &Handler{im: imSvc}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/room-1/members", strings.NewReader(`{"inviter_id":"u-admin","user_ids":["u-alice"]}`))
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("add status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var room im.Room
+	if err := json.NewDecoder(rec.Body).Decode(&room); err != nil {
+		t.Fatalf("decode room: %v", err)
+	}
+	if len(room.Members) != 2 || room.Members[1] != "user-alice" {
+		t.Fatalf("members = %+v, want user-admin and user-alice", room.Members)
+	}
+}
+
+func TestHandleRoomsMembersDeletesCsgclawMember(t *testing.T) {
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "Admin", Role: "admin"},
+			{ID: "u-alice", Name: "Alice", Role: "worker"},
+		},
+		Rooms: []im.Room{
+			{ID: "room-1", Title: "Ops", Members: []string{"u-admin", "u-alice"}},
+		},
+	})
+	srv := &Handler{im: imSvc}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/rooms/room-1/members/u-alice", strings.NewReader(`{"inviter_id":"u-admin"}`))
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var room im.Room
+	if err := json.NewDecoder(rec.Body).Decode(&room); err != nil {
+		t.Fatalf("decode room: %v", err)
+	}
+	if len(room.Members) != 1 || room.Members[0] != "user-admin" {
+		t.Fatalf("members = %+v, want only admin", room.Members)
+	}
+}
+
+func TestHandleAgentsListReturnsUnifiedAgents(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{ID: "u-manager", Name: "manager", Role: agent.RoleManager, CreatedAt: time.Date(2026, 3, 28, 9, 0, 0, 0, time.UTC)},
+		{ID: "u-alice", Name: "alice", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+		{ID: "agent-1", Name: "observer", Role: agent.RoleAgent, CreatedAt: time.Date(2026, 3, 28, 11, 0, 0, 0, time.UTC)},
+	})
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var got []agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len(agents) = %d, want 3; body=%s", len(got), rec.Body.String())
+	}
+	if got[0].ID != "agent-manager" || got[1].ID != "agent-alice" || got[2].ID != "agent-1" {
+		t.Fatalf("agents = %+v, want manager/worker/agent in CreatedAt order", got)
+	}
+}
+
+func TestHandleAgentDeleteRemovesBoundParticipants(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{ID: "agent-qa", Name: "qa", Role: agent.RoleWorker, RuntimeKind: agent.RuntimeKindPicoClawSandbox},
+	})
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: im.AdminUserID,
+		Users: []im.User{
+			{ID: im.AdminUserID, Name: "admin", Role: "admin"},
+			{ID: "user-qa", Name: "qa", Role: agent.RoleWorker},
+		},
+	})
+	participantSvc := participant.NewService(participant.NewMemoryStore([]apitypes.Participant{
+		{
+			ID:              "pt-qa",
+			Channel:         participant.ChannelCSGClaw,
+			Type:            participant.TypeAgent,
+			Name:            "qa",
+			AgentID:         "agent-qa",
+			ChannelUserRef:  "user-qa",
+			ChannelUserKind: participant.ChannelUserKindLocalUserID,
+			LifecycleStatus: participant.LifecycleStatusActive,
+			Mentionable:     true,
+		},
+		{
+			ID:              "pt-qa-feishu",
+			Channel:         participant.ChannelFeishu,
+			Type:            participant.TypeAgent,
+			Name:            "qa Feishu",
+			AgentID:         "agent-qa",
+			ChannelAppRef:   "cli_xxx",
+			ChannelUserRef:  "ou_xxx",
+			ChannelUserKind: participant.ChannelUserKindOpenID,
+			LifecycleStatus: participant.LifecycleStatusActive,
+			Mentionable:     true,
+		},
+	}), participant.WithAgentEngine(agentengine.New(svc)), participant.WithIMService(imSvc))
+	srv := &Handler{svc: svc, im: imSvc, participant: participantSvc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/agents/agent-qa", nil)
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if _, ok := svc.Agent("agent-qa"); ok {
+		t.Fatal("agent agent-qa still exists after delete")
+	}
+	for _, ref := range []struct {
+		channel string
+		id      string
+	}{
+		{participant.ChannelCSGClaw, "pt-qa"},
+		{participant.ChannelFeishu, "pt-qa-feishu"},
+	} {
+		if _, ok := participantSvc.Get(ref.channel, ref.id); ok {
+			t.Fatalf("participant %s:%s still exists after agent delete", ref.channel, ref.id)
+		}
+	}
+	if _, ok := imSvc.User("user-qa"); ok {
+		t.Fatal("local agent user user-qa still exists after deleting its CSGClaw participant")
+	}
+}
+
+func TestHandleAgentsListExposesLinkedLocalUser(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{ID: "agent-dahym7", Name: "qa", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: im.AdminUserID,
+		Users: []im.User{
+			{ID: im.AdminUserID, Name: "admin", Role: "admin"},
+			{ID: "user-dahym7", Name: "qa", Role: agent.RoleWorker, Avatar: "avatar/3D-5.png"},
+		},
+	})
+	participantSvc := participant.NewService(participant.NewMemoryStore([]apitypes.Participant{{
+		ID:              "pt-dahym7",
+		Channel:         participant.ChannelCSGClaw,
+		Type:            participant.TypeAgent,
+		Name:            "qa",
+		AgentID:         "agent-dahym7",
+		ChannelUserRef:  "user-dahym7",
+		ChannelUserKind: participant.ChannelUserKindLocalUserID,
+		LifecycleStatus: participant.LifecycleStatusActive,
+		Mentionable:     true,
+	}}))
+
+	srv := &Handler{svc: svc, im: imSvc, participant: participantSvc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents?include_participants=true", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got []apitypes.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(agents) = %d, want 1; body=%s", len(got), rec.Body.String())
+	}
+	if got[0].UserID != "user-dahym7" || got[0].UserName != "qa" {
+		t.Fatalf("agent user = %q/%q, want user-dahym7/qa; body=%s", got[0].UserID, got[0].UserName, rec.Body.String())
+	}
+	if len(got[0].Participants) != 1 || got[0].Participants[0].UserID != "user-dahym7" {
+		t.Fatalf("participants = %+v, want linked local user", got[0].Participants)
+	}
+}
+
+func TestHandleAgentResponsesExposeLinkedLocalUserWithoutCSGClawParticipant(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{ID: "agent-dahym7", Name: "qa", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: im.AdminUserID,
+		Users: []im.User{
+			{ID: im.AdminUserID, Name: "admin", Role: "admin"},
+			{ID: "user-dahym7", Name: "qa", Role: agent.RoleWorker, Avatar: "avatar/3D-5.png"},
+		},
+	})
+	participantSvc := participant.NewService(participant.NewMemoryStore([]apitypes.Participant{{
+		ID:              "pt-dahym7-feishu",
+		Channel:         participant.ChannelFeishu,
+		Type:            participant.TypeAgent,
+		Name:            "qa",
+		AgentID:         "agent-dahym7",
+		ChannelUserKind: participant.ChannelUserKindAppID,
+		LifecycleStatus: participant.LifecycleStatusActive,
+		Mentionable:     true,
+	}}))
+
+	srv := &Handler{svc: svc, im: imSvc, participant: participantSvc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		listResult bool
+	}{
+		{name: "list", method: http.MethodGet, path: "/api/v1/agents?include_participants=true", listResult: true},
+		{name: "get", method: http.MethodGet, path: "/api/v1/agents/agent-dahym7?include_participants=true"},
+		{name: "patch", method: http.MethodPatch, path: "/api/v1/agents/agent-dahym7", body: `{"description":"updated"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			srv.Routes().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var got apitypes.Agent
+			if tt.listResult {
+				var items []apitypes.Agent
+				if err := json.NewDecoder(rec.Body).Decode(&items); err != nil {
+					t.Fatalf("decode response: %v", err)
+				}
+				if len(items) != 1 {
+					t.Fatalf("len(agents) = %d, want 1; body=%s", len(items), rec.Body.String())
+				}
+				got = items[0]
+			} else if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if got.UserID != "user-dahym7" || got.UserName != "qa" {
+				t.Fatalf("agent user = %q/%q, want user-dahym7/qa; body=%s", got.UserID, got.UserName, rec.Body.String())
+			}
+			if tt.method == http.MethodGet && (len(got.Participants) != 1 || got.Participants[0].Channel != participant.ChannelFeishu) {
+				t.Fatalf("participants = %+v, want only the existing Feishu participant", got.Participants)
+			}
+		})
+	}
+}
+
+func TestHandleAgentsListHydratesStatusFromSandboxInfo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "agents.json")
+	runtimeHome := filepath.Join(dir, "agents", "agent-alice", config.RuntimeHomeDirName)
+	provider := sandboxtest.NewProvider()
+	rt := sandboxtest.NewRuntime()
+	rt.Instances["box-stored"] = sandboxtest.NewInstance(sandbox.Info{
+		ID:        "box-live",
+		Name:      "alice",
+		State:     sandbox.StateRunning,
+		CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC),
+	})
+	provider.Runtimes[runtimeHome] = rt
+
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-stored", Role: agent.RoleWorker, Status: "stale", CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	svc, err := agent.NewController(config.ModelConfig{}, config.ServerConfig{}, "manager-image:test", statePath, agent.WithSandboxProvider(provider))
+	if err != nil {
+		t.Fatalf("agent.NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got []agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(agents) = %d, want 1", len(got))
+	}
+	if got[0].Status != string(sandbox.StateRunning) || got[0].BoxID != "box-live" {
+		t.Fatalf("agent = %+v, want live running status and refreshed box id", got[0])
+	}
+}
+
+func TestHandleAgentsGetByIDReturnsAgent(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{ID: "u-alice", Name: "alice", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-alice", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "agent-alice" || got.Name != "alice" || got.Role != agent.RoleWorker {
+		t.Fatalf("agent = %+v, want agent-alice/alice/worker", got)
+	}
+}
+
+func TestHandleAgentGetDistinguishesNotFoundFromEngineFailure(t *testing.T) {
+	base := enginetest.NewMemoryClient()
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "not found",
+			err:        &agentengine.TurnError{Code: agentengine.ErrorAgentNotFound, Message: "agent missing"},
+			wantStatus: http.StatusNotFound,
+			wantBody:   "agent not found",
+		},
+		{
+			name:       "engine unavailable",
+			err:        &agentengine.TurnError{Code: agentengine.ErrorAgentUnavailable, Message: "agent service is unavailable"},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "agent service is unavailable",
+		},
+		{
+			name:       "reload failure",
+			err:        errors.New("reload agent state: storage unavailable"),
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "storage unavailable",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{agentEngine: getErrorEngine{
+				Interface: base,
+				agents:    getErrorAgents{AgentInterface: base.Agents(), err: test.err},
+			}}
+			recorder := httptest.NewRecorder()
+			handler.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/agents/agent-a", nil))
+			if recorder.Code != test.wantStatus || !strings.Contains(recorder.Body.String(), test.wantBody) {
+				t.Fatalf("response = %d %q, want %d containing %q", recorder.Code, recorder.Body.String(), test.wantStatus, test.wantBody)
+			}
+		})
+	}
+}
+
+func TestHandleAgentsListReportsConfiguredStartupPending(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{
+			ID:              "u-alice",
+			Name:            "alice",
+			Role:            agent.RoleWorker,
+			RuntimeKind:     agent.RuntimeKindCodex,
+			ProfileComplete: true,
+			AgentProfile: agent.AgentProfile{
+				Name:            "alice",
+				Provider:        agent.ProviderCodex,
+				ModelID:         "gpt-5.5",
+				ProfileComplete: true,
+			},
+			CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC),
+		},
+	})
+	svc.PrepareConfiguredAgentsStartup()
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got []struct {
+		Runtime struct {
+			StartupPending bool `json:"startup_pending"`
+		} `json:"runtime"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(agents) = %d, want 1", len(got))
+	}
+	if !got[0].Runtime.StartupPending {
+		t.Fatal("runtime.startup_pending = false, want true during configured-agent restore")
+	}
+}
+
+func TestHandleAgentsGetByIDSeparatesGatewayAvailabilityFromLifecycle(t *testing.T) {
+	var probes int
+	svc := mustNewSeededServiceWithOptions(t, []agent.Agent{
+		{
+			ID:          "u-alice",
+			Name:        "alice",
+			Role:        agent.RoleWorker,
+			RuntimeKind: agent.RuntimeKindPicoClawSandbox,
+			BoxID:       "box-alice",
+			Status:      string(agentruntime.StateRunning),
+			CreatedAt:   time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC),
+		},
+	}, agent.WithRuntime(fakeReadinessCompatRuntime{
+		fakeCompatRuntime: fakeCompatRuntime{kind: agent.RuntimeKindPicoClawSandbox},
+		readiness: func(context.Context, agentruntime.Handle) error {
+			probes++
+			return errors.New("gateway connection refused")
+		},
+	}))
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-alice", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if probes != 1 {
+		t.Fatalf("readiness probes = %d, want 1", probes)
+	}
+	var got struct {
+		Runtime struct {
+			State        string `json:"state"`
+			Availability struct {
+				State     string    `json:"state"`
+				ExpiresAt time.Time `json:"expires_at"`
+				Reason    string    `json:"reason"`
+			} `json:"availability"`
+		} `json:"runtime"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Runtime.State != string(agentruntime.StateRunning) {
+		t.Fatalf("runtime.state = %q, want running", got.Runtime.State)
+	}
+	if got.Runtime.Availability.State != "degraded" || got.Runtime.Availability.Reason != "readiness_failed" {
+		t.Fatalf("runtime.availability = %+v, want degraded readiness_failed", got.Runtime.Availability)
+	}
+	if got.Runtime.Availability.ExpiresAt.IsZero() {
+		t.Fatal("runtime.availability.expires_at = zero, want expiry time")
+	}
+}
+
+func TestHandleAgentUpgradeUsesLatestDefaultImage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	hubSvc := mustNewLocalTemplateHubServiceWithoutWorkspace(t, "frontend-worker", hub.Template{
+		ID:          "frontend-worker",
+		Name:        "frontend-worker",
+		Description: "frontend worker",
+		Role:        hub.TemplateRoleWorker,
+		RuntimeKind: agent.RuntimeNamePicoClaw,
+		Version:     "0.2.0",
+		Image:       "registry.example/picoclaw-worker:0.2.0",
+	})
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{
+			ID:           "u-alice",
+			Name:         "alice",
+			RuntimeID:    "rt-u-alice",
+			RuntimeKind:  agent.RuntimeKindPicoClawSandbox,
+			Image:        "custom.example/alice-worker:2026.05.27",
+			BoxID:        "box-alice-old",
+			Role:         agent.RoleWorker,
+			Status:       string(agentruntime.StateRunning),
+			AgentProfile: agent.AgentProfile{Name: "alice", Provider: agent.ProviderCodex, ModelID: "gpt-5.5", ProfileComplete: true},
+			CreatedAt:    time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	var newImage string
+	svc, err := agent.NewController(
+		config.ModelConfig{},
+		config.ServerConfig{},
+		"manager-image:test",
+		statePath,
+		agent.WithHubService(hubSvc),
+		agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{DefaultWorkerTemplate: "local/frontend-worker"}),
+		agent.WithRuntime(fakeCompatRuntime{
+			new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+				newImage = spec.Image
+				return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "box-alice-new"}, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/u-alice/upgrade", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if newImage != "registry.example/picoclaw-worker:0.2.0" {
+		t.Fatalf("runtime New() image = %q, want latest default image", newImage)
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Image != "registry.example/picoclaw-worker:0.2.0" {
+		t.Fatalf("response Image = %q, want latest default image", got.Image)
+	}
+}
+
+func TestHandleAgentsListReportsImageUpgradeRequiredByTemplateVersion(t *testing.T) {
+	tests := []struct {
+		name         string
+		currentImage string
+		latestImage  string
+		version      string
+		wantRequired bool
+	}{
+		{
+			name:         "older template version requires upgrade",
+			currentImage: "registry.example/picoclaw-worker:0.1.0",
+			latestImage:  "registry.example/picoclaw-worker:0.2.0",
+			version:      "0.2.0",
+			wantRequired: true,
+		},
+		{
+			name:         "legacy worker base image requires upgrade to template wrapper",
+			currentImage: "registry.example/picoclaw:2026.5.27",
+			latestImage:  "registry.example/picoclaw-worker:0.2.0",
+			version:      "0.2.0",
+			wantRequired: true,
+		},
+		{
+			name:         "newer template version does not require upgrade",
+			currentImage: "registry.example/picoclaw-worker:0.3.0",
+			latestImage:  "registry.example/picoclaw-worker:0.2.0",
+			version:      "0.2.0",
+			wantRequired: false,
+		},
+		{
+			name:         "dev image does not require upgrade",
+			currentImage: "registry.example/picoclaw-worker:dev",
+			latestImage:  "registry.example/picoclaw-worker:0.2.0",
+			version:      "0.2.0",
+			wantRequired: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			provider := sandboxtest.NewProvider()
+			provider.Images = []string{"registry.example/picoclaw-worker:9.9.9"}
+			hubSvc := mustNewLocalTemplateHubServiceWithoutWorkspace(t, "frontend-worker", hub.Template{
+				ID:          "frontend-worker",
+				Name:        "frontend-worker",
+				Description: "frontend worker",
+				Role:        hub.TemplateRoleWorker,
+				RuntimeKind: agent.RuntimeNamePicoClaw,
+				Version:     tt.version,
+				Image:       tt.latestImage,
+			})
+			statePath := filepath.Join(t.TempDir(), "agents.json")
+			if err := writeSeededAgents(statePath, []agent.Agent{
+				{
+					ID:           "u-alice",
+					Name:         "alice",
+					RuntimeID:    "rt-u-alice",
+					RuntimeKind:  agent.RuntimeKindPicoClawSandbox,
+					Image:        tt.currentImage,
+					BoxID:        "box-alice",
+					Role:         agent.RoleWorker,
+					Status:       string(agentruntime.StateRunning),
+					AgentProfile: agent.AgentProfile{Name: "alice", Provider: agent.ProviderCodex, ModelID: "gpt-5.5", ProfileComplete: true},
+					CreatedAt:    time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC),
+				},
+			}); err != nil {
+				t.Fatalf("writeSeededAgents() error = %v", err)
+			}
+			svc, err := agent.NewController(
+				config.ModelConfig{},
+				config.ServerConfig{},
+				"manager-image:test",
+				statePath,
+				agent.WithSandboxProvider(provider),
+				agent.WithHubService(hubSvc),
+				agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{DefaultWorkerTemplate: "local/frontend-worker"}),
+				agent.WithRuntime(fakeCompatRuntime{
+					info: func(_ context.Context, h agentruntime.Handle) (agentruntime.Info, error) {
+						return agentruntime.Info{HandleID: h.HandleID, State: agentruntime.StateRunning}, nil
+					},
+				}),
+			)
+			if err != nil {
+				t.Fatalf("NewService() error = %v", err)
+			}
+
+			srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+			rec := httptest.NewRecorder()
+
+			srv.Routes().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var got []agentResponse
+			if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("len(agents) = %d, want 1", len(got))
+			}
+			if got[0].AgentProfile.ImageUpgradeRequired != tt.wantRequired {
+				t.Fatalf("image_upgrade_required = %t, want %t; response=%+v", got[0].AgentProfile.ImageUpgradeRequired, tt.wantRequired, got[0])
+			}
+		})
+	}
+}
+
+func TestHandleManagerGetIgnoresLocalTemplatePublishedFromManager(t *testing.T) {
+	tests := []struct {
+		name         string
+		currentImage string
+		latestImage  string
+		version      string
+		wantRequired bool
+	}{
+		{
+			name:         "older local template version is ignored",
+			currentImage: "registry.example/opencsghq/picoclaw-manager:0.1.0",
+			latestImage:  "registry.example/opencsghq/picoclaw-manager:0.2.0",
+			version:      "0.2.0",
+			wantRequired: false,
+		},
+		{
+			name:         "legacy manager base image is ignored",
+			currentImage: "registry.example/opencsghq/picoclaw:2026.5.27",
+			latestImage:  "registry.example/opencsghq/picoclaw-manager:0.2.0",
+			version:      "0.2.0",
+			wantRequired: false,
+		},
+		{
+			name:         "newer manager version does not require upgrade",
+			currentImage: "registry.example/opencsghq/picoclaw-manager:0.3.0",
+			latestImage:  "registry.example/opencsghq/picoclaw-manager:0.2.0",
+			version:      "0.2.0",
+			wantRequired: false,
+		},
+		{
+			name:         "dev manager tag does not require upgrade",
+			currentImage: "registry.example/opencsghq/picoclaw-manager:dev",
+			latestImage:  "registry.example/opencsghq/picoclaw-manager:0.2.0",
+			version:      "0.2.0",
+			wantRequired: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+			statePath := filepath.Join(t.TempDir(), "agents.json")
+			if err := writeSeededAgents(statePath, []agent.Agent{
+				{
+					ID:           agent.ManagerUserID,
+					Name:         agent.ManagerName,
+					RuntimeID:    "rt-manager",
+					RuntimeKind:  agent.RuntimeKindPicoClawSandbox,
+					Image:        tt.currentImage,
+					BoxID:        "box-manager",
+					Role:         agent.RoleManager,
+					Status:       string(agentruntime.StateRunning),
+					AgentProfile: agent.AgentProfile{Name: agent.ManagerName, Provider: agent.ProviderCodex, ModelID: "gpt-5.5", ProfileComplete: true},
+					CreatedAt:    time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC),
+				},
+			}); err != nil {
+				t.Fatalf("writeSeededAgents() error = %v", err)
+			}
+			hubSvc := mustNewLocalTemplateHubServiceWithoutWorkspace(t, "picoclaw-manager", hub.Template{
+				ID:          "picoclaw-manager",
+				Name:        "picoclaw-manager",
+				Description: "manager",
+				Role:        hub.TemplateRoleManager,
+				RuntimeKind: agent.RuntimeNamePicoClaw,
+				Version:     tt.version,
+				Image:       tt.latestImage,
+			})
+			svc, err := agent.NewController(
+				config.ModelConfig{},
+				config.ServerConfig{},
+				"manager-image:unused",
+				statePath,
+				agent.WithHubService(hubSvc),
+				agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{DefaultManagerTemplate: "local/picoclaw-manager"}),
+				agent.WithRuntime(fakeCompatRuntime{
+					info: func(_ context.Context, h agentruntime.Handle) (agentruntime.Info, error) {
+						return agentruntime.Info{HandleID: h.HandleID, State: agentruntime.StateRunning}, nil
+					},
+				}),
+			)
+			if err != nil {
+				t.Fatalf("NewService() error = %v", err)
+			}
+
+			srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-manager", nil)
+			rec := httptest.NewRecorder()
+
+			srv.Routes().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var got agentResponse
+			if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if got.AgentProfile.ImageUpgradeRequired != tt.wantRequired {
+				t.Fatalf("manager image_upgrade_required = %t, want %t; response=%+v", got.AgentProfile.ImageUpgradeRequired, tt.wantRequired, got)
+			}
+		})
+	}
+}
+
+func TestHandleAgentUpgradeClearsOutdatedImageFlag(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	provider := sandboxtest.NewProvider()
+	provider.Images = []string{"registry.example/picoclaw-worker:0.1.0"}
+	hubSvc := mustNewLocalTemplateHubServiceWithoutWorkspace(t, "frontend-worker", hub.Template{
+		ID:          "frontend-worker",
+		Name:        "frontend-worker",
+		Description: "frontend worker",
+		Role:        hub.TemplateRoleWorker,
+		RuntimeKind: agent.RuntimeNamePicoClaw,
+		Version:     "0.2.0",
+		Image:       "registry.example/picoclaw-worker:0.2.0",
+	})
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{
+			ID:           "u-alice",
+			Name:         "alice",
+			RuntimeID:    "rt-u-alice",
+			RuntimeKind:  agent.RuntimeKindPicoClawSandbox,
+			Image:        "registry.example/picoclaw-worker:0.1.0",
+			BoxID:        "box-alice-old",
+			Role:         agent.RoleWorker,
+			Status:       string(agentruntime.StateRunning),
+			AgentProfile: agent.AgentProfile{Name: "alice", Provider: agent.ProviderCodex, ModelID: "gpt-5.5", ProfileComplete: true},
+			CreatedAt:    time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	var newImage string
+	svc, err := agent.NewController(
+		config.ModelConfig{},
+		config.ServerConfig{},
+		"manager-image:test",
+		statePath,
+		agent.WithSandboxProvider(provider),
+		agent.WithHubService(hubSvc),
+		agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{DefaultWorkerTemplate: "local/frontend-worker"}),
+		agent.WithRuntime(fakeCompatRuntime{
+			new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+				newImage = spec.Image
+				return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "box-alice-new"}, nil
+			},
+			info: func(_ context.Context, h agentruntime.Handle) (agentruntime.Info, error) {
+				return agentruntime.Info{HandleID: h.HandleID, State: agentruntime.StateRunning, CreatedAt: time.Date(2026, 6, 3, 10, 0, 0, 0, time.UTC)}, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	beforeReq := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-alice", nil)
+	beforeRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(beforeRec, beforeReq)
+	if beforeRec.Code != http.StatusOK {
+		t.Fatalf("pre-upgrade status = %d, want %d; body=%s", beforeRec.Code, http.StatusOK, beforeRec.Body.String())
+	}
+	var before agentResponse
+	if err := json.NewDecoder(beforeRec.Body).Decode(&before); err != nil {
+		t.Fatalf("decode pre-upgrade response: %v", err)
+	}
+	if !before.AgentProfile.ImageUpgradeRequired {
+		t.Fatalf("pre-upgrade image_upgrade_required = false, want true; response=%+v", before)
+	}
+
+	upgradeReq := httptest.NewRequest(http.MethodPost, "/api/v1/agents/u-alice/upgrade", nil)
+	upgradeRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(upgradeRec, upgradeReq)
+	if upgradeRec.Code != http.StatusOK {
+		t.Fatalf("upgrade status = %d, want %d; body=%s", upgradeRec.Code, http.StatusOK, upgradeRec.Body.String())
+	}
+	if newImage != "registry.example/picoclaw-worker:0.2.0" {
+		t.Fatalf("runtime New() image = %q, want latest default image", newImage)
+	}
+	var upgraded agentResponse
+	if err := json.NewDecoder(upgradeRec.Body).Decode(&upgraded); err != nil {
+		t.Fatalf("decode upgrade response: %v", err)
+	}
+	if upgraded.Image != "registry.example/picoclaw-worker:0.2.0" {
+		t.Fatalf("upgrade response Image = %q, want latest default image", upgraded.Image)
+	}
+	if upgraded.AgentProfile.ImageUpgradeRequired {
+		t.Fatalf("upgrade response image_upgrade_required = true, want false; response=%+v", upgraded)
+	}
+
+	afterReq := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-alice", nil)
+	afterRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(afterRec, afterReq)
+	if afterRec.Code != http.StatusOK {
+		t.Fatalf("post-upgrade status = %d, want %d; body=%s", afterRec.Code, http.StatusOK, afterRec.Body.String())
+	}
+	var after agentResponse
+	if err := json.NewDecoder(afterRec.Body).Decode(&after); err != nil {
+		t.Fatalf("decode post-upgrade response: %v", err)
+	}
+	if after.Image != "registry.example/picoclaw-worker:0.2.0" || after.AgentProfile.ImageUpgradeRequired {
+		t.Fatalf("post-upgrade response = %+v, want latest image and no image upgrade flag", after)
+	}
+}
+
+func TestHandleManagerUpgradeUsesDefaultTemplateVersionWhenLocalImageListIsStale(t *testing.T) {
+	t.Skip("manager is Codex-only; sandbox manager image upgrades are obsolete")
+	t.Setenv("HOME", t.TempDir())
+	provider := sandboxtest.NewProvider()
+	provider.Images = []string{
+		"opencsg-registry.cn-beijing.cr.aliyuncs.com/opencsghq/picoclaw-manager:0.1.0",
+	}
+	hubSvc := mustNewLocalTemplateHubServiceWithoutWorkspace(t, "picoclaw-manager", hub.Template{
+		ID:          "picoclaw-manager",
+		Name:        "picoclaw-manager",
+		Description: "manager",
+		Role:        hub.TemplateRoleManager,
+		RuntimeKind: agent.RuntimeNamePicoClaw,
+		Version:     "0.2.0",
+		Image:       "opencsg-registry.cn-beijing.cr.aliyuncs.com/opencsghq/picoclaw-manager:0.2.0",
+	})
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{
+			ID:           agent.ManagerUserID,
+			Name:         agent.ManagerName,
+			RuntimeID:    "rt-manager",
+			RuntimeKind:  agent.RuntimeKindPicoClawSandbox,
+			Image:        "opencsg-registry.cn-beijing.cr.aliyuncs.com/opencsghq/picoclaw:2026.5.27",
+			BoxID:        "box-manager-old",
+			Role:         agent.RoleManager,
+			Status:       string(agentruntime.StateRunning),
+			AgentProfile: agent.AgentProfile{Name: agent.ManagerName, Provider: agent.ProviderCodex, ModelID: "gpt-5.5", ProfileComplete: true},
+			CreatedAt:    time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	var newImage string
+	svc, err := agent.NewController(
+		config.ModelConfig{},
+		config.ServerConfig{},
+		"manager-image:unused",
+		statePath,
+		agent.WithSandboxProvider(provider),
+		agent.WithHubService(hubSvc),
+		agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{DefaultManagerTemplate: "local/picoclaw-manager"}),
+		agent.WithRuntime(fakeCompatRuntime{
+			new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+				newImage = spec.Image
+				return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "box-manager-new"}, nil
+			},
+			info: func(_ context.Context, h agentruntime.Handle) (agentruntime.Info, error) {
+				return agentruntime.Info{HandleID: h.HandleID, State: agentruntime.StateRunning, CreatedAt: time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)}, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := httptest.NewServer((&Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}).Routes())
+	defer srv.Close()
+	getAgent := func(path string) agentResponse {
+		t.Helper()
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s error = %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read GET %s response: %v", path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want %d; body=%s", path, resp.StatusCode, http.StatusOK, string(body))
+		}
+		var got agentResponse
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatalf("decode GET %s response: %v", path, err)
+		}
+		return got
+	}
+
+	before := getAgent("/api/v1/agents/u-manager")
+	if !before.AgentProfile.ImageUpgradeRequired {
+		t.Fatalf("pre-upgrade image_upgrade_required = false, want true; response=%+v", before)
+	}
+
+	resp, err := http.Post(srv.URL+"/api/v1/agents/u-manager/upgrade", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST upgrade error = %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read POST upgrade response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST upgrade status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+	wantImage := "opencsg-registry.cn-beijing.cr.aliyuncs.com/opencsghq/picoclaw-manager:0.2.0"
+	if newImage != wantImage {
+		t.Fatalf("runtime New() image = %q, want %q", newImage, wantImage)
+	}
+	var upgraded agentResponse
+	if err := json.Unmarshal(body, &upgraded); err != nil {
+		t.Fatalf("decode upgrade response: %v", err)
+	}
+	if upgraded.Image != wantImage || upgraded.AgentProfile.ImageUpgradeRequired {
+		t.Fatalf("upgrade response = %+v, want latest template image and no image upgrade flag", upgraded)
+	}
+
+	after := getAgent("/api/v1/agents/u-manager")
+	if after.Image != wantImage || after.AgentProfile.ImageUpgradeRequired {
+		t.Fatalf("post-upgrade response = %+v, want latest template image and no image upgrade flag", after)
+	}
+}
+
+func TestHandleAgentsListRedactsProfileAPIKey(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{
+			ID:   "u-alice",
+			Name: "alice",
+			Role: agent.RoleWorker,
+			AgentProfile: agent.AgentProfile{
+				Name:            "alice",
+				Provider:        agent.ProviderAPI,
+				BaseURL:         "https://api.example.test/v1",
+				APIKey:          "secret-token",
+				ModelID:         "gpt-test",
+				ReasoningEffort: agent.DefaultReasoningEffort,
+				ProfileComplete: true,
+			},
+			ProfileComplete: true,
+			CreatedAt:       time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC),
+		},
+	})
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "secret-token") {
+		t.Fatalf("response leaked API key: %s", rec.Body.String())
+	}
+	var got []map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	profile, ok := got[0]["model_config"].(map[string]any)
+	if !ok || profile["api_key_set"] != true {
+		t.Fatalf("model_config = %#v, want api_key_set true", got[0]["model_config"])
+	}
+	if got, want := profile["api_key_preview"], "secr..."; got != want {
+		t.Fatalf("model_config api_key_preview = %#v, want %q", got, want)
+	}
+	if _, ok := profile["api_key"]; ok {
+		t.Fatalf("model_config includes api_key: %#v", profile)
+	}
+}
+
+func TestHandleAgentProfileResolvesAgentName(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{{
+		ID:   "u-alice",
+		Name: "Alice",
+		Role: agent.RoleWorker,
+		AgentProfile: agent.AgentProfile{
+			Name:            "Alice",
+			Provider:        agent.ProviderCodex,
+			ModelID:         "old-model",
+			ProfileComplete: false,
+		},
+	}})
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+
+	t.Run("get", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/alice/profile", nil)
+		rec := httptest.NewRecorder()
+
+		srv.Routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var got apitypes.AgentProfile
+		if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if got.ModelID != "old-model" {
+			t.Fatalf("profile = %+v, want old-model", got)
+		}
+	})
+
+	t.Run("put", func(t *testing.T) {
+		body := `{}`
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/agents/ALICE/profile", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+
+		srv.Routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		profile, err := svc.AgentProfileView("u-alice")
+		if err != nil {
+			t.Fatalf("AgentProfileView() error = %v", err)
+		}
+		if profile.ModelID != "" {
+			t.Fatalf("model id = %q, want empty", profile.ModelID)
+		}
+	})
+}
+
+func TestHandleAgentsPatchUpdatesMetadataAndProfile(t *testing.T) {
+	svc := mustNewSeededServiceWithOptions(t, []agent.Agent{
+		{
+			ID:          "u-alice",
+			Name:        "alice",
+			Role:        agent.RoleWorker,
+			RuntimeKind: agent.RuntimeKindCodex,
+			AgentProfile: agent.AgentProfile{
+				Name:            "alice",
+				Provider:        agent.ProviderCSGHubLite,
+				ModelID:         "old-model",
+				ReasoningEffort: agent.DefaultReasoningEffort,
+				ProfileComplete: true,
+			},
+			ProfileComplete: true,
+			CreatedAt:       time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC),
+		},
+	}, agent.WithRuntime(fakeCompatRuntime{kind: agent.RuntimeKindCodex}))
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	body := `{"description":"new role","agent_profile":{"name":"alice","provider":"csghub_lite","model_id":"new-model","env":{"A":"B"}}}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/agents/u-alice", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got["description"] != "new role" {
+		t.Fatalf("agent = %#v, want updated description", got)
+	}
+	profile, ok := got["model_config"].(map[string]any)
+	env, envOK := profile["env"].(map[string]any)
+	if !ok || profile["model_id"] != "new-model" || !envOK || env["A"] != "B" {
+		t.Fatalf("model_config = %#v, want updated model and env", got["model_config"])
+	}
+}
+
+func TestHandleAgentsPatchFieldMaskClearsRuntimeOptions(t *testing.T) {
+	svc := mustNewSeededServiceWithOptions(t, []agent.Agent{
+		{
+			ID:          "u-alice",
+			Name:        "alice",
+			Role:        agent.RoleWorker,
+			RuntimeKind: agent.RuntimeKindCodex,
+			RuntimeOptions: map[string]any{
+				"local_workspace_dir": "/tmp/project",
+			},
+			AgentProfile: agent.AgentProfile{
+				Name:            "alice",
+				Provider:        agent.ProviderCodex,
+				ModelID:         "gpt-5.5",
+				ProfileComplete: true,
+			},
+			ProfileComplete: true,
+			CreatedAt:       time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC),
+		},
+	}, agent.WithRuntime(fakeCompatRuntime{kind: agent.RuntimeKindCodex}))
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	body := `{"runtime_options":{},"field_mask":["runtime_options"]}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/agents/u-alice", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	runtime, runtimeOK := got["runtime"].(map[string]any)
+	if !runtimeOK {
+		t.Fatalf("runtime = %#v, want runtime object", got["runtime"])
+	}
+	if runtimeOptions, ok := runtime["options"].(map[string]any); ok && len(runtimeOptions) != 0 {
+		t.Fatalf("runtime.options = %#v, want cleared map", runtimeOptions)
+	}
+}
+
+func TestHandleAgentsGetByIDReloadsStateBeforeLookup(t *testing.T) {
+	svc, statePath := mustNewSeededServiceWithPath(t, []agent.Agent{
+		{ID: "u-alice", Name: "alice", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{ID: "u-bob", Name: "bob", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-bob", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "agent-bob" || got.Name != "bob" {
+		t.Fatalf("agent = %+v, want agent-bob/bob", got)
+	}
+}
+
+func TestHandleAgentsGetByIDNotFound(t *testing.T) {
+	svc := mustNewSeededService(t, nil)
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/missing", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandleAgentLogsStreamsGatewayLog(t *testing.T) {
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	agentSvc := mustNewSeededService(t, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-123", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+
+	var gotBoxID string
+	var gotCmd string
+	var gotArgs []string
+	agent.TestOnlySetGetBoxHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Runtime, idOrName string) (sandbox.Instance, error) {
+		gotBoxID = idOrName
+		return sandboxtest.NewInstance(sandbox.Info{ID: idOrName, Name: "alice"}), nil
+	})
+	agent.TestOnlySetRunBoxCommandHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Instance, name string, args []string, w io.Writer) (int, error) {
+		gotCmd = name
+		gotArgs = append([]string(nil), args...)
+		_, _ = io.WriteString(w, "hello\nworld\n")
+		return 0, nil
+	})
+	defer func() {
+		agent.TestOnlySetGetBoxHook(nil)
+		agent.TestOnlySetRunBoxCommandHook(nil)
+	}()
+
+	srv := &Handler{svc: agentSvc, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-alice/logs?lines=80", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if gotBoxID != "box-123" {
+		t.Fatalf("getBox() idOrName = %q, want %q", gotBoxID, "box-123")
+	}
+	if gotCmd != "tail" {
+		t.Fatalf("command = %q, want %q", gotCmd, "tail")
+	}
+	if strings.Join(gotArgs, " ") != "-n 80 "+picoclawsandbox.BoxGatewayLogPath {
+		t.Fatalf("args = %q", gotArgs)
+	}
+	if rec.Body.String() != "hello\nworld\n" {
+		t.Fatalf("body = %q, want streamed logs", rec.Body.String())
+	}
+}
+
+func TestHandleAgentLogsReloadsStateBeforeStreaming(t *testing.T) {
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	agentSvc, statePath := mustNewSeededServiceWithPath(t, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-old", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-new", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+
+	var gotBoxID string
+	agent.TestOnlySetGetBoxHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Runtime, idOrName string) (sandbox.Instance, error) {
+		gotBoxID = idOrName
+		return sandboxtest.NewInstance(sandbox.Info{ID: idOrName, Name: "alice"}), nil
+	})
+	agent.TestOnlySetRunBoxCommandHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Instance, _ string, _ []string, w io.Writer) (int, error) {
+		_, _ = io.WriteString(w, "line-1\n")
+		return 0, nil
+	})
+	defer func() {
+		agent.TestOnlySetGetBoxHook(nil)
+		agent.TestOnlySetRunBoxCommandHook(nil)
+	}()
+
+	srv := &Handler{svc: agentSvc, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-alice/logs", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if gotBoxID != "box-new" {
+		t.Fatalf("getBox() idOrName = %q, want %q", gotBoxID, "box-new")
+	}
+}
+
+func TestHandleAgentStartStartsExistingBox(t *testing.T) {
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	agentSvc, statePath := mustNewSeededServiceWithPath(t, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-old", Role: agent.RoleWorker, Status: "stopped", CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-new", Role: agent.RoleWorker, Status: "stopped", CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+
+	var gotBoxID string
+	var startCalls int
+	agent.TestOnlySetGetBoxHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Runtime, idOrName string) (sandbox.Instance, error) {
+		gotBoxID = idOrName
+		return sandboxtest.NewInstance(sandbox.Info{ID: idOrName, Name: "alice", State: sandbox.StateStopped}), nil
+	})
+	agent.TestOnlySetStartBoxHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Instance) error {
+		startCalls++
+		return nil
+	})
+	agent.TestOnlySetBoxInfoHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Instance) (sandbox.Info, error) {
+		state := sandbox.StateStopped
+		if startCalls > 0 {
+			state = sandbox.StateRunning
+		}
+		return sandbox.Info{ID: "box-new", Name: "alice", State: state}, nil
+	})
+	defer func() {
+		agent.TestOnlySetGetBoxHook(nil)
+		agent.TestOnlySetStartBoxHook(nil)
+		agent.TestOnlySetBoxInfoHook(nil)
+	}()
+
+	srv := &Handler{svc: agentSvc, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/u-alice/start", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if gotBoxID != "box-new" {
+		t.Fatalf("getBox() idOrName = %q, want %q", gotBoxID, "box-new")
+	}
+	if startCalls != 1 {
+		t.Fatalf("startBox() calls = %d, want 1", startCalls)
+	}
+	var got agentResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Status != "running" || got.BoxID != "box-new" {
+		t.Fatalf("agent = %+v, want running box-new", got)
+	}
+	if got.Runtime.SandboxProvider != "fake" {
+		t.Fatalf("runtime sandbox provider = %q, want fake", got.Runtime.SandboxProvider)
+	}
+}
+
+func TestHandleAgentStartEnsuresCodexBridge(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+
+	agentSvc, err := agent.NewController(
+		config.ModelConfig{
+			Provider: config.ProviderLLMAPI,
+			BaseURL:  "http://127.0.0.1:4000",
+			APIKey:   "sk-test",
+			ModelID:  "model-1",
+		},
+		config.ServerConfig{}, "manager-image:test", statePath,
+		agent.WithRuntime(fakeCompatRuntime{
+			kind: agent.RuntimeKindCodex,
+			new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+				return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "codex-" + spec.AgentName}, nil
+			},
+			start: func(_ context.Context, _ agentruntime.Handle) (agentruntime.State, error) {
+				return agentruntime.StateRunning, nil
+			},
+			info: func(_ context.Context, h agentruntime.Handle) (agentruntime.Info, error) {
+				return agentruntime.Info{HandleID: h.HandleID, State: agentruntime.StateRunning}, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	created, err := agentSvc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			Name:        "alice",
+			Role:        agent.RoleWorker,
+			RuntimeKind: agent.RuntimeKindCodex,
+			AgentProfile: agent.AgentProfile{
+				ProfileComplete: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := agentSvc.Stop(context.Background(), created.ID); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	srv := &Handler{svc: agentSvc, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/start", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+func TestHandleAgentApplyBindingsRefreshesRequestedChannelWithoutLifecycleEnsure(t *testing.T) {
+	manager := completeWorkerAgent(agent.ManagerUserID, agent.ManagerName)
+	manager.Role = agent.RoleManager
+	manager.RuntimeKind = agent.RuntimeKindCodex
+	manager.RuntimeID = "rt-manager"
+	bridge := &fakeCodexBridgeController{}
+	agentSvc, _ := mustNewSeededServiceWithPathAndOptions(t, []agent.Agent{manager})
+	srv := &Handler{svc: agentSvc, channelBindings: bridge, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ManagerUserID+"/bindings:apply?channel=feishu", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if len(bridge.ensureCalls) != 0 {
+		t.Fatalf("EnsureAgent() calls = %+v, want none", bridge.ensureCalls)
+	}
+	if len(bridge.refreshCalls) != 1 || bridge.refreshCalls[0].agent.ID != agent.ManagerUserID || bridge.refreshCalls[0].channel != "feishu" {
+		t.Fatalf("RefreshAgentChannel() calls = %+v, want manager feishu once", bridge.refreshCalls)
+	}
+}
+
+func TestHandleAgentApplyBindingsDefaultsLegacyRequestToFeishu(t *testing.T) {
+	manager := completeWorkerAgent(agent.ManagerUserID, agent.ManagerName)
+	manager.Role = agent.RoleManager
+	manager.RuntimeKind = agent.RuntimeKindCodex
+	manager.RuntimeID = "rt-manager"
+	bridge := &fakeCodexBridgeController{}
+	agentSvc, _ := mustNewSeededServiceWithPathAndOptions(t, []agent.Agent{manager})
+	srv := &Handler{svc: agentSvc, channelBindings: bridge, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ManagerUserID+"/bindings:apply", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if len(bridge.ensureCalls) != 0 {
+		t.Fatalf("EnsureAgent() calls = %+v, want none", bridge.ensureCalls)
+	}
+	if len(bridge.refreshCalls) != 1 || bridge.refreshCalls[0].agent.ID != agent.ManagerUserID || bridge.refreshCalls[0].channel != feishu.ChannelID {
+		t.Fatalf("RefreshAgentChannel() calls = %+v, want manager feishu once", bridge.refreshCalls)
+	}
+}
+
+func TestHandleAgentStopStopsExistingBox(t *testing.T) {
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	agentSvc, statePath := mustNewSeededServiceWithPath(t, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-old", Role: agent.RoleWorker, Status: "running", CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-new", Role: agent.RoleWorker, Status: "running", CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+
+	var gotBoxID string
+	var stopCalls int
+	agent.TestOnlySetGetBoxHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Runtime, idOrName string) (sandbox.Instance, error) {
+		gotBoxID = idOrName
+		return sandboxtest.NewInstance(sandbox.Info{ID: idOrName, Name: "alice", State: sandbox.StateRunning}), nil
+	})
+	agent.TestOnlySetStopBoxHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Instance, opts sandbox.StopOptions) error {
+		stopCalls++
+		if opts != (sandbox.StopOptions{}) {
+			t.Fatalf("Stop() opts = %+v, want zero value", opts)
+		}
+		return nil
+	})
+	agent.TestOnlySetBoxInfoHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Instance) (sandbox.Info, error) {
+		return sandbox.Info{ID: "box-new", Name: "alice", State: sandbox.StateStopped}, nil
+	})
+	defer func() {
+		agent.TestOnlySetGetBoxHook(nil)
+		agent.TestOnlySetStopBoxHook(nil)
+		agent.TestOnlySetBoxInfoHook(nil)
+	}()
+
+	srv := &Handler{svc: agentSvc, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/u-alice/stop", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if gotBoxID != "box-new" {
+		t.Fatalf("getBox() idOrName = %q, want %q", gotBoxID, "box-new")
+	}
+	if stopCalls != 1 {
+		t.Fatalf("stopBox() calls = %d, want 1", stopCalls)
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Status != "stopped" || got.BoxID != "box-new" {
+		t.Fatalf("agent = %+v, want stopped box-new", got)
+	}
+}
+
+func TestHandleAgentStopStopsCodexBridge(t *testing.T) {
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	agentSvc, statePath := mustNewSeededServiceWithPath(t, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-old", Role: agent.RoleWorker, Status: "running", CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{ID: "u-alice", Name: "alice", BoxID: "box-new", Role: agent.RoleWorker, Status: "running", CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+
+	agent.TestOnlySetGetBoxHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Runtime, idOrName string) (sandbox.Instance, error) {
+		return sandboxtest.NewInstance(sandbox.Info{ID: idOrName, Name: "alice", State: sandbox.StateRunning}), nil
+	})
+	agent.TestOnlySetStopBoxHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Instance, _ sandbox.StopOptions) error {
+		return nil
+	})
+	agent.TestOnlySetBoxInfoHook(func(_ *agent.Controller, _ context.Context, _ sandbox.Instance) (sandbox.Info, error) {
+		return sandbox.Info{ID: "box-new", Name: "alice", State: sandbox.StateStopped}, nil
+	})
+	defer func() {
+		agent.TestOnlySetGetBoxHook(nil)
+		agent.TestOnlySetStopBoxHook(nil)
+		agent.TestOnlySetBoxInfoHook(nil)
+	}()
+
+	srv := &Handler{svc: agentSvc, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/u-alice/stop", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+func TestHandleAgentsDeleteRemovesAgent(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{ID: "u-alice", Name: "alice", Role: agent.RoleWorker, CreatedAt: time.Date(2026, 3, 28, 10, 0, 0, 0, time.UTC)},
+	})
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/agents/u-alice", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if _, ok := svc.Agent("u-alice"); ok {
+		t.Fatal("Agent() ok = true, want false after delete")
+	}
+}
+
+func TestHandleAgentsDeleteNotFound(t *testing.T) {
+	svc := mustNewSeededService(t, nil)
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/agents/missing", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestAgentAdministrationRoutesUseInjectedEngineWithoutHandlerService(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{{
+		ID:          "agent-engine-admin",
+		Name:        "engine-admin",
+		Description: "before",
+		Role:        agent.RoleWorker,
+		Status:      string(agentruntime.StateStopped),
+		CreatedAt:   time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC),
+	}})
+	handler := &Handler{agentEngine: agentengine.New(svc)}
+
+	list := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil))
+	if list.Code != http.StatusOK {
+		t.Fatalf("GET /agents status = %d, want 200; body=%s", list.Code, list.Body.String())
+	}
+
+	patch := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(patch, httptest.NewRequest(http.MethodPatch, "/api/v1/agents/agent-engine-admin", strings.NewReader(`{"description":"after"}`)))
+	if patch.Code != http.StatusOK {
+		t.Fatalf("PATCH /agents status = %d, want 200; body=%s", patch.Code, patch.Body.String())
+	}
+	updated, ok := svc.Agent("agent-engine-admin")
+	if !ok || updated.Description != "after" {
+		t.Fatalf("persisted Agent = %+v, found=%v, want description after", updated, ok)
+	}
+
+	deleted := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(deleted, httptest.NewRequest(http.MethodDelete, "/api/v1/agents/agent-engine-admin", nil))
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /agents status = %d, want 204; body=%s", deleted.Code, deleted.Body.String())
+	}
+	if _, ok := svc.Agent("agent-engine-admin"); ok {
+		t.Fatal("Agent still exists after Engine-routed delete")
+	}
+}
+
+func TestAgentSubresourceAdministrationUsesOnlyResourceCRUD(t *testing.T) {
+	seed := agentengine.Agent{
+		ID: "agent-resource-admin", ResourceVersion: "1",
+		Spec: agentengine.AgentSpec{
+			Name: "resource-admin", Description: "before", Role: agentengine.AgentRoleWorker,
+			Runtime:    agentengine.RuntimeSpec{Adapter: agent.RuntimeNameCodex},
+			Model:      agentengine.ModelSpec{ProviderID: "provider-a", ModelID: "model-a"},
+			Skills:     []string{"old-skill"},
+			MCPServers: map[string]agentengine.MCPServerConfig{"legacy": {"command": "legacy-server"}},
+			Memory:     &agentengine.MemorySpec{Enabled: true}, DesiredState: agentengine.AgentDesiredStateStopped,
+		},
+		Status: agentengine.AgentStatus{
+			State:        agentengine.AgentStateStopped,
+			Capabilities: agentengine.AgentCapabilities{Memory: true},
+			Instructions: &agentengine.InstructionsStatus{Effective: runtimeinstructions.RenderAgentsInstructionsBlock("before")},
+			Memory:       &agentengine.MemoryStatus{Enabled: true, Ready: true, Name: "MEMORY.md", Content: "memory"},
+		},
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	client := enginetest.NewMemoryClient(seed)
+	handler := &Handler{agentEngine: client}
+	routes := handler.Routes()
+
+	request := func(method, path, body string, want int) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		routes.ServeHTTP(recorder, httptest.NewRequest(method, path, strings.NewReader(body)))
+		if recorder.Code != want {
+			t.Fatalf("%s %s status = %d, want %d; body=%s", method, path, recorder.Code, want, recorder.Body.String())
+		}
+	}
+
+	request(http.MethodPatch, "/api/v1/agents/agent-resource-admin", `{"description":"after"}`, http.StatusOK)
+	request(http.MethodPut, "/api/v1/agents/agent-resource-admin/profile", `{"model_provider_id":"provider-b","model_id":"model-b"}`, http.StatusOK)
+	request(http.MethodPost, "/api/v1/agents/agent-resource-admin/skills:batchAdd", `{"names":["new-skill"]}`, http.StatusNoContent)
+	request(http.MethodDelete, "/api/v1/agents/agent-resource-admin/skills/old-skill", "", http.StatusNoContent)
+	request(http.MethodPost, "/api/v1/agents/agent-resource-admin/mcp-servers:batchDelete", `{"names":["legacy"]}`, http.StatusOK)
+	effective, err := json.Marshal(map[string]string{"effective": runtimeinstructions.RenderAgentsInstructionsBlock("after instructions")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request(http.MethodPut, "/api/v1/agents/agent-resource-admin/instructions", string(effective), http.StatusOK)
+	request(http.MethodPut, "/api/v1/agents/agent-resource-admin/memory", `{"enabled":false}`, http.StatusOK)
+	request(http.MethodPost, "/api/v1/agents/agent-resource-admin/start", "", http.StatusOK)
+	request(http.MethodPost, "/api/v1/agents/agent-resource-admin/stop", "", http.StatusOK)
+	request(http.MethodPost, "/api/v1/agents/agent-resource-admin/recreate", "", http.StatusOK)
+	request(http.MethodPost, "/api/v1/agents/agent-resource-admin/upgrade", "", http.StatusOK)
+
+	got, err := client.Agents().Get(context.Background(), seed.ID, agentengine.AgentGetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Description != "after" || got.Spec.Model.ProviderID != "provider-b" ||
+		!slices.Equal(got.Spec.Skills, []string{"new-skill"}) || len(got.Spec.MCPServers) != 0 ||
+		got.Spec.Instructions != "after instructions" || got.Spec.Memory == nil || got.Spec.Memory.Enabled {
+		t.Fatalf("final Agent resource = %+v", got)
+	}
+	request(http.MethodDelete, "/api/v1/agents/agent-resource-admin", "", http.StatusNoContent)
+}
+
+func TestHandleAgentsCreateDoesNotProvisionIMUser(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	srv := &Handler{
+		svc: svc,
+		im:  im.NewService(), agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"name":"alice","role":"worker"}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.HasPrefix(got.ID, "agent-") || got.Role != agent.RoleWorker {
+		t.Fatalf("agent = %+v, want worker alias result", got)
+	}
+	if _, ok := srv.im.User("u-alice"); ok {
+		t.Fatal("User(u-alice) ok = true, want false after agent create")
+	}
+	if rooms := srv.im.ListRooms(); len(rooms) != 0 {
+		t.Fatalf("rooms = %+v, want no IM rooms after agent create", rooms)
+	}
+}
+
+func TestHandleAgentsCreateWorkerUsesRequestedRuntimeKind(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc, err := agent.NewController(
+		config.ModelConfig{
+			Provider: config.ProviderLLMAPI,
+			BaseURL:  "http://127.0.0.1:4000",
+			APIKey:   "sk-test",
+			ModelID:  "model-1",
+		},
+		config.ServerConfig{}, "manager-image:test", "",
+		agent.WithRuntime(fakeCompatRuntime{
+			kind: agent.RuntimeKindCodex,
+			new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+				return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "codex-" + spec.AgentName}, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := &Handler{
+		svc: svc,
+		im:  im.NewService(), agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"name":"alice","role":"worker","runtime_name":"codex"}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.RuntimeKind != agent.RuntimeKindCodex {
+		t.Fatalf("agent runtime kind = %q, want %q", got.RuntimeKind, agent.RuntimeKindCodex)
+	}
+	if got.BoxID != "codex-alice" {
+		t.Fatalf("agent BoxID = %q, want %q", got.BoxID, "codex-alice")
+	}
+}
+
+func TestHandleAgentsCreateWorkerSupportsLegacyRuntimeKindRequest(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc, err := agent.NewController(
+		config.ModelConfig{
+			Provider: config.ProviderLLMAPI,
+			BaseURL:  "http://127.0.0.1:4000",
+			APIKey:   "sk-test",
+			ModelID:  "model-1",
+		},
+		config.ServerConfig{}, "manager-image:test", "",
+		agent.WithRuntime(fakeCompatRuntime{
+			kind: agent.RuntimeKindCodex,
+			new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+				return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "codex-" + spec.AgentName}, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := &Handler{
+		svc: svc,
+		im:  im.NewService(), agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"name":"alice","role":"worker","runtime_kind":"codex"}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.RuntimeKind != agent.RuntimeKindCodex {
+		t.Fatalf("agent runtime kind = %q, want %q", got.RuntimeKind, agent.RuntimeKindCodex)
+	}
+}
+
+func TestHandleAgentsCreateCodexWorkerEnsuresCodexBridge(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc, err := agent.NewController(
+		config.ModelConfig{
+			Provider: config.ProviderLLMAPI,
+			BaseURL:  "http://127.0.0.1:4000",
+			APIKey:   "sk-test",
+			ModelID:  "model-1",
+		},
+		config.ServerConfig{}, "manager-image:test", "",
+		agent.WithRuntime(fakeCompatRuntime{
+			kind: agent.RuntimeKindCodex,
+			new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+				return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "codex-" + spec.AgentName}, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	srv := &Handler{
+		svc: svc,
+		im:  im.NewService(), agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"name":"alice","role":"worker","runtime_name":"codex","agent_profile":{"profile_complete":true}}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+}
+
+func TestHandleAgentsMCPServersClosedLoopForSupportedRuntimes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	codexRoot := t.TempDir()
+	codexHomes := map[string]string{}
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	codexManager := &apiFakeCodexManager{}
+	t.Cleanup(codexManager.close)
+	codexRT := codexruntime.New(codexruntime.Dependencies{
+		BinaryProvider: apiFakeCodexBinaryProvider{},
+		AgentHome: func(agentID string) (string, error) {
+			home := filepath.Join(codexRoot, agentID)
+			codexHomes[agentID] = home
+			return home, nil
+		},
+		ResolveAgent: func(h agentruntime.Handle) (codexruntime.AgentRef, error) {
+			return codexAgentRefFromStateFile(statePath, h.RuntimeID, agentruntime.Profile{
+				Provider: agent.ProviderAPI,
+				BaseURL:  "https://llm.example/v1",
+				APIKey:   "sk-test",
+				ModelID:  "model-1",
+			})
+		},
+		Manager: codexManager,
+	})
+
+	svc, err := agent.NewController(
+		config.ModelConfig{
+			Provider: config.ProviderLLMAPI,
+			BaseURL:  "https://llm.example/v1",
+			APIKey:   "sk-default",
+			ModelID:  "model-default",
+		},
+		config.ServerConfig{
+			ListenAddr:       "127.0.0.1:18080",
+			AdvertiseBaseURL: "http://127.0.0.1:18080",
+			AccessToken:      "shared-token",
+		},
+		"manager-image:test",
+		statePath,
+		agent.WithRuntime(codexRT),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	srv := &Handler{svc: svc, im: im.NewService(), agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+
+	mcpServers := map[string]any{
+		"context7": map[string]any{
+			"command": "uvx",
+			"args":    []any{"context7-mcp"},
+			"env": map[string]any{
+				"CONTEXT7_API_KEY": "secret",
+			},
+		},
+		"remote": map[string]any{
+			"url":                  "https://mcp.example.com/mcp",
+			"bearer_token_env_var": "MCP_TOKEN",
+		},
+	}
+
+	tests := []struct {
+		name        string
+		id          string
+		agentName   string
+		runtimeKind string
+		image       string
+		assertFile  func(t *testing.T, created agentResponse)
+	}{
+		{
+			name:        "openclaw",
+			id:          "u-openclawmcp",
+			agentName:   "openclawmcp",
+			runtimeKind: agent.RuntimeKindOpenClawSandbox,
+			image:       "openclaw-image:test",
+			assertFile: func(t *testing.T, created agentResponse) {
+				t.Helper()
+				home := testAgentHomeFromStatePath(statePath, created.ID)
+				cfg := readJSONMap(t, filepath.Join(openclawsandbox.Root(home), openclawsandbox.HostConfig))
+				mcpRoot, ok := cfg["mcp"].(map[string]any)
+				if !ok {
+					t.Fatalf("openclaw config missing mcp object: %+v", cfg["mcp"])
+				}
+				assertPersistedMCPServers(t, mcpRoot["servers"])
+			},
+		},
+		{
+			name:        "picoclaw",
+			id:          "u-picoclawmcp",
+			agentName:   "picoclawmcp",
+			runtimeKind: agent.RuntimeKindPicoClawSandbox,
+			image:       "picoclaw-image:test",
+			assertFile: func(t *testing.T, created agentResponse) {
+				t.Helper()
+				home := testAgentHomeFromStatePath(statePath, created.ID)
+				cfg := readJSONMap(t, filepath.Join(picoclawsandbox.Root(home), picoclawsandbox.HostConfig))
+				tools, ok := cfg["tools"].(map[string]any)
+				if !ok {
+					t.Fatalf("picoclaw config missing tools object: %+v", cfg["tools"])
+				}
+				mcpRoot, ok := tools["mcp"].(map[string]any)
+				if !ok {
+					t.Fatalf("picoclaw config missing tools.mcp object: %+v", tools["mcp"])
+				}
+				if enabled, _ := mcpRoot["enabled"].(bool); !enabled {
+					t.Fatalf("picoclaw tools.mcp.enabled = %v, want true", mcpRoot["enabled"])
+				}
+				assertPersistedMCPServers(t, mcpRoot["servers"])
+			},
+		},
+		{
+			name:        "codex",
+			id:          "u-codexmcp",
+			agentName:   "codexmcp",
+			runtimeKind: agent.RuntimeKindCodex,
+			assertFile: func(t *testing.T, created agentResponse) {
+				t.Helper()
+				home := codexHomes[agent.CanonicalID(created.ID)]
+				if strings.TrimSpace(home) == "" {
+					t.Fatalf("codex agent home for %s was not resolved", created.ID)
+				}
+				configPath := filepath.Join(home, ".codex", "home", "config.toml")
+				raw, err := os.ReadFile(configPath)
+				if err != nil {
+					t.Fatalf("read codex config %s: %v", configPath, err)
+				}
+				configText := string(raw)
+				for _, want := range []string{
+					`# BEGIN csgclaw-managed mcp`,
+					`[mcp_servers."context7"]`,
+					`command = "uvx"`,
+					`args = ["context7-mcp"]`,
+					`env = { "CONTEXT7_API_KEY" = "secret" }`,
+					`[mcp_servers."remote"]`,
+					`url = "https://mcp.example.com/mcp"`,
+					`bearer_token_env_var = "MCP_TOKEN"`,
+					`# END csgclaw-managed mcp`,
+				} {
+					if !strings.Contains(configText, want) {
+						t.Fatalf("codex config missing %q:\n%s", want, configText)
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			createBody := map[string]any{
+				"id":           tt.id,
+				"name":         tt.agentName,
+				"role":         agent.RoleWorker,
+				"runtime_kind": tt.runtimeKind,
+				"agent_profile": map[string]any{
+					"model_provider_id": "e2e-api",
+					"base_url":          "https://llm.example/v1",
+					"api_key":           "sk-test",
+					"model_id":          "model-1",
+				},
+			}
+			if tt.image != "" {
+				createBody["image"] = tt.image
+			}
+			created := doAgentJSON(t, srv, http.MethodPost, "/api/v1/agents", createBody, http.StatusCreated)
+			wantRuntime := agentruntime.RuntimeConfigForKind(tt.runtimeKind)
+			if created.RuntimeName != wantRuntime.Name || created.SandboxEnabled != wantRuntime.Sandboxed {
+				t.Fatalf("created runtime = %q/%t, want %q/%t", created.RuntimeName, created.SandboxEnabled, wantRuntime.Name, wantRuntime.Sandboxed)
+			}
+
+			updated := doAgentJSON(t, srv, http.MethodPatch, "/api/v1/agents/"+created.ID, map[string]any{
+				"field_mask": []string{"mcpServers"},
+				"mcpServers": mcpServers,
+			}, http.StatusOK)
+			assertMCPServersResponse(t, updated.MCPServers)
+			tt.assertFile(t, updated)
+		})
+	}
+}
+
+func TestAgentMCPServersResponsesRedactSecrets(t *testing.T) {
+	svc, _ := mustNewSeededServiceWithPath(t, nil)
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	secretConfig := map[string]any{
+		"context7": map[string]any{
+			"command": "uvx",
+			"env": map[string]any{
+				"CONTEXT7_API_KEY": "secret-env",
+			},
+			"headers": map[string]any{
+				"Authorization": "Bearer secret-header",
+			},
+		},
+	}
+
+	created := doAgentJSON(t, srv, http.MethodPost, "/api/v1/agents", map[string]any{
+		"id":           "u-mcp-secrets",
+		"name":         "mcp-secrets",
+		"role":         agent.RoleWorker,
+		"runtime_kind": agent.RuntimeKindPicoClawSandbox,
+		"image":        "picoclaw-image:test",
+		"agent_profile": map[string]any{
+			"profile_complete": true,
+		},
+		"mcpServers": secretConfig,
+	}, http.StatusCreated)
+	assertMCPServersSecretsRedacted(t, created.MCPServers)
+
+	updated := doAgentJSON(t, srv, http.MethodPatch, "/api/v1/agents/"+created.ID, map[string]any{
+		"field_mask": []string{"mcpServers"},
+		"mcpServers": secretConfig,
+	}, http.StatusOK)
+	assertMCPServersSecretsRedacted(t, updated.MCPServers)
+
+	detail := doAgentJSON(t, srv, http.MethodGet, "/api/v1/agents/"+created.ID, nil, http.StatusOK)
+	assertMCPServersSecretsRedacted(t, detail.MCPServers)
+
+	listRec := httptest.NewRecorder()
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	srv.Routes().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d; body=%s", listRec.Code, http.StatusOK, listRec.Body.String())
+	}
+	var listed []agentResponse
+	if err := json.NewDecoder(listRec.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	for _, item := range listed {
+		if item.ID == created.ID {
+			assertMCPServersSecretsRedacted(t, item.MCPServers)
+			return
+		}
+	}
+	t.Fatalf("list response missing agent %q", created.ID)
+}
+
+func TestAgentMCPServersDedicatedEndpointsUseDirectRawMaps(t *testing.T) {
+	srv, svc, created := newAgentMCPManagementTestServer(t)
+	desired := map[string]any{
+		"context7": map[string]any{
+			"command": "uvx",
+			"env": map[string]any{
+				"CONTEXT7_API_KEY": "secret-env",
+			},
+		},
+	}
+
+	updated, err := svc.UpdateRecord(context.Background(), created.ID, agent.UpdateRequest{
+		MCPServers:    &desired,
+		MCPServersSet: true,
+		FieldMask:     []string{"mcpServers"},
+	})
+	if err != nil {
+		t.Fatalf("set MCP servers: %v", err)
+	}
+
+	get := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+created.ID+"/mcp-servers", nil)
+	getRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(getRec, get)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d; body=%s", getRec.Code, http.StatusOK, getRec.Body.String())
+	}
+	var fetched agent.MCPServersView
+	if err := json.NewDecoder(getRec.Body).Decode(&fetched); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	assertDedicatedMCPServersView(t, fetched, "secret-env")
+
+	saved, ok := svc.Agent(updated.ID)
+	if !ok {
+		t.Fatalf("Agent(%q) not found", created.ID)
+	}
+	if got := mcpServerForTest(t, mcpServersForTest(t, saved.MCPServers), "context7"); got["command"] != "uvx" {
+		t.Fatalf("saved context7 = %#v, want direct server configuration", got)
+	}
+
+	legacyGet := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+created.ID+"/mcp", nil)
+	legacyGetRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(legacyGetRec, legacyGet)
+	if legacyGetRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Agent MCP without App service status = %d, want %d", legacyGetRec.Code, http.StatusServiceUnavailable)
+	}
+
+	legacyPost := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers", strings.NewReader(`{"names":["context7"]}`))
+	legacyPostRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(legacyPostRec, legacyPost)
+	if legacyPostRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("legacy POST /mcp-servers status = %d, want %d", legacyPostRec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func assertDedicatedMCPServersView(t *testing.T, view agent.MCPServersView, wantSecret string) {
+	t.Helper()
+	if _, wrapped := view.Servers["mcpServers"]; wrapped {
+		t.Fatalf("servers = %#v, want direct MCP server map", view.Servers)
+	}
+	context7 := mcpServerForTest(t, mcpServersForTest(t, view.Servers), "context7")
+	env, ok := context7["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("servers context7.env = %#v, want object", context7["env"])
+	}
+	if got := env["CONTEXT7_API_KEY"]; got != wantSecret {
+		t.Fatalf("servers context7.env[CONTEXT7_API_KEY] = %#v, want raw secret %q", got, wantSecret)
+	}
+}
+
+func TestGetAgentMCPServersReturnsPersistedServersWhenRuntimeIsUnreadable(t *testing.T) {
+	readErr := errors.New("native MCP config is unreadable")
+	desired := map[string]any{
+		"context7": map[string]any{
+			"command": "uvx",
+			"env": map[string]any{
+				"CONTEXT7_API_KEY": "secret",
+			},
+		},
+	}
+	svc := mustNewSeededServiceWithOptions(t, []agent.Agent{
+		{
+			ID:          "u-mcp-view",
+			Name:        "mcp-view",
+			RuntimeID:   "rt-u-mcp-view",
+			RuntimeKind: agent.RuntimeKindCodex,
+			RuntimeName: agent.RuntimeNameCodex,
+			Role:        agent.RoleWorker,
+			MCPServers:  desired,
+		},
+	}, agent.WithRuntime(failingMCPServersListRuntime{
+		fakeCompatRuntime: fakeCompatRuntime{kind: agent.RuntimeKindCodex},
+		err:               readErr,
+	}))
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-mcp-view/mcp-servers", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var response struct {
+		Servers map[string]any `json:"servers"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	server := mcpServerForTest(t, response.Servers, "context7")
+	env, ok := server["env"].(map[string]any)
+	if !ok || env["CONTEXT7_API_KEY"] != "secret" {
+		t.Fatalf("servers = %#v, want raw persisted secret", response.Servers)
+	}
+}
+
+func TestSanitizeMCPServersResponseRedactsStringMaps(t *testing.T) {
+	env := map[string]string{"CONTEXT7_API_KEY": "secret-env"}
+	headers := map[string]string{"Authorization": "Bearer secret-header"}
+	servers := map[string]any{
+		"context7": map[string]any{
+			"env":     env,
+			"headers": headers,
+		},
+	}
+
+	got := sanitizeMCPServersResponse(servers)
+	assertMCPServersSecretsRedacted(t, got)
+
+	if env["CONTEXT7_API_KEY"] != "secret-env" || headers["Authorization"] != "Bearer secret-header" {
+		t.Fatalf("sanitizeMCPServersResponse() modified the source servers: %#v", servers)
+	}
+}
+
+func doAgentJSON(t *testing.T, srv *Handler, method, path string, body any, wantStatus int) agentResponse {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	req := httptest.NewRequest(method, path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != wantStatus {
+		t.Fatalf("%s %s status = %d, want %d; body=%s", method, path, rec.Code, wantStatus, rec.Body.String())
+	}
+	var got agentResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, rec.Body.String())
+	}
+	return got
+}
+
+func testAgentHomeFromStatePath(statePath, agentID string) string {
+	return filepath.Join(filepath.Dir(statePath), "agents", agent.CanonicalID(agentID))
+}
+
+func codexAgentRefFromStateFile(path, runtimeID string, fallback agentruntime.Profile) (codexruntime.AgentRef, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return codexruntime.AgentRef{}, err
+	}
+	var state struct {
+		Agents []struct {
+			ID             string               `json:"id"`
+			Name           string               `json:"name"`
+			Instructions   string               `json:"instructions,omitempty"`
+			RuntimeID      string               `json:"runtime_id,omitempty"`
+			RuntimeKind    string               `json:"runtime_kind,omitempty"`
+			BoxID          string               `json:"box_id,omitempty"`
+			Runtime        *agent.RuntimeRecord `json:"runtime,omitempty"`
+			RuntimeOptions map[string]any       `json:"runtime_options,omitempty"`
+			MCPServers     map[string]any       `json:"mcpServers,omitempty"`
+			ModelConfig    agent.AgentProfile   `json:"model_config,omitempty"`
+			AgentProfile   agent.AgentProfile   `json:"agent_profile,omitempty"`
+		} `json:"agents"`
+		Items []struct {
+			ID             string               `json:"id"`
+			Name           string               `json:"name"`
+			Instructions   string               `json:"instructions,omitempty"`
+			RuntimeID      string               `json:"runtime_id,omitempty"`
+			RuntimeKind    string               `json:"runtime_kind,omitempty"`
+			BoxID          string               `json:"box_id,omitempty"`
+			Runtime        *agent.RuntimeRecord `json:"runtime,omitempty"`
+			RuntimeOptions map[string]any       `json:"runtime_options,omitempty"`
+			MCPServers     map[string]any       `json:"mcpServers,omitempty"`
+			ModelConfig    agent.AgentProfile   `json:"model_config,omitempty"`
+			AgentProfile   agent.AgentProfile   `json:"agent_profile,omitempty"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return codexruntime.AgentRef{}, err
+	}
+	type stateAgent struct {
+		ID             string
+		Name           string
+		Instructions   string
+		RuntimeID      string
+		RuntimeKind    string
+		BoxID          string
+		Runtime        *agent.RuntimeRecord
+		RuntimeOptions map[string]any
+		MCPServers     map[string]any
+		ModelConfig    agent.AgentProfile
+		AgentProfile   agent.AgentProfile
+	}
+	items := make([]stateAgent, 0, len(state.Agents)+len(state.Items))
+	for _, item := range state.Agents {
+		items = append(items, stateAgent{
+			ID:             item.ID,
+			Name:           item.Name,
+			Instructions:   item.Instructions,
+			RuntimeID:      item.RuntimeID,
+			RuntimeKind:    item.RuntimeKind,
+			BoxID:          item.BoxID,
+			Runtime:        item.Runtime,
+			RuntimeOptions: item.RuntimeOptions,
+			MCPServers:     item.MCPServers,
+			ModelConfig:    item.ModelConfig,
+			AgentProfile:   item.AgentProfile,
+		})
+	}
+	for _, item := range state.Items {
+		items = append(items, stateAgent{
+			ID:             item.ID,
+			Name:           item.Name,
+			Instructions:   item.Instructions,
+			RuntimeID:      item.RuntimeID,
+			RuntimeKind:    item.RuntimeKind,
+			BoxID:          item.BoxID,
+			Runtime:        item.Runtime,
+			RuntimeOptions: item.RuntimeOptions,
+			MCPServers:     item.MCPServers,
+			ModelConfig:    item.ModelConfig,
+			AgentProfile:   item.AgentProfile,
+		})
+	}
+	for _, item := range items {
+		rtID := strings.TrimSpace(item.RuntimeID)
+		options := item.RuntimeOptions
+		boxID := strings.TrimSpace(item.BoxID)
+		if item.Runtime != nil {
+			if strings.TrimSpace(item.Runtime.ID) != "" {
+				rtID = strings.TrimSpace(item.Runtime.ID)
+			}
+			if len(options) == 0 && len(item.Runtime.Options) > 0 {
+				options = item.Runtime.Options
+			}
+			if boxID == "" {
+				boxID = strings.TrimSpace(item.Runtime.SandboxID)
+			}
+		}
+		if rtID == "" && strings.TrimSpace(item.ID) != "" {
+			rtID = "rt-" + strings.TrimSpace(item.ID)
+		}
+		if rtID != strings.TrimSpace(runtimeID) {
+			continue
+		}
+		profile := fallback.Normalized()
+		rawProfile := item.ModelConfig
+		if profileEmptyForTest(rawProfile) {
+			rawProfile = item.AgentProfile
+		}
+		if providerID := strings.TrimSpace(rawProfile.ModelProviderID); providerID != "" {
+			profile.Provider = agent.ProfileProviderForModelProviderID(providerID)
+		}
+		if provider := strings.TrimSpace(rawProfile.Provider); provider != "" {
+			profile.Provider = provider
+		}
+		if baseURL := strings.TrimRight(strings.TrimSpace(rawProfile.BaseURL), "/"); baseURL != "" {
+			profile.BaseURL = baseURL
+		}
+		if apiKey := strings.TrimSpace(rawProfile.APIKey); apiKey != "" {
+			profile.APIKey = apiKey
+		}
+		if modelID := strings.TrimSpace(rawProfile.ModelID); modelID != "" {
+			profile.ModelID = modelID
+		}
+		if reasoning := strings.TrimSpace(rawProfile.ReasoningEffort); reasoning != "" {
+			profile.ReasoningEffort = reasoning
+		}
+		if len(rawProfile.Env) > 0 {
+			profile.Env = rawProfile.Env
+		}
+		return codexruntime.AgentRef{
+			ID:             item.ID,
+			Name:           item.Name,
+			RuntimeID:      rtID,
+			HandleID:       boxID,
+			Instructions:   item.Instructions,
+			RuntimeOptions: options,
+			MCPServers:     item.MCPServers,
+			Profile:        profile,
+		}, nil
+	}
+	return codexruntime.AgentRef{}, os.ErrNotExist
+}
+
+func profileEmptyForTest(profile agent.AgentProfile) bool {
+	return strings.TrimSpace(profile.Provider) == "" &&
+		strings.TrimSpace(profile.ModelProviderID) == "" &&
+		strings.TrimSpace(profile.BaseURL) == "" &&
+		strings.TrimSpace(profile.APIKey) == "" &&
+		strings.TrimSpace(profile.ModelID) == "" &&
+		strings.TrimSpace(profile.ReasoningEffort) == "" &&
+		len(profile.Env) == 0
+}
+
+func readJSONMap(t *testing.T, path string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode %s: %v\n%s", path, err, string(raw))
+	}
+	return got
+}
+
+func assertMCPServersResponse(t *testing.T, cfg map[string]any) {
+	t.Helper()
+	if len(cfg) == 0 {
+		t.Fatal("response missing mcpServers")
+	}
+	assertRedactedMCPServers(t, cfg)
+}
+
+func assertRedactedMCPServers(t *testing.T, raw any) {
+	t.Helper()
+	servers, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("MCP servers = %#v, want object", raw)
+	}
+	context7, ok := servers["context7"].(map[string]any)
+	if !ok {
+		t.Fatalf("MCP servers missing context7: %+v", servers)
+	}
+	if command, _ := context7["command"].(string); command != "uvx" {
+		t.Fatalf("context7.command = %q, want uvx", command)
+	}
+	args, ok := context7["args"].([]any)
+	if !ok || len(args) != 1 || args[0] != "context7-mcp" {
+		t.Fatalf("context7.args = %#v, want [context7-mcp]", context7["args"])
+	}
+	env, ok := context7["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("context7.env = %#v, want map", context7["env"])
+	}
+	secret, ok := env["CONTEXT7_API_KEY"].(string)
+	if !ok {
+		t.Fatalf("context7.env[CONTEXT7_API_KEY] = %#v, want string", env["CONTEXT7_API_KEY"])
+	}
+	if secret != participant.RedactedSecretValue {
+		t.Fatalf("context7.env[CONTEXT7_API_KEY] = %q, want %q", secret, participant.RedactedSecretValue)
+	}
+	remote, ok := servers["remote"].(map[string]any)
+	if !ok {
+		t.Fatalf("MCP servers missing remote: %+v", servers)
+	}
+	if url, _ := remote["url"].(string); url != "https://mcp.example.com/mcp" {
+		t.Fatalf("remote.url = %q, want https://mcp.example.com/mcp", url)
+	}
+	if envVar, _ := remote["bearer_token_env_var"].(string); envVar != "MCP_TOKEN" {
+		t.Fatalf("remote.bearer_token_env_var = %q, want MCP_TOKEN", envVar)
+	}
+}
+
+func assertPersistedMCPServers(t *testing.T, raw any) {
+	t.Helper()
+	servers, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("MCP servers = %#v, want object", raw)
+	}
+	context7, ok := servers["context7"].(map[string]any)
+	if !ok {
+		t.Fatalf("MCP servers missing context7: %+v", servers)
+	}
+	env, ok := context7["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("context7.env = %#v, want map", context7["env"])
+	}
+	if got := env["CONTEXT7_API_KEY"]; got != "secret" {
+		t.Fatalf("context7.env[CONTEXT7_API_KEY] = %#v, want persisted secret", got)
+	}
+}
+
+func assertMCPServersSecretsRedacted(t *testing.T, config map[string]any) {
+	t.Helper()
+	if len(config) == 0 {
+		t.Fatalf("mcpServers = %#v, want a non-empty map", config)
+	}
+	context7, ok := config["context7"].(map[string]any)
+	if !ok {
+		t.Fatalf("context7 config = %#v, want object", config["context7"])
+	}
+	for section, key := range map[string]string{"env": "CONTEXT7_API_KEY", "headers": "Authorization"} {
+		values, ok := context7[section].(map[string]any)
+		if !ok {
+			t.Fatalf("context7.%s = %#v, want object", section, context7[section])
+		}
+		if got := values[key]; got != participant.RedactedSecretValue {
+			t.Fatalf("context7.%s[%q] = %#v, want %q", section, key, got, participant.RedactedSecretValue)
+		}
+	}
+}
+
+func TestHandleAgentsCreateManagerUsesBootstrapManager(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"id":"manager","name":"manager"}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != agent.ManagerUserID || got.Name != agent.ManagerName || got.Role != agent.RoleManager {
+		t.Fatalf("agent = %+v, want bootstrapped manager", got)
+	}
+}
+
+func TestHandleAgentsCreateManagerRejectsNonCodexRuntime(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"id":"manager","name":"manager","runtime_kind":"openclaw_sandbox"}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "manager runtime is fixed to codex") {
+		t.Fatalf("body = %q, want fixed codex runtime rejection", rec.Body.String())
+	}
+}
+
+func TestHandleAgentsCreateManagerRejectsMCPRuntimeOptions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	for name, body := range map[string]string{
+		"top-level-runtime-options": `{"id":"manager","name":"manager","runtime_options":{"mcp":{"mcpServers":{"context7":{"command":"npx"}}}}}`,
+		"compact-runtime-options":   `{"id":"manager","name":"manager","runtime":{"options":{"mcp":{"mcpServers":{"context7":{"command":"npx"}}}}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := mustNewService(t)
+			srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+
+			srv.Routes().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "runtime_options.mcp is not supported") {
+				t.Fatalf("body = %q, want MCP runtime option rejection", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleAgentsCreateReplaceUsesUnifiedServiceEntry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	if _, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:   "u-alice",
+			Name: "alice",
+			Role: agent.RoleWorker,
+		},
+	}); err != nil {
+		t.Fatalf("seed Create() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"id":"u-alice","name":"alice-v2","role":"worker","replace":true}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "agent-alice" || got.Name != "alice-v2" || got.Role != agent.RoleWorker {
+		t.Fatalf("agent = %+v, want replaced worker", got)
+	}
+	if got.RuntimeKind != agent.RuntimeKindOpenClawSandbox {
+		t.Fatalf("agent runtime kind = %q, want %q", got.RuntimeKind, agent.RuntimeKindOpenClawSandbox)
+	}
+}
+
+func TestHandleAgentsCreateReplaceFieldMaskMergesInService(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	if _, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:          "u-alice",
+			Name:        "alice",
+			Description: "worker",
+			Image:       "agent-image:v1",
+			Role:        agent.RoleWorker,
+		},
+	}); err != nil {
+		t.Fatalf("seed Create() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"id":"u-alice","name":"alice-v2","description":"","image":"agent-image:v2","replace":true,"field_mask":["id","name"]}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "agent-alice" || got.Name != "alice-v2" || got.Description != "worker" || got.Image != "agent-image:v1" {
+		t.Fatalf("agent = %+v, want masked replace preserving unmasked fields", got)
+	}
+
+	descriptionOnly := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"id":"u-alice","description":"updated by CLI replace","replace":true,"field_mask":["id","description"]}`))
+	descriptionRecorder := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(descriptionRecorder, descriptionOnly)
+	if descriptionRecorder.Code != http.StatusCreated {
+		t.Fatalf("description-only replace status = %d, want %d; body=%s", descriptionRecorder.Code, http.StatusCreated, descriptionRecorder.Body.String())
+	}
+	var descriptionResult agent.Agent
+	if err := json.NewDecoder(descriptionRecorder.Body).Decode(&descriptionResult); err != nil {
+		t.Fatalf("decode description-only replace response: %v", err)
+	}
+	if descriptionResult.Name != "alice-v2" || descriptionResult.Description != "updated by CLI replace" {
+		t.Fatalf("description-only replace Agent = %+v, want preserved name and updated description", descriptionResult)
+	}
+}
+
+func TestHandleAgentsCreateReplaceIDOnlyRecreatesWithoutClearingSpec(t *testing.T) {
+	createCalls := 0
+	created := agent.Agent{
+		ID: "agent-alice", Name: "alice", Description: "keep description", Instructions: "keep instructions",
+		Image: "agent-image:v1", Role: agent.RoleWorker, RuntimeKind: agent.RuntimeKindPicoClawSandbox,
+		RuntimeID: "rt-agent-alice", BoxID: "box-alice-existing", Status: string(agentruntime.StateRunning),
+		AgentProfile: agent.AgentProfile{
+			Provider: agent.ProviderAPI, BaseURL: "http://127.0.0.1:4000", APIKey: "secret", ModelID: "model-a", ProfileComplete: true,
+		},
+		ProfileComplete: true, CreatedAt: time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC),
+	}
+	svc := mustNewSeededServiceWithOptions(t, []agent.Agent{created}, agent.WithRuntime(fakeCompatRuntime{
+		kind: agent.RuntimeKindPicoClawSandbox,
+		new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+			createCalls++
+			return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: fmt.Sprintf("box-alice-%d", createCalls)}, nil
+		},
+	}))
+	beforeCreates := createCalls
+
+	handler := &Handler{
+		svc: svc,
+		hub: mustNewLocalTemplateHubServiceWithoutWorkspace(t, "unused", hub.Template{
+			Name: "unused", Role: hub.TemplateRoleWorker, RuntimeKind: agent.RuntimeNamePicoClaw, Image: "unused:test",
+		}), agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc,
+	}
+	recorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(
+		`{"id":"agent-alice","replace":true,"field_mask":["id"]}`,
+	)))
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+	var replaced agent.Agent
+	if err := json.NewDecoder(recorder.Body).Decode(&replaced); err != nil {
+		t.Fatal(err)
+	}
+	if replaced.ID != created.ID || replaced.Name != created.Name || replaced.Description != created.Description ||
+		replaced.Instructions != created.Instructions || replaced.Image != created.Image {
+		t.Fatalf("id-only replace changed Agent spec: before=%+v after=%+v", created, replaced)
+	}
+	if got := createCalls; got != beforeCreates+1 {
+		t.Fatalf("Runtime create calls = %d, want %d after id-only recreate", got, beforeCreates+1)
+	}
+}
+
+func TestAgentCreateRequestFromAPIIncludesFromTemplate(t *testing.T) {
+	got := agentCreateRequestFromAPI(apitypes.CreateAgentRequest{
+		Name:         "alice",
+		Instructions: "follow AGENTS",
+		RuntimeName:  agent.RuntimeNameCodex,
+		FromTemplate: "builtin.frontend-alice",
+		Profile:      "codex-fast",
+	})
+
+	if got.Spec.Name != "alice" {
+		t.Fatalf("Spec.Name = %q, want %q", got.Spec.Name, "alice")
+	}
+	if got.Spec.RuntimeName != agent.RuntimeNameCodex || got.Spec.SandboxEnabled {
+		t.Fatalf("Spec runtime = %q/%t, want %q/%t", got.Spec.RuntimeName, got.Spec.SandboxEnabled, agent.RuntimeNameCodex, false)
+	}
+	if got.Spec.FromTemplate != "builtin.frontend-alice" {
+		t.Fatalf("Spec.FromTemplate = %q, want %q", got.Spec.FromTemplate, "builtin.frontend-alice")
+	}
+	if got.Spec.Profile != "codex-fast" {
+		t.Fatalf("Spec.Profile = %q, want %q", got.Spec.Profile, "codex-fast")
+	}
+	if got.Spec.Instructions != "follow AGENTS" {
+		t.Fatalf("Spec.Instructions = %q, want %q", got.Spec.Instructions, "follow AGENTS")
+	}
+}
+
+func TestAgentEngineAdministrationPreservesModelSelector(t *testing.T) {
+	selector := "opencsg.qwen3.6-plus"
+	created := engineCreateRequest(agent.CreateRequest{Spec: agent.CreateAgentSpec{
+		Name:    "selector-test",
+		Profile: selector,
+	}})
+	if created.Spec.Model.Selector != selector {
+		t.Fatalf("create model selector = %q, want %q", created.Spec.Model.Selector, selector)
+	}
+	patched := engineUpdateRequest(agent.UpdateRequest{Profile: &selector}, "version-1")
+	if patched.Spec.Model.Selector != selector || !agentUpdateIncludes(patched, "model.selector") {
+		t.Fatalf("patch model selector = %q with mask %v, want %q", patched.Spec.Model.Selector, patched.FieldMask, selector)
+	}
+}
+
+func TestHandleAgentsPatchSelectorPreservesModelConfiguration(t *testing.T) {
+	profile := agent.AgentProfile{
+		Provider: agent.ProviderAPI, BaseURL: "https://models.example/v1", APIKey: "secret",
+		Headers: map[string]string{"X-Test": "keep"}, ModelID: "model-a", ReasoningEffort: "high",
+		RequestOptions: map[string]any{"temperature": 0.2}, Env: map[string]string{"KEEP": "yes"}, ProfileComplete: true,
+	}
+	svc := mustNewSeededService(t, []agent.Agent{{
+		ID: "agent-selector", Name: "selector", Role: agent.RoleWorker, RuntimeKind: agent.RuntimeKindCodex,
+		Status: string(agentruntime.StateStopped), Profile: "old-selector", AgentProfile: profile, ProfileComplete: true,
+	}})
+	handler := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	recorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/agents/agent-selector", strings.NewReader(
+		`{"profile":"new-selector"}`,
+	)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	updated, ok := svc.Agent("agent-selector")
+	if !ok {
+		t.Fatal("updated Agent not found")
+	}
+	if updated.Profile != "new-selector" || updated.AgentProfile.Provider != profile.Provider ||
+		updated.AgentProfile.ModelProviderID != profile.ModelProviderID || updated.AgentProfile.BaseURL != profile.BaseURL ||
+		updated.AgentProfile.APIKey != profile.APIKey || updated.AgentProfile.ModelID != profile.ModelID ||
+		updated.AgentProfile.ReasoningEffort != profile.ReasoningEffort ||
+		updated.AgentProfile.Headers["X-Test"] != "keep" || updated.AgentProfile.Env["KEEP"] != "yes" ||
+		updated.AgentProfile.RequestOptions["temperature"] != 0.2 {
+		t.Fatalf("selector PATCH changed model configuration: selector=%q profile=%+v", updated.Profile, updated.AgentProfile)
+	}
+}
+
+func TestHandleHubTemplatesListsAggregatedTemplates(t *testing.T) {
+	hubSvc := mustNewLocalTemplateHubService(t, "review-bot", hub.Template{
+		ID:             "review-bot",
+		Name:           "review-bot",
+		Role:           hub.TemplateRoleWorker,
+		RuntimeKind:    agent.RuntimeKindCodex,
+		RuntimeOptions: map[string]any{"execution_mode": "read_only"},
+	})
+	srv := &Handler{}
+	srv.SetHubService(hubSvc)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/hub/templates", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got []apitypes.HubTemplate
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatalf("templates = %#v, want non-empty result", got)
+	}
+	if got[0].Source.Name == "" || got[0].Source.Kind == "" {
+		t.Fatalf("template source = %+v, want populated source", got[0].Source)
+	}
+	var published apitypes.HubTemplate
+	for _, item := range got {
+		if item.Name == "review-bot" && item.Source.Kind == hub.RegistryKindLocal {
+			published = item
+			break
+		}
+	}
+	if mode := published.RuntimeOptions["execution_mode"]; mode != "read_only" {
+		t.Fatalf("template RuntimeOptions[execution_mode] = %v, want read_only", mode)
+	}
+}
+
+func TestPresentHubTemplateIncludesSensitiveCheckMetadata(t *testing.T) {
+	presented := presentHubTemplate(hub.Template{Metadata: &hub.TemplateMetadata{
+		SensitiveCheck: &hub.TemplateSensitiveCheck{
+			Status: "Exception",
+			FailureDetails: []hub.TemplateSensitiveCheckFailure{{
+				Path: "file/path", Status: "Fail", Message: "checker result",
+			}},
+		},
+	}})
+	if presented.Metadata == nil || presented.Metadata.SensitiveCheck == nil {
+		t.Fatal("sensitive check metadata is nil")
+	}
+	if got := presented.Metadata.SensitiveCheck.FailureDetails[0].Message; got != "checker result" {
+		t.Fatalf("failure message = %q, want checker result", got)
+	}
+}
+
+func TestWriteHubTemplateErrorUsesStructuredContract(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeHubTemplateError(
+		recorder,
+		http.StatusServiceUnavailable,
+		communityInstanceResourceUnavailableCode,
+		"The resource is temporarily unavailable.",
+		"alice/reviewer",
+	)
+
+	if got, want := recorder.Code, http.StatusServiceUnavailable; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
+	}
+	var payload struct {
+		Error struct {
+			Code                string `json:"code"`
+			Message             string `json:"message"`
+			PublishedTemplateID string `json:"published_template_id"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Error.Code != communityInstanceResourceUnavailableCode ||
+		payload.Error.PublishedTemplateID != "alice/reviewer" {
+		t.Fatalf("error payload = %+v", payload.Error)
+	}
+}
+
+func TestFilterHubTemplatesForConfiguredProvider(t *testing.T) {
+	items := []hub.Template{
+		{ID: "codex-worker", Role: hub.TemplateRoleWorker, RuntimeKind: agent.RuntimeKindCodex, Source: hub.RegistryRef{Kind: hub.RegistryKindRemote}},
+		{ID: "codex-manager", Role: hub.TemplateRoleManager, RuntimeKind: agent.RuntimeKindCodex, Source: hub.RegistryRef{Kind: hub.RegistryKindBuiltin}},
+		{ID: "dsh-worker", Role: hub.TemplateRoleWorker, RuntimeKind: agent.RuntimeKindDSH, Source: hub.RegistryRef{Kind: hub.RegistryKindBuiltin}},
+		{ID: "openclaw-worker", Role: hub.TemplateRoleWorker, RuntimeKind: "openclaw", Source: hub.RegistryRef{Kind: hub.RegistryKindRemote}},
+		{ID: "local-codex-worker", Role: hub.TemplateRoleWorker, RuntimeKind: agent.RuntimeKindCodex, Source: hub.RegistryRef{Kind: hub.RegistryKindLocal}},
+		{ID: "local-openclaw-worker", Role: hub.TemplateRoleWorker, RuntimeKind: "openclaw", Source: hub.RegistryRef{Kind: hub.RegistryKindLocal}},
+		{ID: "picoclaw-worker", Role: hub.TemplateRoleWorker, RuntimeKind: agent.RuntimeKindPicoClawSandbox, Source: hub.RegistryRef{Kind: hub.RegistryKindBuiltin}},
+	}
+	tests := []struct {
+		name     string
+		provider string
+		wantIDs  []string
+	}{
+		{name: "csghub lists only host runtime workers including local templates", provider: config.CSGHubProvider, wantIDs: []string{"codex-worker", "dsh-worker", "local-codex-worker"}},
+		{name: "other providers are unchanged", provider: config.DockerProvider, wantIDs: []string{"codex-worker", "codex-manager", "dsh-worker", "openclaw-worker", "local-codex-worker", "local-openclaw-worker", "picoclaw-worker"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.toml")
+			content := "[sandbox]\nprovider = \"" + tt.provider + "\"\n"
+			if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+				t.Fatalf("WriteFile(config) error = %v", err)
+			}
+			srv := &Handler{}
+			srv.SetConfigPath(configPath)
+
+			got, err := srv.filterHubTemplatesForConfiguredProvider(items)
+			if err != nil {
+				t.Fatalf("filterHubTemplatesForConfiguredProvider() error = %v", err)
+			}
+			gotIDs := make([]string, 0, len(got))
+			for _, item := range got {
+				gotIDs = append(gotIDs, item.ID)
+			}
+			if !slices.Equal(gotIDs, tt.wantIDs) {
+				t.Fatalf("template ids = %#v, want %#v", gotIDs, tt.wantIDs)
+			}
+		})
+	}
+}
+
+func TestBootstrapConfigViewRestrictsCSGHubToHostRuntimes(t *testing.T) {
+	got := bootstrapConfigView(context.Background(), config.Config{
+		Sandbox: config.SandboxConfig{Provider: config.CSGHubProvider},
+	}, nil, nil)
+
+	if got.SandboxProvider != config.CSGHubProvider {
+		t.Fatalf("sandbox provider = %q, want %q", got.SandboxProvider, config.CSGHubProvider)
+	}
+	if len(got.WorkerRuntimeChoices) != 2 {
+		t.Fatalf("worker runtime choices = %#v, want Codex and DSH", got.WorkerRuntimeChoices)
+	}
+	choice := got.WorkerRuntimeChoices[0]
+	if choice.Name != agent.RuntimeNameCodex || choice.SandboxEnabled {
+		t.Fatalf("worker runtime choice = %#v, want non-sandbox Codex", choice)
+	}
+	choice = got.WorkerRuntimeChoices[1]
+	if choice.Name != agent.RuntimeNameDSH || choice.SandboxEnabled {
+		t.Fatalf("worker runtime choice = %#v, want non-sandbox DSH", choice)
+	}
+}
+
+func TestHandleHubTemplateByIDReturnsTemplate(t *testing.T) {
+	hubSvc := mustNewLocalTemplateHubService(t, "review-bot", hub.Template{
+		ID:          "review-bot",
+		Name:        "review-bot",
+		Description: "code review helper",
+		Role:        hub.TemplateRoleWorker,
+		RuntimeKind: agent.RuntimeKindCodex,
+	})
+	srv := &Handler{}
+	srv.SetHubService(hubSvc)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/hub/templates/local.review-bot", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got apitypes.HubTemplate
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "local.review-bot" {
+		t.Fatalf("template id = %q, want %q", got.ID, "local.review-bot")
+	}
+	if got.Source.Name != "local" || got.Source.Kind != "local" {
+		t.Fatalf("template source = %+v, want local/local", got.Source)
+	}
+	if len(got.Workspace.Entries) != 0 {
+		t.Fatalf("workspace entries = %#v, want lazy-loaded empty result", got.Workspace.Entries)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/hub/templates/local.review-bot/workspace", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("workspace status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var listing apitypes.WorkspaceListing
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode workspace response: %v", err)
+	}
+	paths := make([]string, 0, len(listing.Entries))
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "instructions") || !slices.Contains(paths, "skills") || !slices.Contains(paths, "mcps") {
+		t.Fatalf("template paths = %#v, want instructions, skills, and mcps", paths)
+	}
+	if slices.Contains(paths, "skills/custom") || slices.Contains(paths, "skills/custom/SKILL.md") {
+		t.Fatalf("workspace paths = %#v, want top-level entries only", paths)
+	}
+
+	req = httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/hub/templates/local.review-bot/workspace?path=skills",
+		nil,
+	)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("nested workspace status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	listing = apitypes.WorkspaceListing{}
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode nested workspace response: %v", err)
+	}
+	if len(listing.Entries) != 1 || listing.Entries[0].Path != "skills/custom" {
+		t.Fatalf("nested workspace entries = %#v, want skills/custom only", listing.Entries)
+	}
+}
+
+func TestHandleHubTemplateWorkspaceFileByIDReturnsContent(t *testing.T) {
+	hubSvc := mustNewLocalTemplateHubService(t, "review-bot", hub.Template{
+		ID:          "review-bot",
+		Name:        "review-bot",
+		Description: "code review helper",
+		Role:        hub.TemplateRoleWorker,
+		RuntimeKind: agent.RuntimeKindCodex,
+	})
+	srv := &Handler{}
+	srv.SetHubService(hubSvc)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/hub/templates/local.review-bot/workspace/file?path=skills/custom/SKILL.md", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got apitypes.HubTemplateWorkspaceFile
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Path != "skills/custom/SKILL.md" {
+		t.Fatalf("path = %q, want %q", got.Path, "skills/custom/SKILL.md")
+	}
+	if strings.TrimSpace(got.Content) != "# Custom" {
+		t.Fatalf("content = %q, want %q", strings.TrimSpace(got.Content), "# Custom")
+	}
+}
+
+func TestHandleAgentWorkspaceFileReturnsContent(t *testing.T) {
+	svc := mustNewService(t)
+	created, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			Name:        "alice",
+			Role:        agent.RoleWorker,
+			RuntimeKind: agent.RuntimeKindPicoClawSandbox,
+			Image:       "worker-image:test",
+			AgentProfile: agent.AgentProfile{
+				ProfileComplete: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	workspaceRoot, err := svc.WorkspaceRoot(created.Name)
+	if err != nil {
+		t.Fatalf("WorkspaceRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspaceRoot, "skills", "custom"), 0o755); err != nil {
+		t.Fatalf("create skill dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "skills", "custom", "SKILL.md"), []byte("# Custom\n"), 0o644); err != nil {
+		t.Fatalf("write skill file: %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+created.ID+"/workspace/file?path=skills/custom/SKILL.md", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got apitypes.WorkspaceFile
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Path != "skills/custom/SKILL.md" {
+		t.Fatalf("path = %q, want %q", got.Path, "skills/custom/SKILL.md")
+	}
+	if strings.TrimSpace(got.Content) != "# Custom" {
+		t.Fatalf("content = %q, want %q", strings.TrimSpace(got.Content), "# Custom")
+	}
+}
+
+func TestHandleAgentSkillsReturnsContentFromSkillsRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	hubSvc, err := hub.NewService(config.HubConfig{Registries: []config.HubRegistryConfig{{Name: config.DefaultOfficialHubRegistryName, Kind: config.HubRegistryKindRemote, Enabled: false}}}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	svc, err := agent.NewController(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "model-1",
+	}, config.ServerConfig{}, "manager-image:test", "",
+		agent.WithHubService(hubSvc),
+		agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{
+			DefaultManagerTemplate: config.DefaultBootstrapManagerTemplate,
+			DefaultWorkerTemplate:  config.DefaultBootstrapWorkerTemplate,
+		}),
+		agent.WithRuntime(fakeCompatRuntime{kind: agent.RuntimeKindCodex}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	created, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			Name:        "alice",
+			Role:        agent.RoleWorker,
+			RuntimeKind: agent.RuntimeKindCodex,
+			Image:       "worker-image:test",
+			AgentProfile: agent.AgentProfile{
+				ProfileComplete: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	skillsRoot, err := svc.SkillsRoot(created.Name)
+	if err != nil {
+		t.Fatalf("SkillsRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(skillsRoot, "custom"), 0o755); err != nil {
+		t.Fatalf("create skill dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "custom", "SKILL.md"), []byte("# Custom\n"), 0o644); err != nil {
+		t.Fatalf("write skill file: %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+created.ID+"/skills", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var listing apitypes.WorkspaceListing
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	paths := make([]string, 0, len(listing.Entries))
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "custom") || !slices.Contains(paths, "custom/SKILL.md") {
+		t.Fatalf("skills paths = %#v, want custom and custom/SKILL.md", paths)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+created.ID+"/skills/file?path=custom/SKILL.md", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("file status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var file apitypes.WorkspaceFile
+	if err := json.NewDecoder(rec.Body).Decode(&file); err != nil {
+		t.Fatalf("decode file response: %v", err)
+	}
+	if got, want := file.Path, "custom/SKILL.md"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	if strings.TrimSpace(file.Content) != "# Custom" {
+		t.Fatalf("content = %q, want %q", strings.TrimSpace(file.Content), "# Custom")
+	}
+}
+
+func TestHandleAgentSkillsBatchAddCopiesGlobalSkillIntoAgentRuntimeRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	globalRoot := filepath.Join(home, ".csgclaw", "skills")
+	if err := os.MkdirAll(filepath.Join(globalRoot, "alpha", "scripts"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(global alpha) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(globalRoot, "alpha", "SKILL.md"), []byte("---\ndescription: Alpha skill\n---\n# Alpha\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(global SKILL.md) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(globalRoot, "alpha", "scripts", "run.sh"), []byte("echo alpha\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(global run.sh) error = %v", err)
+	}
+
+	srv, svc, created := newAgentSkillManagementTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/skills:batchAdd", strings.NewReader(`{"names":["alpha"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+
+	skillsRoot, err := svc.SkillsRoot(created.Name)
+	if err != nil {
+		t.Fatalf("SkillsRoot() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(skillsRoot, "alpha", "SKILL.md")); err != nil {
+		t.Fatalf("Stat(agent SKILL.md) error = %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(skillsRoot, "alpha", "scripts", "run.sh")); err != nil {
+		t.Fatalf("ReadFile(agent run.sh) error = %v", err)
+	} else if strings.TrimSpace(string(data)) != "echo alpha" {
+		t.Fatalf("run.sh content = %q, want %q", strings.TrimSpace(string(data)), "echo alpha")
+	}
+
+	workspaceRoot, err := svc.WorkspaceRoot(created.Name)
+	if err != nil {
+		t.Fatalf("WorkspaceRoot() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspaceRoot, "skills", "alpha", "SKILL.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(workspace skills alpha) error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(globalRoot, "alpha", "SKILL.md")); err != nil {
+		t.Fatalf("Stat(global SKILL.md) error = %v", err)
+	}
+}
+
+func TestHandleAgentSkillsBatchAddReturnsNotFoundWhenGlobalSkillMissing(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	srv, _, created := newAgentSkillManagementTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/skills:batchAdd", strings.NewReader(`{"names":["missing"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestHandleAgentSkillsBatchAddReturnsBadRequestWhenGlobalSkillInvalid(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	globalRoot := filepath.Join(home, ".csgclaw", "skills")
+	if err := os.MkdirAll(filepath.Join(globalRoot, "alpha"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(global alpha) error = %v", err)
+	}
+
+	srv, _, created := newAgentSkillManagementTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/skills:batchAdd", strings.NewReader(`{"names":["alpha"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestHandleAgentSkillsBatchAddReturnsConflictWhenSkillAlreadyExists(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	globalRoot := filepath.Join(home, ".csgclaw", "skills")
+	if err := os.MkdirAll(filepath.Join(globalRoot, "alpha"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(global alpha) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(globalRoot, "alpha", "SKILL.md"), []byte("# Alpha\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(global SKILL.md) error = %v", err)
+	}
+
+	srv, svc, created := newAgentSkillManagementTestServer(t)
+	skillsRoot, err := svc.SkillsRoot(created.Name)
+	if err != nil {
+		t.Fatalf("SkillsRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(skillsRoot, "alpha"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(agent alpha) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "alpha", "SKILL.md"), []byte("# Existing\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(agent SKILL.md) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/skills:batchAdd", strings.NewReader(`{"names":["alpha"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+}
+
+func TestHandleAgentSkillDeleteRemovesOnlyAgentScopedSkill(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	globalRoot := filepath.Join(home, ".csgclaw", "skills")
+	if err := os.MkdirAll(filepath.Join(globalRoot, "alpha"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(global alpha) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(globalRoot, "alpha", "SKILL.md"), []byte("# Global Alpha\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(global SKILL.md) error = %v", err)
+	}
+
+	srv, svc, created := newAgentSkillManagementTestServer(t)
+	skillsRoot, err := svc.SkillsRoot(created.Name)
+	if err != nil {
+		t.Fatalf("SkillsRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(skillsRoot, "alpha"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(agent alpha) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "alpha", "SKILL.md"), []byte("# Agent Alpha\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(agent SKILL.md) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/agents/"+created.ID+"/skills/alpha", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(skillsRoot, "alpha", "SKILL.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(agent SKILL.md) error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(globalRoot, "alpha", "SKILL.md")); err != nil {
+		t.Fatalf("Stat(global SKILL.md) error = %v", err)
+	}
+}
+
+func TestHandleAgentSkillsMutationsReturnNotFoundForMissingAgent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	srv, _, _ := newAgentSkillManagementTestServer(t)
+
+	postReq := httptest.NewRequest(http.MethodPost, "/api/v1/agents/u-missing/skills:batchAdd", strings.NewReader(`{"names":["alpha"]}`))
+	postRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusNotFound {
+		t.Fatalf("batch add status = %d, want %d; body=%s", postRec.Code, http.StatusNotFound, postRec.Body.String())
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/agents/u-missing/skills/alpha", nil)
+	deleteRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusNotFound {
+		t.Fatalf("delete status = %d, want %d; body=%s", deleteRec.Code, http.StatusNotFound, deleteRec.Body.String())
+	}
+}
+
+func newAgentSkillManagementTestServer(t *testing.T) (*Handler, *agent.Controller, agent.Agent) {
+	t.Helper()
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	hubSvc, err := hub.NewService(config.HubConfig{Registries: []config.HubRegistryConfig{{Name: config.DefaultOfficialHubRegistryName, Kind: config.HubRegistryKindRemote, Enabled: false}}}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	svc, err := agent.NewController(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "model-1",
+	}, config.ServerConfig{}, "manager-image:test", "",
+		agent.WithHubService(hubSvc),
+		agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{
+			DefaultManagerTemplate: config.DefaultBootstrapManagerTemplate,
+			DefaultWorkerTemplate:  config.DefaultBootstrapWorkerTemplate,
+		}),
+		agent.WithRuntime(fakeCompatRuntime{kind: agent.RuntimeKindCodex}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	created, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			Name:        "alice",
+			Role:        agent.RoleWorker,
+			RuntimeKind: agent.RuntimeKindCodex,
+			Image:       "worker-image:test",
+			AgentProfile: agent.AgentProfile{
+				ProfileComplete: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	return &Handler{svc: svc, hub: hubSvc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}, svc, created
+}
+
+func TestHandleBatchAddAgentMCPServersAddsCatalogServersByName(t *testing.T) {
+	srv, svc, created := newAgentMCPManagementTestServer(t)
+
+	if _, err := srv.mcp.CreateServer(context.Background(), "context7", map[string]any{
+		"command":     "uvx",
+		"args":        []any{"context7-mcp"},
+		"description": "Context7",
+	}); err != nil {
+		t.Fatalf("CreateServer(context7) error = %v", err)
+	}
+	if _, err := srv.mcp.CreateServer(context.Background(), "remote", map[string]any{
+		"url":         "https://mcp.example.com/mcp",
+		"transport":   "streamable-http",
+		"description": "Remote",
+	}); err != nil {
+		t.Fatalf("CreateServer(remote) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers:batchAdd", strings.NewReader(`{"names":["context7","remote","context7"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var view agent.MCPServersView
+	if err := json.NewDecoder(rec.Body).Decode(&view); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	servers := mcpServersForTest(t, view.Servers)
+	context7 := mcpServerForTest(t, servers, "context7")
+	if command, _ := context7["command"].(string); command != "uvx" {
+		t.Fatalf("context7.command = %q, want uvx", command)
+	}
+	if _, ok := context7["description"]; ok {
+		t.Fatalf("context7 contains hub-only description: %#v", context7)
+	}
+	remote := mcpServerForTest(t, servers, "remote")
+	if url, _ := remote["url"].(string); url != "https://mcp.example.com/mcp" {
+		t.Fatalf("remote.url = %q, want https://mcp.example.com/mcp", url)
+	}
+
+	saved, ok := svc.Agent(created.ID)
+	if !ok {
+		t.Fatalf("Agent(%q) not found", created.ID)
+	}
+	savedServers := mcpServersForTest(t, saved.MCPServers)
+	if len(savedServers) != 2 {
+		t.Fatalf("saved mcpServers = %#v, want 2 entries", savedServers)
+	}
+}
+
+func TestHandleBatchAddAgentMCPServersTrustsManagedKnowledgeBaseSnapshot(t *testing.T) {
+	srv, svc, created := newAgentMCPManagementTestServer(t)
+
+	originalLoader := loadKnowledgeBaseConnection
+	t.Cleanup(func() { loadKnowledgeBaseConnection = originalLoader })
+	loadKnowledgeBaseConnection = func(context.Context) (knowledgeBaseConnection, error) {
+		t.Fatal("adding a managed knowledge-base MCP must not query AgenticHub")
+		return knowledgeBaseConnection{}, nil
+	}
+
+	if _, err := srv.mcp.CreateServer(context.Background(), "kb_tourism", map[string]any{
+		"type":      "remote",
+		"url":       "https://mcp.example.com/knowledge/kb_tourism",
+		"transport": "streamable-http",
+		"headers": map[string]any{
+			"Authorization": "Bearer stored-token",
+		},
+		knowledgebase.ManagedMetaKey: map[string]any{
+			knowledgebase.ManagedMetaNamespace: map[string]any{
+				"type":        knowledgebase.ManagedMCPType,
+				"resource_id": "142",
+				"content_id":  "kb_tourism",
+				"auth_type":   knowledgebase.ManagedAuthType,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("CreateServer(kb_tourism) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers:batchAdd", strings.NewReader(`{"names":["kb_tourism"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	saved, ok := svc.Agent(created.ID)
+	if !ok {
+		t.Fatalf("Agent(%q) not found", created.ID)
+	}
+	server := mcpServerForTest(t, mcpServersForTest(t, saved.MCPServers), "kb_tourism")
+	if _, managed := knowledgebase.ManagedMetadataFromServer(server); !managed {
+		t.Fatalf("saved knowledge-base MCP lost managed metadata: %#v", server)
+	}
+	if _, exists := server["headers"]; exists {
+		t.Fatalf("saved knowledge-base MCP retained user credentials: %#v", server)
+	}
+}
+
+func TestHandleBatchAddAgentMCPServersReturnsNotFoundWhenCatalogServerMissing(t *testing.T) {
+	srv, _, created := newAgentMCPManagementTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers:batchAdd", strings.NewReader(`{"names":["missing"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestHandleBatchAddAgentMCPServersRejectsUnavailableRemoteWithoutRemovingConfig(t *testing.T) {
+	srv, svc, created := newAgentMCPManagementTestServer(t)
+	installer := mcp.NewService(mcp.WithServerProber(&stubMCPServerProber{}))
+	if _, err := installer.InstallRemoteServer(context.Background(), mcp.RemoteServer{
+		ID: "remote-denied", Name: "denied", URL: "https://mcp.example.test/denied",
+	}); err != nil {
+		t.Fatalf("InstallRemoteServer() error = %v", err)
+	}
+	srv.mcp = mcp.NewService(mcp.WithServerProber(failingMCPServerProber{}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers:batchAdd", strings.NewReader(`{"names":["denied"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "mcp_server_unavailable") {
+		t.Fatalf("body = %q, want stable unavailable error", rec.Body.String())
+	}
+	stored, err := srv.mcp.ListServers(context.Background())
+	if err != nil {
+		t.Fatalf("ListServers() error = %v", err)
+	}
+	if _, ok := stored["denied"]; !ok {
+		t.Fatalf("stored servers removed denied MCP: %#v", stored)
+	}
+	got, ok := svc.Agent(created.ID)
+	if !ok {
+		t.Fatalf("Agent(%q) not found", created.ID)
+	}
+	if _, ok := got.MCPServers["denied"]; ok {
+		t.Fatalf("agent MCP servers retained denied MCP: %#v", got.MCPServers)
+	}
+}
+
+func TestHandleBatchDeleteAgentMCPServersUsesBackendManagedState(t *testing.T) {
+	srv, svc, created := newAgentMCPManagementTestServer(t)
+	initial := map[string]any{
+		"context7": map[string]any{"command": "uvx", "args": []any{"context7-mcp"}},
+		"native":   map[string]any{"command": "npx", "args": []any{"native-mcp"}},
+	}
+	if _, err := svc.UpdateRecord(context.Background(), created.ID, agent.UpdateRequest{
+		MCPServers:    &initial,
+		MCPServersSet: true,
+		FieldMask:     []string{"mcpServers"},
+	}); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers:batchDelete", strings.NewReader(`{"names":["context7"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var view agent.MCPServersView
+	if err := json.NewDecoder(rec.Body).Decode(&view); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, exists := view.Servers["context7"]; exists {
+		t.Fatalf("servers = %#v, retained deleted MCP server", view.Servers)
+	}
+	mcpServerForTest(t, view.Servers, "native")
+
+	saved, ok := svc.Agent(created.ID)
+	if !ok {
+		t.Fatalf("Agent(%q) not found", created.ID)
+	}
+	if _, exists := saved.MCPServers["context7"]; exists {
+		t.Fatalf("saved MCPServers = %#v, retained deleted MCP server", saved.MCPServers)
+	}
+	mcpServerForTest(t, saved.MCPServers, "native")
+}
+
+func TestAgentMCPServersAdoptsUnmanagedRuntimeStateBeforeMutation(t *testing.T) {
+	runtimeImpl := &snapshotMCPServersRuntime{
+		fakeCompatRuntime: fakeCompatRuntime{kind: agent.RuntimeKindCodex},
+		servers: map[string]any{
+			"native": map[string]any{"command": "native-server"},
+		},
+	}
+	svc := mustNewSeededServiceWithOptions(t, []agent.Agent{{
+		ID: "agent-mcp-adopt", Name: "mcp-adopt", Role: agent.RoleWorker,
+		RuntimeID: "rt-agent-mcp-adopt", RuntimeKind: agent.RuntimeKindCodex, RuntimeName: agent.RuntimeNameCodex,
+		Status: string(agentruntime.StateStopped), AgentProfile: agent.AgentProfile{ProfileComplete: true}, ProfileComplete: true,
+	}}, agent.WithRuntime(runtimeImpl))
+	mcpSvc := mcp.NewService()
+	if _, err := mcpSvc.CreateServer(context.Background(), "catalog", map[string]any{"command": "catalog-server"}); err != nil {
+		t.Fatal(err)
+	}
+	handler := &Handler{svc: svc, mcp: mcpSvc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	engine := agentengine.New(svc)
+	ordinary, err := engine.Agents().Get(context.Background(), "agent-mcp-adopt", agentengine.AgentGetOptions{})
+	if err != nil {
+		t.Fatalf("ordinary Agent Get() error = %v", err)
+	}
+	if ordinary.Spec.MCPServers != nil {
+		t.Fatalf("ordinary Agent Get() MCP servers = %#v, want unmanaged desired state", ordinary.Spec.MCPServers)
+	}
+	if runtimeImpl.listCalls != 0 {
+		t.Fatalf("ordinary Agent Get() performed %d Runtime MCP reads, want 0", runtimeImpl.listCalls)
+	}
+
+	getRecorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(getRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/agents/agent-mcp-adopt/mcp-servers", nil))
+	if getRecorder.Code != http.StatusOK || !strings.Contains(getRecorder.Body.String(), `"native"`) {
+		t.Fatalf("GET unmanaged MCP servers = %d %s", getRecorder.Code, getRecorder.Body.String())
+	}
+
+	addRecorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(addRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/agents/agent-mcp-adopt/mcp-servers:batchAdd", strings.NewReader(`{"names":["catalog"]}`)))
+	if addRecorder.Code != http.StatusOK {
+		t.Fatalf("batch add status = %d; body=%s", addRecorder.Code, addRecorder.Body.String())
+	}
+	var added agent.MCPServersView
+	if err := json.NewDecoder(addRecorder.Body).Decode(&added); err != nil {
+		t.Fatal(err)
+	}
+	mcpServerForTest(t, added.Servers, "native")
+	mcpServerForTest(t, added.Servers, "catalog")
+	saved, ok := svc.Agent("agent-mcp-adopt")
+	if !ok {
+		t.Fatal("Agent missing after MCP adoption")
+	}
+	mcpServerForTest(t, saved.MCPServers, "native")
+	mcpServerForTest(t, saved.MCPServers, "catalog")
+	listCallsAfterAdoption := runtimeImpl.listCalls
+
+	deleteRecorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(deleteRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/agents/agent-mcp-adopt/mcp-servers:batchDelete", strings.NewReader(`{"names":["native"]}`)))
+	if deleteRecorder.Code != http.StatusOK {
+		t.Fatalf("batch delete status = %d; body=%s", deleteRecorder.Code, deleteRecorder.Body.String())
+	}
+	var deleted agent.MCPServersView
+	if err := json.NewDecoder(deleteRecorder.Body).Decode(&deleted); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := deleted.Servers["native"]; exists {
+		t.Fatalf("batch delete retained adopted native server: %#v", deleted.Servers)
+	}
+	mcpServerForTest(t, deleted.Servers, "catalog")
+	if runtimeImpl.listCalls != listCallsAfterAdoption {
+		t.Fatalf("Runtime MCP servers were re-imported after persistence: before=%d after=%d", listCallsAfterAdoption, runtimeImpl.listCalls)
+	}
+}
+
+func TestAgentMCPServersMutationAbortsWhenInitialRuntimeAdoptionFails(t *testing.T) {
+	readErr := errors.New("native MCP config is unreadable")
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "add", path: "/api/v1/agents/agent-mcp-unreadable/mcp-servers:batchAdd"},
+		{name: "delete", path: "/api/v1/agents/agent-mcp-unreadable/mcp-servers:batchDelete"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			svc := mustNewSeededServiceWithOptions(t, []agent.Agent{{
+				ID: "agent-mcp-unreadable", Name: "mcp-unreadable", Role: agent.RoleWorker,
+				RuntimeID: "rt-agent-mcp-unreadable", RuntimeKind: agent.RuntimeKindCodex, RuntimeName: agent.RuntimeNameCodex,
+				Status: string(agentruntime.StateStopped), AgentProfile: agent.AgentProfile{ProfileComplete: true}, ProfileComplete: true,
+			}}, agent.WithRuntime(failingMCPServersListRuntime{
+				fakeCompatRuntime: fakeCompatRuntime{kind: agent.RuntimeKindCodex},
+				err:               readErr,
+			}))
+			mcpSvc := mcp.NewService()
+			if _, err := mcpSvc.CreateServer(context.Background(), "catalog", map[string]any{"command": "catalog-server"}); err != nil {
+				t.Fatal(err)
+			}
+			handler := &Handler{svc: svc, mcp: mcpSvc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+
+			recorder := httptest.NewRecorder()
+			handler.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(`{"names":["catalog"]}`)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), readErr.Error()) {
+				t.Fatalf("body = %q, want Runtime read failure", recorder.Body.String())
+			}
+			saved, ok := svc.Agent("agent-mcp-unreadable")
+			if !ok {
+				t.Fatal("Agent missing after failed MCP adoption")
+			}
+			if saved.MCPServers != nil {
+				t.Fatalf("saved MCPServers = %#v, want unmanaged state preserved", saved.MCPServers)
+			}
+		})
+	}
+}
+
+func newAgentMCPManagementTestServer(t *testing.T) (*Handler, *agent.Controller, agent.Agent) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	hubSvc := mustNewLocalTemplateHubServiceWithoutWorkspace(t, "picoclaw-worker", hub.Template{
+		ID:          "picoclaw-worker",
+		Name:        "picoclaw-worker",
+		Description: "PicoClaw worker",
+		Role:        hub.TemplateRoleWorker,
+		RuntimeKind: agent.RuntimeNamePicoClaw,
+		Version:     "test",
+		Image:       "picoclaw-image:test",
+	})
+	mcpSvc := mcp.NewService()
+
+	svc, err := agent.NewController(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "model-1",
+	}, config.ServerConfig{ListenAddr: "127.0.0.1:18080", AccessToken: "test-server-token"}, "manager-image:test", "",
+		agent.WithHubService(hubSvc),
+		agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{
+			DefaultWorkerTemplate: "local/picoclaw-worker",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	created, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			Name:        "mcp-agent",
+			Role:        agent.RoleWorker,
+			RuntimeKind: agent.RuntimeKindPicoClawSandbox,
+			Image:       "picoclaw-image:test",
+			AgentProfile: agent.AgentProfile{
+				ProfileComplete: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	return &Handler{svc: svc, mcp: mcpSvc, serverAccessToken: "test-server-token", agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}, svc, created
+}
+
+func TestHandleMCPServersUsesMCPService(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv := &Handler{mcp: mcp.NewService()}
+
+	post := httptest.NewRequest(http.MethodPost, "/api/v1/mcp-servers", strings.NewReader(`{"name":"context7","config":{"command":"uvx","args":["context7-mcp"]}}`))
+	postRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(postRec, post)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want %d; body=%s", postRec.Code, http.StatusCreated, postRec.Body.String())
+	}
+
+	get := httptest.NewRequest(http.MethodGet, "/api/v1/mcp-servers", nil)
+	getRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(getRec, get)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d; body=%s", getRec.Code, http.StatusOK, getRec.Body.String())
+	}
+	var state struct {
+		Servers map[string]any `json:"mcpServers"`
+	}
+	if err := json.NewDecoder(getRec.Body).Decode(&state); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	if _, ok := state.Servers["context7"]; !ok {
+		t.Fatalf("GET mcpServers = %#v, want context7", state.Servers)
+	}
+
+	put := httptest.NewRequest(http.MethodPut, "/api/v1/mcp-servers/context7", strings.NewReader(`{"name":"remote","config":{"url":"https://mcp.example.com"}}`))
+	putRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(putRec, put)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want %d; body=%s", putRec.Code, http.StatusOK, putRec.Body.String())
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/mcp-servers/context7", nil)
+	deleteRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want %d; body=%s", deleteRec.Code, http.StatusOK, deleteRec.Body.String())
+	}
+}
+
+func mcpServersForTest(t *testing.T, servers map[string]any) map[string]any {
+	t.Helper()
+	if servers == nil {
+		t.Fatal("mcpServers is nil, want object")
+	}
+	return servers
+}
+
+func mcpServerForTest(t *testing.T, servers map[string]any, name string) map[string]any {
+	t.Helper()
+	server, ok := servers[name].(map[string]any)
+	if !ok {
+		t.Fatalf("mcpServers[%q] = %#v, want object", name, servers[name])
+	}
+	return server
+}
+
+func TestHandleSkillsListsGlobalSkillsAndBrowsesFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	skillsRoot := filepath.Join(home, ".csgclaw", "skills")
+	if err := os.MkdirAll(filepath.Join(skillsRoot, "alpha", "scripts"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(skills) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "alpha", "SKILL.md"), []byte("---\ndescription: Alpha skill\n---\n# Alpha\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(alpha SKILL.md) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "alpha", "scripts", "run.sh"), []byte("echo hi\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(run.sh) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(skillsRoot, "beta"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(beta) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "beta", "SKILL.md"), []byte("# Beta\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(beta SKILL.md) error = %v", err)
+	}
+
+	srv := &Handler{}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var skills []skillsystem.SkillSummary
+	if err := json.NewDecoder(rec.Body).Decode(&skills); err != nil {
+		t.Fatalf("decode skills response: %v", err)
+	}
+	if len(skills) != 5 {
+		t.Fatalf("len(skills) = %d, want 5", len(skills))
+	}
+	skillsByName := map[string]skillsystem.SkillSummary{}
+	for _, item := range skills {
+		skillsByName[item.Name] = item
+	}
+	if got := skillsByName["alpha"]; got.Description != "Alpha skill" || got.Source != skillsystem.SkillSourceLocal || got.Readonly {
+		t.Fatalf("alpha skill = %+v, want local alpha with description", got)
+	}
+	if got := skillsByName["beta"]; got.Name != "beta" || got.Description != "" || got.Source != skillsystem.SkillSourceLocal || got.Readonly {
+		t.Fatalf("beta skill = %+v, want local beta without description", got)
+	}
+	if got := skillsByName["skill-installer"]; got.Name != "skill-installer" || got.Source != skillsystem.SkillSourceSystem || !got.Readonly {
+		t.Fatalf("skill-installer = %+v, want read-only system skill", got)
+	}
+	if got := skillsByName["skill-creator"]; got.Name != "skill-creator" || got.Source != skillsystem.SkillSourceSystem || !got.Readonly {
+		t.Fatalf("skill-creator = %+v, want read-only system skill", got)
+	}
+	if got := skillsByName["csgclaw-interactive-output-demo"]; got.Name != "csgclaw-interactive-output-demo" || got.Source != skillsystem.SkillSourceSystem || !got.Readonly {
+		t.Fatalf("interactive output demo = %+v, want read-only system skill", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/tree", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root tree status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var listing apitypes.WorkspaceListing
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode root tree response: %v", err)
+	}
+	paths := make([]string, 0, len(listing.Entries))
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "alpha/SKILL.md") || !slices.Contains(paths, "skill-installer/SKILL.md") || !slices.Contains(paths, "csgclaw-interactive-output-demo/SKILL.md") {
+		t.Fatalf("root tree paths = %#v, want local and system skill files", paths)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/tree?path=.", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dot root tree status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode dot root tree response: %v", err)
+	}
+	paths = paths[:0]
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "alpha/SKILL.md") || !slices.Contains(paths, "skill-installer/SKILL.md") || !slices.Contains(paths, "csgclaw-interactive-output-demo/SKILL.md") {
+		t.Fatalf("dot root tree paths = %#v, want local and system skill files", paths)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/tree?path=alpha", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tree status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode tree response: %v", err)
+	}
+	paths = paths[:0]
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "alpha/SKILL.md") || !slices.Contains(paths, "alpha/scripts/run.sh") {
+		t.Fatalf("tree paths = %#v, want alpha files", paths)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/file?path=alpha/SKILL.md", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("file status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var file apitypes.WorkspaceFile
+	if err := json.NewDecoder(rec.Body).Decode(&file); err != nil {
+		t.Fatalf("decode file response: %v", err)
+	}
+	if got, want := file.Path, "alpha/SKILL.md"; got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	if !strings.Contains(file.Content, "# Alpha") {
+		t.Fatalf("content = %q, want preview with # Alpha", file.Content)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/tree?path=skill-installer", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("system tree status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode system tree response: %v", err)
+	}
+	paths = paths[:0]
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "skill-installer/SKILL.md") {
+		t.Fatalf("system tree paths = %#v, want skill-installer/SKILL.md", paths)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/file?path=skill-installer/SKILL.md", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("system file status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&file); err != nil {
+		t.Fatalf("decode system file response: %v", err)
+	}
+	if !strings.Contains(file.Content, "registry skill search") {
+		t.Fatalf("system skill content = %q, want skill-installer instructions", file.Content)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/tree?path=csgclaw-interactive-output-demo", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("demo tree status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode demo tree response: %v", err)
+	}
+	paths = paths[:0]
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "csgclaw-interactive-output-demo/SKILL.md") || !slices.Contains(paths, "csgclaw-interactive-output-demo/scripts/emit_demo.py") {
+		t.Fatalf("demo tree paths = %#v, want skill and emitter files", paths)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/file?path=csgclaw-interactive-output-demo/scripts/emit_demo.py", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("demo file status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&file); err != nil {
+		t.Fatalf("decode demo file response: %v", err)
+	}
+	if !strings.Contains(file.Content, "::csgclaw-output::") {
+		t.Fatalf("demo emitter content = %q, want structured output record", file.Content)
+	}
+}
+
+func TestHandleSkillsMissingRootUsesEmptyOrNotFound(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	srv := &Handler{}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var skills []skillsystem.SkillSummary
+	if err := json.NewDecoder(rec.Body).Decode(&skills); err != nil {
+		t.Fatalf("decode skills response: %v", err)
+	}
+	skillsByName := map[string]skillsystem.SkillSummary{}
+	for _, item := range skills {
+		skillsByName[item.Name] = item
+	}
+	for _, name := range []string{"skill-installer", "skill-creator", "csgclaw-interactive-output-demo"} {
+		if got := skillsByName[name]; got.Name != name || got.Source != skillsystem.SkillSourceSystem || !got.Readonly {
+			t.Fatalf("skills = %+v, want read-only system skill %s", skills, name)
+		}
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/tree", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root tree status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var listing apitypes.WorkspaceListing
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode root tree response: %v", err)
+	}
+	paths := make([]string, 0, len(listing.Entries))
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "skill-installer/SKILL.md") || !slices.Contains(paths, "csgclaw-interactive-output-demo/SKILL.md") {
+		t.Fatalf("root tree paths = %#v, want system skill file", paths)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/tree?path=alpha", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("tree status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/file?path=alpha/SKILL.md", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("file status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestHandleSkillsBrowsesSystemSkillWhenLocalSystemSkillIsMalformed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	skillsRoot := filepath.Join(home, ".csgclaw", "skills")
+	if err := os.MkdirAll(filepath.Join(skillsRoot, "skill-installer"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(malformed skill-installer) error = %v", err)
+	}
+
+	srv := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var skills []skillsystem.SkillSummary
+	if err := json.NewDecoder(rec.Body).Decode(&skills); err != nil {
+		t.Fatalf("decode skills response: %v", err)
+	}
+	skillsByName := map[string]skillsystem.SkillSummary{}
+	for _, item := range skills {
+		skillsByName[item.Name] = item
+	}
+	for _, name := range []string{"skill-installer", "skill-creator", "csgclaw-interactive-output-demo"} {
+		if got := skillsByName[name]; got.Name != name || got.Source != skillsystem.SkillSourceSystem || !got.Readonly {
+			t.Fatalf("skills = %+v, want read-only system skill %s", skills, name)
+		}
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/tree?path=skill-installer", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tree status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var listing apitypes.WorkspaceListing
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode tree response: %v", err)
+	}
+	paths := make([]string, 0, len(listing.Entries))
+	for _, entry := range listing.Entries {
+		paths = append(paths, entry.Path)
+	}
+	if !slices.Contains(paths, "skill-installer/SKILL.md") {
+		t.Fatalf("tree paths = %#v, want system skill file", paths)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/skills/file?path=skill-installer/SKILL.md", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("file status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var file apitypes.WorkspaceFile
+	if err := json.NewDecoder(rec.Body).Decode(&file); err != nil {
+		t.Fatalf("decode file response: %v", err)
+	}
+	if !strings.Contains(file.Content, "registry skill search") {
+		t.Fatalf("system skill content = %q, want skill-installer instructions", file.Content)
+	}
+}
+
+func TestHandleSkillDeleteRejectsSystemSkill(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	srv := &Handler{}
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/skills/skill-installer", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("delete status = %d, want %d; body=%s", rec.Code, http.StatusForbidden, rec.Body.String())
+	}
+}
+
+func TestHandleSkillDeleteAllowsLocalSkillWithSystemName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	skillsRoot := filepath.Join(home, ".csgclaw", "skills")
+	if err := os.MkdirAll(filepath.Join(skillsRoot, "skill-installer"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(skill-installer) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "skill-installer", "SKILL.md"), []byte("# Local installer\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(local installer) error = %v", err)
+	}
+
+	srv := &Handler{}
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/skills/skill-installer", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(skillsRoot, "skill-installer")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local skill-installer still exists, err=%v", err)
+	}
+}
+
+func TestHandleSkillUpload(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	srv := &Handler{}
+	req := newSkillUploadRequest(t, "alpha.zip", map[string]string{
+		"alpha/SKILL.md":       "---\ndescription: Alpha skill\n---\n# Alpha\n",
+		"alpha/scripts/run.sh": "#!/bin/sh\necho hi\n",
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var skill struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&skill); err != nil {
+		t.Fatalf("decode upload response: %v", err)
+	}
+	if skill.Name != "alpha" || skill.Description != "Alpha skill" {
+		t.Fatalf("uploaded skill = %+v, want alpha summary", skill)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".csgclaw", "skills", "alpha", "SKILL.md")); err != nil {
+		t.Fatalf("installed SKILL.md missing: %v", err)
+	}
+}
+
+func TestHandleRemoteSkillsUsesEffectiveOfficialHub(t *testing.T) {
+	currentStatus := auth.Status{}
+	restore := stubAuthStatus(func(*http.Request) (auth.Status, error) {
+		return currentStatus, nil
+	})
+	defer restore()
+	previousAccessToken := remoteSkillsHubAccessToken
+	remoteSkillsHubAccessToken = func() (string, error) { return "private-skill-token", nil }
+	t.Cleanup(func() { remoteSkillsHubAccessToken = previousAccessToken })
+
+	officialHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/skills" {
+			t.Fatalf("path = %q, want /api/v1/skills", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("page"); got != "2" {
+			t.Fatalf("page = %q, want 2", got)
+		}
+		if got := r.URL.Query().Get("per"); got != "16" {
+			t.Fatalf("per = %q, want 16", got)
+		}
+		if got := r.URL.Query().Get("search"); got != "agents" {
+			t.Fatalf("search = %q, want agents", got)
+		}
+		if got := r.URL.Query().Get("sort"); got != "trending" {
+			t.Fatalf("sort = %q, want trending", got)
+		}
+		if got := r.URL.Query().Get("source"); got != "" {
+			t.Fatalf("source = %q, want empty", got)
+		}
+		wantAuthorization := ""
+		if currentStatus.Authenticated {
+			wantAuthorization = "Bearer private-skill-token"
+		}
+		if got := r.Header.Get("Authorization"); got != wantAuthorization {
+			t.Fatalf("Authorization = %q, want %q", got, wantAuthorization)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{
+				"default_branch": "dev",
+				"description":    "Build agents",
+				"name":           "Skill",
+				"path":           "AIWizards/agent-builder",
+			}},
+			"total": "78",
+		})
+	}))
+	defer officialHub.Close()
+	t.Setenv("CSGHUB_API_BASE_URL", officialHub.URL)
+	stubHubTransport(t, officialHub.URL)
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	content := `[server]
+listen_addr = "127.0.0.1:18080"
+
+[models]
+default = "default.model"
+
+[models.providers.default]
+base_url = "http://127.0.0.1:4000"
+api_key = "sk"
+models = ["model"]
+
+[[hub.registries]]
+name = "official"
+kind = "remote"
+url = "` + officialHub.URL + `/"
+enabled = true
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	srv := &Handler{}
+	srv.SetConfigPath(configPath)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/skills/remote?page=2&per=16&search=agents", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var response struct {
+		Items []struct {
+			Name       string `json:"name"`
+			Readonly   bool   `json:"readonly"`
+			RemotePath string `json:"remote_path"`
+			RemoteRef  string `json:"remote_ref"`
+			RemoteURL  string `json:"remote_url"`
+			Source     string `json:"source"`
+		} `json:"items"`
+		NextPage *int `json:"next_page"`
+		Page     int  `json:"page"`
+		Per      int  `json:"per"`
+		Total    *int `json:"total"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Page != 2 || response.Per != 16 || response.Total == nil || *response.Total != 78 {
+		t.Fatalf("response pagination = %+v, want page 2/per 16/total 78", response)
+	}
+	if response.NextPage == nil || *response.NextPage != 3 {
+		t.Fatalf("next_page = %v, want 3", response.NextPage)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %+v, want one", response.Items)
+	}
+	item := response.Items[0]
+	if item.Name != "agent-builder" || !item.Readonly || item.RemotePath != "AIWizards/agent-builder" || item.RemoteRef != "dev" || item.Source != "official" {
+		t.Fatalf("item = %+v, want normalized official skill", item)
+	}
+	if want := auth.DefaultOpenCSGBaseURL + "/skills/AIWizards/agent-builder"; item.RemoteURL != want {
+		t.Fatalf("remote_url = %q, want %q", item.RemoteURL, want)
+	}
+
+	for _, test := range []struct {
+		name   string
+		status auth.Status
+		want   string
+	}{
+		{
+			name:   "legacy production login",
+			status: auth.Status{Authenticated: true, BaseURL: auth.DefaultCSGHubBaseURL},
+			want:   auth.DefaultOpenCSGBaseURL + "/skills/AIWizards/agent-builder",
+		},
+		{
+			name: "stage login",
+			status: auth.Status{
+				Authenticated:  true,
+				OpenCSGBaseURL: auth.StageOpenCSGBaseURL,
+				BaseURL:        auth.StageCSGHubBaseURL,
+			},
+			want: auth.StageOpenCSGBaseURL + "/skills/AIWizards/agent-builder",
+		},
+		{
+			name: "custom login",
+			status: auth.Status{
+				Authenticated:  true,
+				OpenCSGBaseURL: "https://east.example.test",
+				BaseURL:        "https://east.example.test",
+			},
+			want: "https://east.example.test/skills/AIWizards/agent-builder",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			currentStatus = test.status
+			rec := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/skills/remote?page=2&per=16&search=agents", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var got struct {
+				Items []struct {
+					RemoteURL string `json:"remote_url"`
+				} `json:"items"`
+			}
+			if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if len(got.Items) != 1 || got.Items[0].RemoteURL != test.want {
+				t.Fatalf("items = %+v, want remote_url %q", got.Items, test.want)
+			}
+		})
+	}
+}
+
+func TestHandleSkillInstallFromOfficialHub(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	previousAccessToken := remoteSkillsHubAccessToken
+	remoteSkillsHubAccessToken = func() (string, error) { return "private-skill-token", nil }
+	t.Cleanup(func() { remoteSkillsHubAccessToken = previousAccessToken })
+
+	archiveRequests := 0
+	officialHub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/skills/AIWizards/agent-builder/download_archive/refs/dev":
+			archiveRequests++
+			if got := r.Header.Get("Accept"); got != "application/zip" {
+				t.Errorf("Accept = %q, want application/zip", got)
+			}
+			if got, want := r.Header.Get("Authorization"), "Bearer private-skill-token"; got != want {
+				t.Errorf("Authorization = %q, want %q", got, want)
+			}
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write(mustZipBytes(t, map[string]string{
+				"SKILL.md":       "---\ndescription: Build agents\n---\n# Agent Builder\n",
+				"scripts/run.sh": "#!/bin/sh\necho ready\n",
+			}))
+		case "/api/v1/skills/AIWizards/agent-builder/download_archive/refs/broken":
+			archiveRequests++
+			if got, want := r.Header.Get("Authorization"), "Bearer private-skill-token"; got != want {
+				t.Errorf("Authorization = %q, want %q", got, want)
+			}
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, "<html>not a zip</html>")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer officialHub.Close()
+	t.Setenv("CSGHUB_API_BASE_URL", officialHub.URL)
+	t.Cleanup(stubAuthStatus(func(*http.Request) (auth.Status, error) {
+		return auth.Status{
+			Authenticated:  true,
+			OpenCSGBaseURL: officialHub.URL,
+			BaseURL:        officialHub.URL,
+		}, nil
+	}))
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	content := `[server]
+listen_addr = "127.0.0.1:18080"
+access_token = "secret"
+
+[models]
+default = "default.model"
+
+[models.providers.default]
+base_url = "http://127.0.0.1:4000"
+api_key = "sk"
+models = ["model"]
+
+[[hub.registries]]
+name = "official"
+kind = "remote"
+url = "` + officialHub.URL + `/"
+enabled = true
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	srv := &Handler{}
+	srv.SetConfigPath(configPath)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills:install", strings.NewReader(`{
+		"remote_path": "AIWizards/agent-builder",
+		"ref": "dev"
+	}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("install status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var skill struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&skill); err != nil {
+		t.Fatalf("decode install response: %v", err)
+	}
+	if skill.Name != "agent-builder" || skill.Description != "Build agents" {
+		t.Fatalf("installed skill = %+v, want agent-builder summary", skill)
+	}
+	skillRoot := filepath.Join(home, ".csgclaw", "skills", "agent-builder")
+	if _, err := os.Stat(filepath.Join(skillRoot, "SKILL.md")); err != nil {
+		t.Fatalf("installed SKILL.md missing: %v", err)
+	}
+	script, err := os.ReadFile(filepath.Join(skillRoot, "scripts", "run.sh"))
+	if err != nil {
+		t.Fatalf("read installed script: %v", err)
+	}
+	if !strings.Contains(string(script), "echo ready") {
+		t.Fatalf("script = %q, want remote script content", script)
+	}
+	staleFile := filepath.Join(skillRoot, "stale.txt")
+	if err := os.WriteFile(staleFile, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("WriteFile(stale) error = %v", err)
+	}
+
+	replaceReq := httptest.NewRequest(http.MethodPost, "/api/v1/skills:install", strings.NewReader(`{
+		"remote_path": "AIWizards/agent-builder",
+		"ref": "dev",
+		"replace": true
+	}`))
+	replaceRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(replaceRec, replaceReq)
+
+	if replaceRec.Code != http.StatusCreated {
+		t.Fatalf("replace install status = %d, want %d; body=%s", replaceRec.Code, http.StatusCreated, replaceRec.Body.String())
+	}
+	if _, err := os.Stat(staleFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale file still exists after replace, err=%v", err)
+	}
+
+	invalidReq := httptest.NewRequest(http.MethodPost, "/api/v1/skills:install", strings.NewReader(`{
+		"remote_path": "AIWizards/agent-builder",
+		"ref": "broken"
+	}`))
+	invalidRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(invalidRec, invalidReq)
+	if invalidRec.Code != http.StatusBadGateway {
+		t.Fatalf("invalid archive status = %d, want %d; body=%s", invalidRec.Code, http.StatusBadGateway, invalidRec.Body.String())
+	}
+	if archiveRequests != 3 {
+		t.Fatalf("archive requests = %d, want 3", archiveRequests)
+	}
+}
+
+func TestHandleSkillUploadRejectsDuplicate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".csgclaw", "skills", "alpha"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(alpha) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".csgclaw", "skills", "alpha", "SKILL.md"), []byte("# Alpha\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(alpha SKILL.md) error = %v", err)
+	}
+
+	srv := &Handler{}
+	req := newSkillUploadRequest(t, "alpha.zip", map[string]string{
+		"alpha/SKILL.md": "# Alpha\n",
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("upload status = %d, want %d; body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+}
+
+func TestHandleSkillDelete(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	skillsRoot := filepath.Join(home, ".csgclaw", "skills")
+	if err := os.MkdirAll(filepath.Join(skillsRoot, "alpha", "scripts"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(alpha) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "alpha", "SKILL.md"), []byte("# Alpha\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(alpha SKILL.md) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsRoot, "alpha", "scripts", "run.sh"), []byte("echo hi\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(run.sh) error = %v", err)
+	}
+
+	srv := &Handler{}
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/skills/alpha", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(skillsRoot, "alpha")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("alpha still exists, err = %v", err)
+	}
+}
+
+func TestHandleSkillUploadRejectsInvalidArchive(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	srv := &Handler{}
+	req := newSkillUploadRequest(t, "invalid.zip", map[string]string{
+		"alpha/SKILL.md": "# Alpha\n",
+		"beta/SKILL.md":  "# Beta\n",
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestHandleHubTemplateWithoutWorkspaceOmitsEntriesAndFilePreview(t *testing.T) {
+	hubSvc := mustNewLocalTemplateHubServiceWithoutWorkspace(t, "review-bot", hub.Template{
+		ID:          "review-bot",
+		Name:        "review-bot",
+		Description: "code review helper",
+		Role:        hub.TemplateRoleWorker,
+		RuntimeKind: agent.RuntimeKindCodex,
+	})
+	srv := &Handler{}
+	srv.SetHubService(hubSvc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/hub/templates/local.review-bot", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var detail apitypes.HubTemplate
+	if err := json.NewDecoder(rec.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode detail response: %v", err)
+	}
+	if len(detail.Workspace.Entries) != 0 {
+		t.Fatalf("workspace entries = %#v, want empty", detail.Workspace.Entries)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/hub/templates/local.review-bot/workspace", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("workspace status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var listing apitypes.WorkspaceListing
+	if err := json.NewDecoder(rec.Body).Decode(&listing); err != nil {
+		t.Fatalf("decode workspace response: %v", err)
+	}
+	if len(listing.Entries) != 1 || listing.Entries[0].Path != "agent.toml" {
+		t.Fatalf("template entries = %#v, want agent.toml", listing.Entries)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/hub/templates/local.review-bot/workspace/file?path=USER.md", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("file status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "workspace") {
+		t.Fatalf("file response body = %q, want workspace error", rec.Body.String())
+	}
+}
+
+func newSkillUploadRequest(t *testing.T, filename string, files map[string]string) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := part.Write(mustZipBytes(t, files)); err != nil {
+		t.Fatalf("Write(zip) error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills:upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
+}
+
+func mustZipBytes(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("Create(%q) error = %v", name, err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatalf("Write(%q) error = %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestHandleHubTemplatesPublishesAgentSnapshot(t *testing.T) {
+	svc := mustNewService(t)
+	created, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:          "u-alice",
+			Name:        "alice",
+			Description: "review worker",
+			RuntimeKind: agent.RuntimeKindPicoClawSandbox,
+			Image:       "worker-image:1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	spec, err := svc.HubPublishSpec(created.ID, false)
+	if err != nil {
+		t.Fatalf("HubPublishSpec() error = %v", err)
+	}
+	downloadsRoot := filepath.Join(spec.WorkspaceRef.Path, "downloads")
+	if err := os.MkdirAll(downloadsRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(downloads) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloadsRoot, "input.pdf"), []byte("must not publish\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(downloads/input.pdf) error = %v", err)
+	}
+
+	registryRoot := t.TempDir()
+	hubSvc, err := hub.NewService(config.HubConfig{
+		DefaultRegistry:        "local",
+		DefaultPublishRegistry: "local",
+		Registries: []config.HubRegistryConfig{
+			{Name: "local", Kind: hub.RegistryKindLocal, Path: registryRoot, Enabled: true},
+		},
+	}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	srv.SetHubService(hubSvc)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/templates", strings.NewReader(
+		`{"agent_id":"u-alice","registry":"local","name":"ReviewBot_2","description":"Published review template"}`,
+	))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got apitypes.HubTemplate
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "local.ReviewBot_2" {
+		t.Fatalf("template id = %q, want %q", got.ID, "local.ReviewBot_2")
+	}
+	if got.Name != "ReviewBot_2" || got.Description != "Published review template" {
+		t.Fatalf("template metadata = %q/%q, want request values", got.Name, got.Description)
+	}
+	if got.Role != hub.TemplateRoleWorker {
+		t.Fatalf("template role = %q, want %q", got.Role, hub.TemplateRoleWorker)
+	}
+	if got.Source.Name != "local" || got.Source.Kind != "local" {
+		t.Fatalf("template source = %+v, want local/local", got.Source)
+	}
+	publishedWorkspace := filepath.Join(registryRoot, "templates", "ReviewBot_2", "instructions", "downloads")
+	if _, err := os.Stat(publishedWorkspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("published downloads stat error = %v, want not exist", err)
+	}
+
+	duplicateReq := httptest.NewRequest(http.MethodPost, "/api/v1/hub/templates", strings.NewReader(
+		`{"agent_id":"u-alice","registry":"local","name":"ReviewBot_2","description":"Duplicate"}`,
+	))
+	duplicateRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(duplicateRec, duplicateReq)
+	if duplicateRec.Code != http.StatusConflict {
+		t.Fatalf("duplicate status = %d, want %d; body=%s", duplicateRec.Code, http.StatusConflict, duplicateRec.Body.String())
+	}
+}
+
+func TestHandleHubTemplatesPublishesCodexRuntimeOptions(t *testing.T) {
+	created := agent.Agent{
+		ID:          "u-codex-worker",
+		Name:        "codex-worker",
+		Role:        agent.RoleWorker,
+		RuntimeKind: agent.RuntimeKindCodex,
+		RuntimeOptions: map[string]any{
+			"execution_mode": "read_only",
+			"memory_mode":    "disabled",
+		},
+	}
+	svc := mustNewSeededService(t, []agent.Agent{created})
+	publishSpec, err := svc.HubPublishSpec(created.ID, false)
+	if err != nil {
+		t.Fatalf("HubPublishSpec() error = %v", err)
+	}
+	if err := os.MkdirAll(publishSpec.WorkspaceRef.Path, 0o755); err != nil {
+		t.Fatalf("MkdirAll(workspace) error = %v", err)
+	}
+
+	registryRoot := t.TempDir()
+	hubSvc, err := hub.NewService(config.HubConfig{
+		DefaultRegistry:        "local",
+		DefaultPublishRegistry: "local",
+		Registries: []config.HubRegistryConfig{
+			{Name: "local", Kind: hub.RegistryKindLocal, Path: registryRoot, Enabled: true},
+		},
+	}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	srv.SetHubService(hubSvc)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/templates", strings.NewReader(
+		fmt.Sprintf(`{"agent_id":%q,"registry":"local"}`, created.ID),
+	))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got apitypes.HubTemplate
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.RuntimeOptions["execution_mode"] != "read_only" || got.RuntimeOptions["memory_mode"] != "disabled" {
+		t.Fatalf("runtime options = %#v, want execution_mode=read_only and memory_mode=disabled", got.RuntimeOptions)
+	}
+	manifestData, err := os.ReadFile(filepath.Join(registryRoot, "templates", created.Name, "agent.toml"))
+	if err != nil {
+		t.Fatalf("ReadFile(agent.toml) error = %v", err)
+	}
+	manifest := string(manifestData)
+	if !strings.Contains(manifest, "execution_mode = 'read_only'") || !strings.Contains(manifest, "memory_mode = 'disabled'") {
+		t.Fatalf("agent.toml missing Codex runtime options:\n%s", manifest)
+	}
+}
+
+func TestHandleHubTemplatesRequiresExplicitMemoryOptIn(t *testing.T) {
+	created := agent.Agent{
+		ID: "u-codex-memory", Name: "codex-memory", Role: agent.RoleWorker, RuntimeKind: agent.RuntimeKindCodex,
+	}
+	svc := mustNewSeededService(t, []agent.Agent{created})
+	publishSpec, err := svc.HubPublishSpec(created.ID, true)
+	if err != nil {
+		t.Fatalf("HubPublishSpec() error = %v", err)
+	}
+	if err := os.MkdirAll(publishSpec.WorkspaceRef.Path, 0o755); err != nil {
+		t.Fatalf("MkdirAll(workspace) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publishSpec.WorkspaceRef.Path, "AGENTS.md"), []byte("instructions\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(AGENTS.md) error = %v", err)
+	}
+	memoryPath := filepath.Join(filepath.Dir(publishSpec.WorkspaceRef.SkillsPath), "memories", "memory_summary.md")
+	if err := os.MkdirAll(filepath.Dir(memoryPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(memory) error = %v", err)
+	}
+	if err := os.WriteFile(memoryPath, []byte("private memory\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(memory_summary.md) error = %v", err)
+	}
+
+	registryRoot := t.TempDir()
+	hubSvc, err := hub.NewService(config.HubConfig{
+		DefaultRegistry: "local", DefaultPublishRegistry: "local",
+		Registries: []config.HubRegistryConfig{{Name: "local", Kind: hub.RegistryKindLocal, Path: registryRoot, Enabled: true}},
+	}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	srv.SetHubService(hubSvc)
+
+	for _, test := range []struct {
+		name          string
+		includeMemory bool
+		wantMemory    bool
+	}{
+		{name: "WithoutMemory", includeMemory: false, wantMemory: false},
+		{name: "WithMemory", includeMemory: true, wantMemory: true},
+	} {
+		body := fmt.Sprintf(`{"agent_id":%q,"registry":"local","name":%q,"include_memory":%t}`,
+			created.ID, test.name, test.includeMemory)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/templates", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("%s status = %d, want %d; body=%s", test.name, rec.Code, http.StatusCreated, rec.Body.String())
+		}
+		_, statErr := os.Stat(filepath.Join(registryRoot, "templates", test.name, "memories", "memory_summary.md"))
+		if test.wantMemory && statErr != nil {
+			t.Fatalf("%s memory missing: %v", test.name, statErr)
+		}
+		if !test.wantMemory && !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("%s memory was published without opt-in: %v", test.name, statErr)
+		}
+	}
+}
+
+func TestHandleHubTemplatesRequiresOpenCSGLoginForOfficialPublish(t *testing.T) {
+	restore := stubAuthStatus(func(*http.Request) (auth.Status, error) {
+		return auth.Status{Authenticated: false}, nil
+	})
+	defer restore()
+
+	hubSvc, err := hub.NewService(config.HubConfig{
+		DefaultRegistry:        "local",
+		DefaultPublishRegistry: "local",
+		Registries: []config.HubRegistryConfig{
+			{Name: "local", Kind: hub.RegistryKindLocal, Path: t.TempDir(), Enabled: true},
+		},
+	}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: mustNewService(t), agentEngine: agentengine.New(mustNewService(t)), workspace: mustNewService(t).Workspace(), agentModels: mustNewService(t).Models(), agentRuntime: mustNewService(t)}
+	srv.SetHubService(hubSvc)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/hub/templates",
+		strings.NewReader(`{"agent_id":"u-alice","registry":"official"}`),
+	)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusUnauthorized, rec.Body.String())
+	}
+}
+
+func TestHandleHubTemplatesRejectsInvalidPublishName(t *testing.T) {
+	svc := mustNewService(t)
+	created, err := svc.CreateRecord(context.Background(), agent.CreateRequest{Spec: agent.CreateAgentSpec{
+		ID: "u-alice", Name: "alice", RuntimeKind: agent.RuntimeKindPicoClawSandbox, Image: "worker-image:1",
+	}})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	hubSvc, err := hub.NewService(config.HubConfig{
+		DefaultRegistry:        "local",
+		DefaultPublishRegistry: "local",
+		Registries: []config.HubRegistryConfig{
+			{Name: "local", Kind: hub.RegistryKindLocal, Path: t.TempDir(), Enabled: true},
+		},
+	}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	srv.SetHubService(hubSvc)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/templates", strings.NewReader(
+		fmt.Sprintf(`{"agent_id":%q,"registry":"local","name":"2-invalid"}`, created.ID),
+	))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "must start with an English letter") {
+		t.Fatalf("body = %q, want template name validation error", rec.Body.String())
+	}
+}
+
+func TestValidateAgentTemplatePublishTarget(t *testing.T) {
+	tests := []struct {
+		name        string
+		runtimeKind string
+		registry    string
+		wantErr     bool
+	}{
+		{name: "Codex to community", runtimeKind: agent.RuntimeKindCodex, registry: "official"},
+		{name: "Codex to local", runtimeKind: agent.RuntimeKindCodex, registry: "local"},
+		{name: "DSH to community", runtimeKind: agent.RuntimeKindDSH, registry: "official"},
+		{name: "DSH to local", runtimeKind: agent.RuntimeKindDSH, registry: "local"},
+		{name: "OpenClaw to local", runtimeKind: agent.RuntimeKindOpenClawSandbox, registry: "local"},
+		{name: "OpenClaw to community", runtimeKind: agent.RuntimeKindOpenClawSandbox, registry: "official", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAgentTemplatePublishTarget(hub.PublishSpec{RuntimeKind: tt.runtimeKind}, tt.registry)
+			if tt.wantErr && err == nil {
+				t.Fatal("validateAgentTemplatePublishTarget() error = nil, want rejection")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateAgentTemplatePublishTarget() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestHandleHubTemplatesPublishesAgentSnapshotToDefaultRegistryWhenOmitted(t *testing.T) {
+	svc := mustNewService(t)
+	created, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:          "u-alice",
+			Name:        "alice",
+			Description: "review worker",
+			RuntimeKind: agent.RuntimeKindPicoClawSandbox,
+			Image:       "worker-image:1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	spec, err := svc.HubPublishSpec(created.ID, false)
+	if err != nil {
+		t.Fatalf("HubPublishSpec() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(spec.WorkspaceRef.Path, "PLAYBOOK.md"), []byte("published workspace\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(PLAYBOOK.md) error = %v", err)
+	}
+
+	registryRoot := t.TempDir()
+	hubSvc, err := hub.NewService(config.HubConfig{
+		DefaultRegistry:        "local",
+		DefaultPublishRegistry: "local",
+		Registries: []config.HubRegistryConfig{
+			{Name: "local", Kind: hub.RegistryKindLocal, Path: registryRoot, Enabled: true},
+		},
+	}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	srv.SetHubService(hubSvc)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hub/templates", strings.NewReader(`{"agent_id":"u-alice"}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got apitypes.HubTemplate
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "local.alice" {
+		t.Fatalf("template id = %q, want %q", got.ID, "local.alice")
+	}
+	if got.Role != hub.TemplateRoleWorker {
+		t.Fatalf("template role = %q, want %q", got.Role, hub.TemplateRoleWorker)
+	}
+	if got.Source.Name != "local" || got.Source.Kind != "local" {
+		t.Fatalf("template source = %+v, want local/local", got.Source)
+	}
+}
+
+func mustNewLocalTemplateHubService(t *testing.T, id string, item hub.Template) *hub.Service {
+	t.Helper()
+
+	registryRoot := t.TempDir()
+	workspaceRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "USER.md"), []byte("template user\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(USER.md) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspaceRoot, "skills", "custom"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(skill dir) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "skills", "custom", "SKILL.md"), []byte("# Custom\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(SKILL.md) error = %v", err)
+	}
+
+	store := hub.NewLocalStore(registryRoot)
+	if _, err := store.Publish(context.Background(), hub.PublishSpec{
+		ID:             id,
+		Name:           item.Name,
+		Description:    item.Description,
+		RuntimeKind:    item.RuntimeKind,
+		Version:        item.Version,
+		Image:          item.Image,
+		RuntimeOptions: item.RuntimeOptions,
+		WorkspaceRef:   hub.WorkspaceRef{Kind: hub.WorkspaceKindDir, Path: workspaceRoot},
+		UpdatedAt:      time.Date(2026, 5, 12, 9, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+
+	svc, err := hub.NewService(config.HubConfig{
+		DefaultRegistry: "local",
+		Registries: []config.HubRegistryConfig{
+			{Name: "local", Kind: hub.RegistryKindLocal, Path: registryRoot, Enabled: true},
+		},
+	}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+	return svc
+}
+
+func mustNewLocalTemplateHubServiceWithoutWorkspace(t *testing.T, id string, item hub.Template) *hub.Service {
+	t.Helper()
+
+	registryRoot := t.TempDir()
+	store := hub.NewLocalStore(registryRoot)
+	if _, err := store.Publish(context.Background(), hub.PublishSpec{
+		ID:             id,
+		Name:           item.Name,
+		Description:    item.Description,
+		RuntimeKind:    item.RuntimeKind,
+		Version:        item.Version,
+		Image:          item.Image,
+		RuntimeOptions: item.RuntimeOptions,
+		UpdatedAt:      time.Date(2026, 5, 12, 9, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+
+	svc, err := hub.NewService(config.HubConfig{
+		DefaultRegistry: "local",
+		Registries: []config.HubRegistryConfig{
+			{Name: "local", Kind: hub.RegistryKindLocal, Path: registryRoot, Enabled: true},
+		},
+	}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+	return svc
+}
+
+func TestHandleAgentsCreateReplaceManagerUsesUnifiedServiceEntry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	if _, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:   agent.ManagerUserID,
+			Name: agent.ManagerName,
+		},
+	}); err != nil {
+		t.Fatalf("seed Create() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"id":"u-manager","name":"manager","replace":true}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got agent.Agent
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != agent.ManagerUserID || got.Name != agent.ManagerName || got.Role != agent.RoleManager {
+		t.Fatalf("agent = %+v, want replaced manager", got)
+	}
+}
+
+func TestHandleAgentsCreateReplaceManagerRejectsNonCodexRuntime(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	if _, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:   agent.ManagerUserID,
+			Name: agent.ManagerName,
+		},
+	}); err != nil {
+		t.Fatalf("seed Create() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"id":"u-manager","name":"manager","replace":true,"runtime_name":"openclaw","sandbox_enabled":true}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "manager runtime is fixed to codex") {
+		t.Fatalf("body = %q, want fixed codex runtime rejection", rec.Body.String())
+	}
+}
+
+func TestHandleAgentsCreateReplaceManagerRejectsMCPRuntimeOptions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	if _, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:   agent.ManagerUserID,
+			Name: agent.ManagerName,
+		},
+	}); err != nil {
+		t.Fatalf("seed Create() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agents", strings.NewReader(`{"id":"u-manager","name":"manager","replace":true,"field_mask":["runtime_options"],"runtime_options":{"mcp":{"mcpServers":{"context7":{"command":"npx"}}}}}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "runtime_options.mcp is not supported") {
+		t.Fatalf("body = %q, want MCP runtime option rejection", rec.Body.String())
+	}
+}
+
+func TestHandleAgentsPatchManagerRejectsNonCodexRuntime(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	if _, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:   agent.ManagerUserID,
+			Name: agent.ManagerName,
+		},
+	}); err != nil {
+		t.Fatalf("seed Create() error = %v", err)
+	}
+
+	srv := &Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/agents/u-manager", strings.NewReader(`{"runtime":{"name":"openclaw","sandbox_enabled":true}}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "manager runtime is fixed to codex") {
+		t.Fatalf("body = %q, want fixed codex runtime rejection", rec.Body.String())
+	}
+}
+
+func TestHandleAgentsCreateReplaceManagerIgnoresImageAndUsesRuntimeTemplate(t *testing.T) {
+	t.Skip("manager is Codex-only; sandbox manager image replacement is obsolete")
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	svc := mustNewService(t)
+	if _, err := svc.CreateRecord(context.Background(), agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:   agent.ManagerUserID,
+			Name: agent.ManagerName,
+		},
+	}); err != nil {
+		t.Fatalf("seed Create() error = %v", err)
+	}
+	hubSvc, err := hub.NewService(config.HubConfig{Registries: []config.HubRegistryConfig{{Name: config.DefaultOfficialHubRegistryName, Kind: config.HubRegistryKindRemote, Enabled: false}}}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+	openClawTemplate, err := hubSvc.Get(context.Background(), "builtin.openclaw-manager")
+	if err != nil {
+		t.Fatalf("Get(openclaw-manager) error = %v", err)
+	}
+
+	srv := httptest.NewServer((&Handler{svc: svc, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}).Routes())
+	defer srv.Close()
+
+	resp, err := http.Post(
+		srv.URL+"/api/v1/agents",
+		"application/json",
+		strings.NewReader(`{"id":"u-manager","name":"manager","replace":true,"runtime_name":"openclaw","sandbox_enabled":true,"image":"client:must-not-win"}`),
+	)
+	if err != nil {
+		t.Fatalf("POST /api/v1/agents error = %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, http.StatusCreated, string(body))
+	}
+	var got agent.Agent
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.RuntimeKind != agent.RuntimeKindOpenClawSandbox {
+		t.Fatalf("runtime_kind = %q, want %q", got.RuntimeKind, agent.RuntimeKindOpenClawSandbox)
+	}
+	if got.Image != openClawTemplate.Image {
+		t.Fatalf("image = %q, want runtime template image %q", got.Image, openClawTemplate.Image)
+	}
+}
+
+func TestHandleBootstrapAliasReturnsIMBootstrap(t *testing.T) {
+	srv := &Handler{im: im.NewService()}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got struct {
+		CurrentUserID string    `json:"current_user_id"`
+		Users         []im.User `json:"users"`
+		Rooms         []im.Room `json:"rooms"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.CurrentUserID == "" {
+		t.Fatal("bootstrap current_user_id is empty")
+	}
+	if got.Rooms == nil {
+		t.Fatal("bootstrap rooms is nil, want room-oriented DTO")
+	}
+}
+
+func TestHandleBootstrapReloadsIMStateBeforeResponse(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	initial := im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin", Role: "admin"},
+			{ID: "u-manager", Name: "manager", Role: "manager"},
+		},
+	}
+	if err := im.SaveBootstrap(statePath, initial); err != nil {
+		t.Fatalf("SaveBootstrap() initial error = %v", err)
+	}
+
+	imSvc, err := im.NewServiceFromPath(statePath)
+	if err != nil {
+		t.Fatalf("NewServiceFromPath() error = %v", err)
+	}
+
+	updated := initial
+	updated.Rooms = []im.Room{{
+		ID:       "room-1",
+		Title:    "admin & manager",
+		IsDirect: true,
+		Members:  []string{"u-admin", "u-manager"},
+	}}
+	if err := im.SaveBootstrap(statePath, updated); err != nil {
+		t.Fatalf("SaveBootstrap() updated error = %v", err)
+	}
+
+	srv := &Handler{im: imSvc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got struct {
+		Rooms []im.Room `json:"rooms"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got.Rooms) != 1 || got.Rooms[0].ID != "room-1" {
+		t.Fatalf("rooms = %+v, want reloaded room-1", got.Rooms)
+	}
+}
+
+func TestHandleRoomsInviteAliasAddsConversationMembers(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin"},
+				{ID: "manager", Name: "manager"},
+			},
+			Rooms: []im.Room{
+				{
+					ID:      "room-1",
+					Title:   "Room One",
+					Members: []string{"u-admin"},
+				},
+			},
+		}),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/invite", strings.NewReader(`{"room_id":"room-1","inviter_id":"u-admin","user_ids":["manager"],"locale":"en"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got im.Conversation
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "room-1" {
+		t.Fatalf("conversation id = %q, want %q", got.ID, "room-1")
+	}
+	if !containsMember(got.Members, "user-manager") {
+		t.Fatalf("members = %+v, want manager to be invited", got.Members)
+	}
+}
+
+func TestHandleRoomsInviteRequiresRoomID(t *testing.T) {
+	srv := &Handler{im: im.NewService()}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/invite", strings.NewReader(`{"inviter_id":"u-admin","user_ids":["manager"]}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	assertAPIErrorCode(t, rec, http.StatusBadRequest, "room_id_required")
+}
+
+func TestHandleRoomsReturnsConversationList(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-alice", Name: "Alice"},
+			},
+			Rooms: []im.Room{
+				{
+					ID:      "room-1",
+					Title:   "Room One",
+					Members: []string{"u-admin", "u-alice"},
+					Messages: []im.Message{{
+						ID:        "msg-1",
+						SenderID:  "u-admin",
+						Content:   "hello",
+						CreatedAt: time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+					}},
+				},
+			},
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/rooms", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var got []im.Conversation
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "room-1" {
+		t.Fatalf("rooms = %+v, want room-1", got)
+	}
+}
+
+func TestHandleRoomsReloadsIMStateBeforeList(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	initial := im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin", Role: "admin"},
+			{ID: "u-manager", Name: "manager", Role: "manager"},
+		},
+	}
+	if err := im.SaveBootstrap(statePath, initial); err != nil {
+		t.Fatalf("SaveBootstrap() initial error = %v", err)
+	}
+
+	imSvc, err := im.NewServiceFromPath(statePath)
+	if err != nil {
+		t.Fatalf("NewServiceFromPath() error = %v", err)
+	}
+
+	updated := initial
+	updated.Rooms = []im.Room{{
+		ID:       "room-1",
+		Title:    "admin & manager",
+		IsDirect: true,
+		Members:  []string{"u-admin", "u-manager"},
+	}}
+	if err := im.SaveBootstrap(statePath, updated); err != nil {
+		t.Fatalf("SaveBootstrap() updated error = %v", err)
+	}
+
+	srv := &Handler{im: imSvc}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/rooms", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got []im.Conversation
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "room-1" {
+		t.Fatalf("rooms = %+v, want reloaded room-1", got)
+	}
+}
+
+func TestHandleUsersReturnsUserList(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-zed", Name: "Zed"},
+				{ID: "u-alice", Name: "Alice"},
+			},
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/csgclaw/users", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var got []im.User
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 4 || got[0].Name != "admin" || got[1].Name != "Alice" || got[2].Name != "manager" || got[3].Name != "Zed" {
+		t.Fatalf("users = %+v, want admin/Alice/manager/Zed", got)
+	}
+}
+
+func TestHandleUsersCreateProvisionsIMUser(t *testing.T) {
+	bus := im.NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+
+	imSvc := im.NewService()
+	srv := &Handler{
+		im:    imSvc,
+		imBus: bus,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/users", strings.NewReader(`{"id":"u-alice","name":"Alice","role":"worker"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got im.User
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "user-alice" || got.Name != "Alice" || got.Role != "worker" {
+		t.Fatalf("user = %+v, want normalized provisioned user", got)
+	}
+
+	if _, ok := srv.im.User("u-alice"); !ok {
+		t.Fatal("User(u-alice) ok = false, want true after create")
+	}
+	rooms := srv.im.ListRooms()
+	if len(rooms) != 1 || !containsMember(rooms[0].Members, "user-admin") || !containsMember(rooms[0].Members, "user-alice") {
+		t.Fatalf("rooms = %+v, want one bootstrap room with admin and u-alice", rooms)
+	}
+
+	first := mustReceiveIMEvent(t, events)
+	if first.Type != im.EventTypeUserCreated || first.User == nil || first.User.ID != "user-alice" {
+		t.Fatalf("first event = %+v, want user_created for user-alice", first)
+	}
+	second := mustReceiveIMEvent(t, events)
+	if second.Type != im.EventTypeRoomCreated || second.Room == nil || second.Room.ID == "" {
+		t.Fatalf("second event = %+v, want room_created for bootstrap room", second)
+	}
+}
+
+func TestHandleUsersCreateWithParticipantServiceCreatesWorkerAgent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+	previousLocateCodexCLI := locateCodexCLI
+	locateCodexCLI = func() (string, error) { return "", errors.New("not installed") }
+	t.Cleanup(func() { locateCodexCLI = previousLocateCodexCLI })
+
+	agentSvc := mustNewService(t)
+	imSvc := im.NewService()
+	bus := im.NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+
+	participantSvc := participant.NewService(
+		participant.NewMemoryStore(nil),
+		participant.WithAgentEngine(agentengine.New(agentSvc)),
+		participant.WithIMService(imSvc),
+	)
+	srv := &Handler{
+		svc:         agentSvc,
+		participant: participantSvc,
+		im:          imSvc,
+		imBus:       bus, agentEngine: agentengine.New(agentSvc), workspace: agentSvc.Workspace(), agentModels: agentSvc.Models(), agentRuntime: agentSvc,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/users", strings.NewReader(`{"id":"u-qa","name":"qa","role":"qa"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got im.User
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "user-qa" || got.Name != "qa" || got.Role != "worker" {
+		t.Fatalf("user = %+v, want qa worker user", got)
+	}
+	if !strings.HasPrefix(got.Avatar, "avatar/") || !strings.HasSuffix(got.Avatar, ".png") {
+		t.Fatalf("user avatar = %q, want a built-in agent avatar", got.Avatar)
+	}
+
+	created, ok := agentSvc.Agent("agent-qa")
+	if !ok {
+		t.Fatal("Agent(agent-qa) ok = false, want worker agent created with IM user")
+	}
+	if created.Name != "qa" || created.Role != agent.RoleWorker {
+		t.Fatalf("agent = %+v, want qa worker", created)
+	}
+	if created.RuntimeKind != agent.RuntimeKindPicoClawSandbox {
+		t.Fatalf("agent runtime kind = %q, want %q", created.RuntimeKind, agent.RuntimeKindPicoClawSandbox)
+	}
+	if strings.TrimSpace(created.Image) == "" {
+		t.Fatal("agent Image = empty, want default sandbox image")
+	}
+
+	participants := participantSvc.List(participant.ListOptions{Channel: participant.ChannelCSGClaw, Type: participant.TypeAgent})
+	if len(participants) != 1 || participants[0].ID != "pt-qa" || participants[0].AgentID != "agent-qa" || participants[0].ChannelUserRef != "user-qa" {
+		t.Fatalf("participants = %+v, want one qa worker participant", participants)
+	}
+
+	first := mustReceiveIMEvent(t, events)
+	if first.Type != im.EventTypeUserCreated || first.User == nil || first.User.ID != "user-qa" {
+		t.Fatalf("first event = %+v, want user_created for user-qa", first)
+	}
+	second := mustReceiveIMEvent(t, events)
+	if second.Type != im.EventTypeRoomCreated || second.Room == nil || !containsMember(second.Room.Members, "user-qa") {
+		t.Fatalf("second event = %+v, want qa direct room", second)
+	}
+}
+
+func TestHandleUsersCreateReusesExistingWorkerParticipant(t *testing.T) {
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: im.AdminUserID,
+		Users: []im.User{{
+			ID:   im.AdminUserID,
+			Name: "admin",
+			Role: "admin",
+		}, {
+			ID:   "user-dahym7",
+			Name: "qa",
+			Role: "worker",
+		}},
+		Rooms: []im.Room{{
+			ID:       "room-qa",
+			Title:    "qa",
+			Members:  []string{"user-admin", "user-dahym7"},
+			IsDirect: true,
+		}},
+	})
+	participantSvc := participant.NewService(participant.NewMemoryStore([]apitypes.Participant{{
+		ID:              "pt-dahym7",
+		Channel:         participant.ChannelCSGClaw,
+		Type:            participant.TypeAgent,
+		Name:            "qa",
+		ChannelUserRef:  "user-dahym7",
+		ChannelUserKind: participant.ChannelUserKindLocalUserID,
+		AgentID:         "agent-dahym7",
+		LifecycleStatus: participant.LifecycleStatusActive,
+		Mentionable:     true,
+	}}))
+	srv := &Handler{
+		svc:         &agent.Controller{},
+		im:          imSvc,
+		participant: participantSvc, agentEngine: agentengine.New(&agent.Controller{}), workspace: (&agent.Controller{}).Workspace(), agentModels: (&agent.Controller{}).Models(), agentRuntime: &agent.Controller{},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/users", strings.NewReader(`{"id":"user-dahym7","name":"qa","role":"worker"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got im.User
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "user-dahym7" || got.Name != "qa" {
+		t.Fatalf("user = %+v, want existing qa user", got)
+	}
+	rooms := imSvc.ListRooms()
+	if len(rooms) != 1 || rooms[0].ID != "room-qa" || !containsMember(rooms[0].Members, "user-dahym7") {
+		t.Fatalf("rooms = %+v, want existing qa DM preserved", rooms)
+	}
+	participants := participantSvc.List(participant.ListOptions{Channel: participant.ChannelCSGClaw, Type: participant.TypeAgent})
+	if len(participants) != 1 || participants[0].ID != "pt-dahym7" {
+		t.Fatalf("participants = %+v, want existing participant only", participants)
+	}
+}
+
+func TestHandleUsersCreateManagerAgentIDReturnsParticipantUser(t *testing.T) {
+	imSvc := im.NewService()
+	participantSvc := participant.NewService(participant.NewMemoryStore([]apitypes.Participant{{
+		ID:              agent.ManagerParticipantID,
+		Channel:         participant.ChannelCSGClaw,
+		Type:            participant.TypeAgent,
+		Name:            agent.ManagerName,
+		ChannelUserRef:  agent.ManagerParticipantID,
+		ChannelUserKind: participant.ChannelUserKindLocalUserID,
+		AgentID:         agent.ManagerUserID,
+		LifecycleStatus: participant.LifecycleStatusActive,
+		Mentionable:     true,
+	}}))
+	srv := &Handler{
+		im:          imSvc,
+		participant: participantSvc,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/users", strings.NewReader(`{"id":"u-manager","name":"manager","role":"manager"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got im.User
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != im.ManagerUserID || got.Name != agent.ManagerName {
+		t.Fatalf("user = %+v, want existing manager participant user", got)
+	}
+	if _, ok := imSvc.User(im.ManagerUserID); !ok {
+		t.Fatalf("manager user %q missing after create", agent.ManagerUserID)
+	}
+}
+
+func TestHandleCreateRoomResolvesManagerAgentIDToParticipantUser(t *testing.T) {
+	imSvc := im.NewService()
+	participantSvc := participant.NewService(participant.NewMemoryStore([]apitypes.Participant{{
+		ID:              agent.ManagerParticipantID,
+		Channel:         participant.ChannelCSGClaw,
+		Type:            participant.TypeAgent,
+		Name:            agent.ManagerName,
+		ChannelUserRef:  agent.ManagerParticipantID,
+		ChannelUserKind: participant.ChannelUserKindLocalUserID,
+		AgentID:         agent.ManagerUserID,
+		LifecycleStatus: participant.LifecycleStatusActive,
+		Mentionable:     true,
+	}}))
+	srv := &Handler{
+		im:          imSvc,
+		participant: participantSvc,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/rooms", strings.NewReader(`{"title":"manager dm","creator_id":"u-admin","member_ids":["u-manager"]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got im.Room
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !containsMember(got.Members, im.ManagerUserID) || containsMember(got.Members, agent.ManagerUserID) {
+		t.Fatalf("room members = %+v, want manager IM user only", got.Members)
+	}
+}
+
+func TestHandleUsersCreateRejectsMissingID(t *testing.T) {
+	srv := &Handler{im: im.NewService()}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/users", strings.NewReader(`{"name":"Alice"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func mustReceiveIMEvent(t *testing.T, events <-chan im.Event) im.Event {
+	t.Helper()
+	select {
+	case evt := <-events:
+		return evt
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for IM event")
+		return im.Event{}
+	}
+}
+
+func mustReceiveIMEventWithin(t *testing.T, events <-chan im.Event, timeout time.Duration) im.Event {
+	t.Helper()
+	select {
+	case evt := <-events:
+		return evt
+	case <-time.After(timeout):
+		t.Fatalf("timed out waiting for IM event after %s", timeout)
+		return im.Event{}
+	}
+}
+
+func TestHandleMessagesReturnsConversationMessages(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Rooms: []im.Room{
+				{
+					ID:      "room-1",
+					Title:   "Room One",
+					Members: []string{"u-admin", "u-manager"},
+					Messages: []im.Message{{
+						ID:        "msg-1",
+						SenderID:  "u-admin",
+						Content:   "hello",
+						CreatedAt: time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+					}},
+				},
+			},
+		}),
+	}
+
+	for _, path := range []string{
+		"/api/v1/messages?room_id=room-1",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("path %s status = %d, want %d; body=%s", path, rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var got []im.Message
+		if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+			t.Fatalf("path %s decode response: %v", path, err)
+		}
+		if len(got) != 1 || got[0].ID != "msg-1" {
+			t.Fatalf("path %s messages = %+v, want msg-1", path, got)
+		}
+	}
+}
+
+func TestHandleMessagesRejectsInvalidQuery(t *testing.T) {
+	srv := &Handler{im: im.NewService()}
+
+	for _, path := range []string{
+		"/api/v1/messages",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("path %s status = %d, want %d", path, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+func TestHandleMessagesPostCreatesMessage(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin"},
+				{ID: "manager", Name: "manager"},
+			},
+			Rooms: []im.Room{
+				{
+					ID:      "room-1",
+					Title:   "Room One",
+					Members: []string{"u-admin", "manager"},
+				},
+			},
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/messages", strings.NewReader(`{"room_id":"room-1","sender_id":"u-admin","content":"hello @manager"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.SenderID != "user-admin" || got.Content != "hello @manager" {
+		t.Fatalf("message = %+v, want sender/content populated", got)
+	}
+	if len(got.Mentions) != 1 || got.Mentions[0].ID != "user-manager" || got.Mentions[0].Name != "manager" {
+		t.Fatalf("mentions = %+v, want manager", got.Mentions)
+	}
+}
+
+func TestHandleMessagesPostDeduplicatesClientMessageID(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users:         []im.User{{ID: "u-admin", Name: "admin"}},
+			Rooms:         []im.Room{{ID: "room-1", Title: "Room One", Members: []string{"u-admin"}}},
+		}),
+	}
+	body := `{"room_id":"room-1","sender_id":"u-admin","content":"send once","client_message_id":"client-1"}`
+	var ids []string
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/messages", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+		}
+		var got im.Message
+		if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		ids = append(ids, got.ID)
+	}
+	if ids[0] != ids[1] {
+		t.Fatalf("message ids = %v, want the same id for duplicate requests", ids)
+	}
+	messages, err := srv.im.ListMessages("room-1")
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("messages = %d, want one idempotent message", len(messages))
+	}
+}
+
+func TestHandleMessagesPostNormalizesCanonicalSlashCommand(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin"},
+				{ID: "u-manager", Name: "manager"},
+			},
+			Rooms: []im.Room{{ID: "room-1", Title: "Room One", Members: []string{"u-admin", "u-manager"}}},
+		}),
+	}
+
+	body := `{"room_id":"room-1","sender_id":"u-admin","content":"  <slash-command arg=\"skill-creator\" name=\"use-skill\"/>  create & review <safely>  "}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	want := `<slash-command name="use-skill" arg="skill-creator"></slash-command> create & review <safely>`
+	if got.Content != want {
+		t.Fatalf("content = %q, want canonical slash command %q", got.Content, want)
+	}
+}
+
+func TestHandleMessagesPostRejectsMalformedSlashCommand(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users:         []im.User{{ID: "u-admin", Name: "admin"}},
+			Rooms:         []im.Room{{ID: "room-1", Title: "Room One", Members: []string{"u-admin"}}},
+		}),
+	}
+
+	body := `{"room_id":"room-1","sender_id":"u-admin","content":"<slash-command name=\"\"></slash-command> body"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestHandleMessagesPostKeepsLegacySlashTextAsPlainContent(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users:         []im.User{{ID: "u-admin", Name: "admin"}},
+			Rooms:         []im.Room{{ID: "room-1", Title: "Room One", Members: []string{"u-admin"}}},
+		}),
+	}
+
+	body := `{"room_id":"room-1","sender_id":"u-admin","content":"/skill-creator create a review skill"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Content != "/skill-creator create a review skill" {
+		t.Fatalf("content = %q, want legacy slash text kept as plain content", got.Content)
+	}
+}
+
+func TestHandleThreadRoutesAndMessageFiltering(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin"},
+				{ID: "manager", Name: "manager"},
+			},
+			Rooms: []im.Room{
+				{
+					ID:      "room-1",
+					Title:   "Room One",
+					Members: []string{"u-admin", "manager"},
+					Messages: []im.Message{
+						{ID: "msg-1", SenderID: "u-admin", Content: "before", CreatedAt: time.Date(2026, 5, 20, 9, 0, 0, 0, time.UTC)},
+						{ID: "msg-root", SenderID: "u-admin", Content: "root", CreatedAt: time.Date(2026, 5, 20, 9, 1, 0, 0, time.UTC)},
+						{ID: "msg-2", SenderID: "manager", Content: "after", CreatedAt: time.Date(2026, 5, 20, 9, 2, 0, 0, time.UTC)},
+					},
+				},
+			},
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/room-1/threads", strings.NewReader(`{"root_message_id":"msg-root"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("start thread status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var started im.ThreadView
+	if err := json.NewDecoder(rec.Body).Decode(&started); err != nil {
+		t.Fatalf("decode start thread response: %v", err)
+	}
+	if started.Root.ID != "msg-root" || len(started.Context) != 3 {
+		t.Fatalf("started thread = %+v, want root with context", started)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/messages", strings.NewReader(`{"room_id":"room-1","sender_id":"manager","content":"thread reply","relates_to":{"rel_type":"m.thread","event_id":"msg-root"}}`))
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("reply status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var reply im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&reply); err != nil {
+		t.Fatalf("decode reply response: %v", err)
+	}
+	if reply.RelatesTo == nil || reply.RelatesTo.EventID != "msg-root" {
+		t.Fatalf("reply.RelatesTo = %+v, want thread root", reply.RelatesTo)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/messages?room_id=room-1", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var timeline []im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&timeline); err != nil {
+		t.Fatalf("decode timeline: %v", err)
+	}
+	if containsAPIMessageID(timeline, reply.ID) {
+		t.Fatalf("timeline = %+v, want thread reply hidden by default", timeline)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/rooms", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rooms status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var rooms []im.Room
+	if err := json.NewDecoder(rec.Body).Decode(&rooms); err != nil {
+		t.Fatalf("decode rooms: %v", err)
+	}
+	if len(rooms) != 1 || containsAPIMessageID(rooms[0].Messages, reply.ID) {
+		t.Fatalf("rooms = %+v, want thread reply hidden by default", rooms)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bootstrap status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var bootstrap struct {
+		Rooms []im.Room `json:"rooms"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&bootstrap); err != nil {
+		t.Fatalf("decode bootstrap: %v", err)
+	}
+	if len(bootstrap.Rooms) != 1 || containsAPIMessageID(bootstrap.Rooms[0].Messages, reply.ID) {
+		t.Fatalf("bootstrap rooms = %+v, want thread reply hidden by default", bootstrap.Rooms)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/messages?room_id=room-1&include_thread_replies=true", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list include status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var fullTimeline []im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&fullTimeline); err != nil {
+		t.Fatalf("decode full timeline: %v", err)
+	}
+	if !containsAPIMessageID(fullTimeline, reply.ID) {
+		t.Fatalf("full timeline = %+v, want thread reply included", fullTimeline)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/rooms/room-1/threads/msg-root", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get thread status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var gotThread im.ThreadView
+	if err := json.NewDecoder(rec.Body).Decode(&gotThread); err != nil {
+		t.Fatalf("decode get thread: %v", err)
+	}
+	if len(gotThread.Replies) != 1 || gotThread.Replies[0].ID != reply.ID {
+		t.Fatalf("thread replies = %+v, want reply %s", gotThread.Replies, reply.ID)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/rooms/room-1/relations/msg-root/m.thread", nil)
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("relations status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var relations im.ThreadRelationsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&relations); err != nil {
+		t.Fatalf("decode relations: %v", err)
+	}
+	if len(relations.Chunk) != 1 || relations.Chunk[0].ID != reply.ID {
+		t.Fatalf("relations = %+v, want reply %s", relations, reply.ID)
+	}
+}
+
+func TestHandleThreadEventsPublishCreatedAndUpdated(t *testing.T) {
+	bus := im.NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+	srv := &Handler{
+		im: im.NewServiceFromBootstrapWithBus(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin"},
+				{ID: "manager", Name: "manager"},
+			},
+			Rooms: []im.Room{
+				{
+					ID:       "room-1",
+					Title:    "Room One",
+					Members:  []string{"u-admin", "manager"},
+					Messages: []im.Message{{ID: "msg-root", SenderID: "u-admin", Content: "root", CreatedAt: time.Date(2026, 5, 20, 9, 0, 0, 0, time.UTC)}},
+				},
+			},
+		}, bus),
+		imBus: bus,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/room-1/threads", strings.NewReader(`{"root_message_id":"msg-root"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("start thread status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	created := mustReceiveIMEvent(t, events)
+	if created.Type != im.EventTypeThreadCreated || created.Thread == nil || created.Thread.Root.ID != "msg-root" {
+		t.Fatalf("created event = %+v, want thread.created for msg-root", created)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/messages", strings.NewReader(`{"room_id":"room-1","sender_id":"manager","content":"thread reply","relates_to":{"rel_type":"m.thread","event_id":"msg-root"}}`))
+	rec = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("reply status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	messageCreated := mustReceiveIMEvent(t, events)
+	if messageCreated.Type != im.EventTypeMessageCreated || messageCreated.Message == nil || messageCreated.Message.RelatesTo == nil {
+		t.Fatalf("message event = %+v, want threaded message.created", messageCreated)
+	}
+	threadUpdated := mustReceiveIMEvent(t, events)
+	if threadUpdated.Type != im.EventTypeThreadUpdated || threadUpdated.Thread == nil || threadUpdated.Thread.Summary.ReplyCount != 1 {
+		t.Fatalf("thread updated event = %+v, want one reply", threadUpdated)
+	}
+}
+
+func TestHandleMessagesPostPrefixesMentionID(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin"},
+				{ID: "u-dev", Name: "dev"},
+				{ID: "u-manager", Name: "manager"},
+			},
+			Rooms: []im.Room{
+				{
+					ID:      "room-1",
+					Title:   "Room One",
+					Members: []string{"u-admin", "u-dev", "u-manager"},
+				},
+			},
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/messages", strings.NewReader(`{"room_id":"room-1","sender_id":"u-admin","content":"hi","mention_id":"u-dev"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Content != `<at user_id="user-dev">dev</at> hi` {
+		t.Fatalf(`content = %q, want <at user_id="user-dev">dev</at> hi`, got.Content)
+	}
+	if len(got.Mentions) != 1 || got.Mentions[0].ID != "user-dev" || got.Mentions[0].Name != "dev" {
+		t.Fatalf("mentions = %+v, want u-dev", got.Mentions)
+	}
+}
+
+func TestHandleFeishuMessagesPostSendsMessage(t *testing.T) {
+	feishuSvc := feishu.NewServiceWithSendMessage(
+		map[string]feishu.AppConfig{"agent-manager": {AppID: "cli_manager", AppSecret: "manager-secret"}},
+		func(_ context.Context, _ feishu.AppConfig, req feishu.SendMessageRequest) (feishu.SendMessageResponse, error) {
+			if req.ChatID != "oc_alpha" || req.Content != "hello" {
+				t.Fatalf("send request = %+v, want chat/content", req)
+			}
+			return feishu.SendMessageResponse{MessageID: "om_1", SenderOpenID: "ou_manager"}, nil
+		},
+	)
+	srv := &Handler{feishu: feishuSvc}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/feishu/messages", strings.NewReader(`{"room_id":"oc_alpha","sender_id":"u-manager","content":"hello"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ID != "om_1" || got.SenderID != "ou_manager" || got.Content != "hello" {
+		t.Fatalf("message = %+v, want feishu message response", got)
+	}
+}
+
+func TestHandleFeishuMessagesPostKeepsCanonicalSlashCommandAsPlainMessage(t *testing.T) {
+	wantContent := `<slash-command arg="skill-creator" name="use-skill"/> create & review`
+	feishuSvc := feishu.NewServiceWithSendMessage(
+		map[string]feishu.AppConfig{"agent-manager": {AppID: "cli_manager", AppSecret: "manager-secret"}},
+		func(_ context.Context, _ feishu.AppConfig, req feishu.SendMessageRequest) (feishu.SendMessageResponse, error) {
+			if req.ChatID != "oc_alpha" || req.Content != wantContent {
+				t.Fatalf("send request = %+v, want chat/content %q", req, wantContent)
+			}
+			return feishu.SendMessageResponse{MessageID: "om_1", SenderOpenID: "ou_manager"}, nil
+		},
+	)
+	srv := &Handler{feishu: feishuSvc}
+
+	body := `{"room_id":"oc_alpha","sender_id":"u-manager","content":"<slash-command arg=\"skill-creator\" name=\"use-skill\"/> create & review"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/feishu/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Content != wantContent {
+		t.Fatalf("content = %q, want %q", got.Content, wantContent)
+	}
+}
+
+func TestHandleFeishuMessagesPostKeepsSlashShorthandAsPlainMessage(t *testing.T) {
+	wantContent := `/skill-creator create & review`
+	feishuSvc := feishu.NewServiceWithSendMessage(
+		map[string]feishu.AppConfig{"agent-manager": {AppID: "cli_manager", AppSecret: "manager-secret"}},
+		func(_ context.Context, _ feishu.AppConfig, req feishu.SendMessageRequest) (feishu.SendMessageResponse, error) {
+			if req.ChatID != "oc_alpha" || req.Content != wantContent {
+				t.Fatalf("send request = %+v, want chat/content %q", req, wantContent)
+			}
+			return feishu.SendMessageResponse{MessageID: "om_1", SenderOpenID: "ou_manager"}, nil
+		},
+	)
+	srv := &Handler{feishu: feishuSvc}
+
+	body := `{"room_id":"oc_alpha","sender_id":"u-manager","content":"/skill-creator create & review"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/feishu/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var got im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Content != wantContent {
+		t.Fatalf("content = %q, want %q", got.Content, wantContent)
+	}
+}
+
+func TestHandleFeishuMessagesGetListsRoomMessages(t *testing.T) {
+	feishuSvc := feishu.NewServiceWithCreateChatAndListRoomMessages(
+		map[string]feishu.AppConfig{"agent-manager": {AppID: "cli_manager", AppSecret: "manager-secret", AdminOpenID: "ou_admin"}},
+		func(_ context.Context, _ feishu.AppConfig, req feishu.CreateChatRequest) (feishu.CreateChatResponse, error) {
+			return feishu.CreateChatResponse{ChatID: "oc_alpha", Name: req.Title}, nil
+		},
+		func(_ context.Context, _ feishu.AppConfig, roomID string) ([]im.Message, error) {
+			if roomID != "oc_alpha" {
+				t.Fatalf("room_id = %q, want oc_alpha", roomID)
+			}
+			return []im.Message{{ID: "om_1", SenderID: "ou_manager", Content: "hello", CreatedAt: time.Unix(1, 0).UTC()}}, nil
+		},
+	)
+	feishuSvc.SetBotOpenIDResolver(testFeishuBotInfoResolver(t, map[string]string{"cli_manager": "ou_manager"}))
+	if _, err := feishuSvc.CreateRoom(im.CreateRoomRequest{Title: "alpha", CreatorID: "u-manager"}); err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	srv := &Handler{feishu: feishuSvc}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/feishu/messages?room_id=oc_alpha", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var got []im.Message
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "om_1" || got[0].SenderID != "agent-manager" {
+		t.Fatalf("messages = %+v, want listed feishu messages with bot ids", got)
+	}
+}
+
+func TestHandleFeishuEventsStreamsMessageBusEvents(t *testing.T) {
+	feishuSvc := feishu.NewService()
+	srv := &Handler{feishu: feishuSvc, serverAccessToken: "secret"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/feishu/participants/u-manager/events", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		srv.Routes().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	feishuSvc.MessageBus().Publish(feishu.MessageEvent{
+		Type:   feishu.MessageEventTypeMessageCreated,
+		RoomID: "oc_ignored",
+		Message: &im.Message{
+			ID:       "om_ignored",
+			SenderID: "ou_manager",
+			Content:  "hello @worker",
+			Mentions: []im.Mention{{ID: "u-worker"}},
+		},
+	})
+	feishuSvc.MessageBus().Publish(feishu.MessageEvent{
+		Type:         feishu.MessageEventTypeMessageCreated,
+		RoomID:       "oc_alpha",
+		MentionBotID: "u-manager",
+		Message: &im.Message{
+			ID:       "om_1",
+			SenderID: "ou_manager",
+			Content:  "/custom do this",
+			Mentions: []im.Mention{{ID: "u-manager"}},
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"type":"message.created"`) {
+		t.Fatalf("body = %q, want message.created event", body)
+	}
+	if !strings.Contains(body, `"room_id":"oc_alpha"`) {
+		t.Fatalf("body = %q, want room_id", body)
+	}
+	if !strings.Contains(body, `"mention_bot_id":"u-manager"`) {
+		t.Fatalf("body = %q, want mentioned bot bridge metadata", body)
+	}
+	if strings.Contains(body, "om_ignored") || strings.Contains(body, "oc_ignored") {
+		t.Fatalf("body = %q, want only u-manager events", body)
+	}
+	if !strings.Contains(body, `"id":"om_1"`) {
+		t.Fatalf("body = %q, want message id", body)
+	}
+	if !strings.Contains(body, `"content":"/custom do this"`) {
+		t.Fatalf("body = %q, want original slash invocation content", body)
+	}
+	if strings.Contains(body, "agent_content") || strings.Contains(body, "Follow custom rules") {
+		t.Fatalf("body = %q, want no hidden skill payload", body)
+	}
+}
+
+func TestHandleFeishuEventsSendsHeartbeat(t *testing.T) {
+	oldInterval := sseHeartbeatInterval
+	sseHeartbeatInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		sseHeartbeatInterval = oldInterval
+	})
+
+	feishuSvc := feishu.NewService()
+	srv := &Handler{feishu: feishuSvc, serverAccessToken: "secret"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/feishu/participants/u-manager/events", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		srv.Routes().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+
+	if body := rec.Body.String(); !strings.Contains(body, ": ping\n\n") {
+		t.Fatalf("body = %q, want heartbeat ping", body)
+	}
+}
+
+func TestHandleFeishuEventsRequiresAuthorization(t *testing.T) {
+	srv := &Handler{
+		feishu:            feishu.NewService(),
+		serverAccessToken: "secret",
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/feishu/participants/u-manager/events", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHandleFeishuEventsRequiresAuthorizationWhenServerAccessTokenEmpty(t *testing.T) {
+	srv := &Handler{}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/feishu/participants/u-manager/events", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHandleFeishuEventsSkipsAuthorizationWhenNoAuth(t *testing.T) {
+	srv := &Handler{serverNoAuth: true}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/feishu/participants/u-manager/events", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("status = %d, want non-unauthorized when no_auth is true", rec.Code)
+	}
+}
+
+func TestHandleMessagesPostRequiresRoomID(t *testing.T) {
+	srv := &Handler{im: im.NewService()}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/messages", strings.NewReader(`{"sender_id":"u-admin","content":"hello"}`))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	assertAPIErrorCode(t, rec, http.StatusBadRequest, "room_id_required")
+}
+
+func TestHandleIMEventsExposeRoomIDOnly(t *testing.T) {
+	bus := im.NewBus()
+	srv := &Handler{imBus: bus}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		srv.Routes().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	bus.Publish(im.Event{
+		Type:   im.EventTypeMessageCreated,
+		RoomID: "room-1",
+		Message: &im.Message{
+			ID:       "msg-1",
+			SenderID: "u-admin",
+			Content:  "hello",
+		},
+		Sender: &im.User{ID: "u-admin", Name: "admin"},
+	})
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"room_id":"room-1"`) {
+		t.Fatalf("body = %q, want room_id", body)
+	}
+	if strings.Contains(body, `"conversation_id"`) {
+		t.Fatalf("body = %q, want no conversation_id compatibility field", body)
+	}
+}
+
+func TestHandleIMEventsExposeTeamPayload(t *testing.T) {
+	bus := im.NewBus()
+	srv := &Handler{imBus: bus}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		srv.Routes().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	bus.Publish(im.Event{
+		Type:   im.EventTypeTeamCreated,
+		TeamID: "team-1",
+		Team: &apitypes.Team{
+			ID:    "team-1",
+			Title: "Weather team",
+		},
+	})
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"type":"team.created"`) || !strings.Contains(body, `"team_id":"team-1"`) || !strings.Contains(body, `"title":"Weather team"`) {
+		t.Fatalf("body = %q, want team.created payload", body)
+	}
+}
+
+func TestHandleRoomsPostCreatesRoom(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin"},
+				{ID: "u-alice", Name: "Alice"},
+				{ID: "manager", Name: "manager"},
+			},
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"title":"Launch","description":"coordination","creator_id":"u-admin","member_ids":["u-alice","manager"],"locale":"en"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got im.Conversation
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Title != "Launch" {
+		t.Fatalf("conversation.Title = %q, want Launch", got.Title)
+	}
+	if !containsMember(got.Members, "user-admin") || !containsMember(got.Members, "user-alice") || !containsMember(got.Members, "user-manager") {
+		t.Fatalf("members = %+v, want admin, alice, and manager", got.Members)
+	}
+}
+
+func TestHandleRoomsPostUsesCsgclawChannelAdapter(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin"},
+				{ID: "u-alice", Name: "Alice"},
+			},
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"title":"Launch","creator_id":" u-admin ","member_ids":[" u-alice "]}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got im.Room
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !containsMember(got.Members, "user-admin") || !containsMember(got.Members, "user-alice") {
+		t.Fatalf("members = %+v, want trimmed bot IDs", got.Members)
+	}
+}
+
+func TestHandleRoomsPatchRejectsNotifyAllForGroupRoom(t *testing.T) {
+	svc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "u-alice", Name: "Alice"},
+		},
+		Rooms: []im.Room{{
+			ID:      "room-1",
+			Title:   "Launch",
+			Members: []string{"u-admin", "u-alice"},
+		}},
+	})
+	srv := &Handler{im: svc}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/rooms/room-1", strings.NewReader(`{"notify_all_agents":true}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestHandleUsersDeleteRemovesUser(t *testing.T) {
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Users: []im.User{
+				{ID: "u-admin", Name: "admin", IsOnline: true},
+				{ID: "u-alice", Name: "Alice", IsOnline: true},
+			},
+			Rooms: []im.Room{
+				{
+					ID:       "room-1",
+					Title:    "Room One",
+					Members:  []string{"u-admin", "u-alice"},
+					Messages: []im.Message{{ID: "msg-1", SenderID: "u-alice", Content: "hello"}},
+				},
+			},
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/channels/csgclaw/users/u-alice", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if _, ok := srv.im.User("u-alice"); ok {
+		t.Fatal("User() ok = true, want false after delete")
+	}
+	if _, ok := srv.im.Room("room-1"); ok {
+		t.Fatal("Room() ok = true, want false for DM after deleted user")
+	}
+}
+
+func TestHandleUsersDeleteCurrentUserReturnsConflict(t *testing.T) {
+	srv := &Handler{im: im.NewService()}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/channels/csgclaw/users/u-admin", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+}
+
+func TestHandleFeishuUsersDeleteRemovesUser(t *testing.T) {
+	srv := &Handler{
+		feishu: feishu.NewService(),
+	}
+	if _, err := srv.feishu.CreateUser(feishu.CreateUserRequest{ID: "ou-alice", Name: "Alice"}); err != nil {
+		t.Fatalf("CreateUser() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/channels/feishu/users/ou-alice", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if containsUser(srv.feishu.ListUsers(), "ou-alice") {
+		t.Fatal("containsUser() = true, want false after delete")
+	}
+}
+
+func TestHandleRoomsDeleteRemovesRoom(t *testing.T) {
+	bus := im.NewBus()
+	events, cancel := bus.Subscribe()
+	defer cancel()
+
+	srv := &Handler{
+		im: im.NewServiceFromBootstrap(im.Bootstrap{
+			CurrentUserID: "u-admin",
+			Rooms: []im.Room{
+				{ID: "room-1", Title: "Room One", Members: []string{"u-admin", "u-manager"}},
+			},
+		}),
+		imBus: bus,
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/rooms/room-1", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if _, ok := srv.im.Room("room-1"); ok {
+		t.Fatal("Room() ok = true, want false after delete")
+	}
+	event := mustReceiveIMEvent(t, events)
+	if event.Type != im.EventTypeRoomDeleted || event.RoomID != "room-1" || event.Room == nil || event.Room.ID != "room-1" {
+		t.Fatalf("event = %+v, want room.deleted for room-1", event)
+	}
+}
+
+func TestHandleFeishuRoomsDeleteRemovesRoom(t *testing.T) {
+	deleted := make([]string, 0, 1)
+	srv := &Handler{
+		feishu: feishu.NewServiceWithDeleteChat(
+			map[string]feishu.AppConfig{"agent-manager": {AppID: "cli_manager", AppSecret: "manager-secret", AdminOpenID: "ou_admin"}},
+			func(_ context.Context, _ feishu.AppConfig, roomID string) error {
+				deleted = append(deleted, roomID)
+				return nil
+			},
+		),
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/channels/feishu/rooms/oc_alpha", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if len(deleted) != 1 || deleted[0] != "oc_alpha" {
+		t.Fatalf("deleted = %+v, want [oc_alpha]", deleted)
+	}
+}
+
+func TestHandleParticipantMessageRouteRequiresAuthorization(t *testing.T) {
+	srv := &Handler{
+		im:                im.NewService(),
+		participantBridge: im.NewParticipantBridge("secret"),
+		serverAccessToken: "secret",
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/u-manager/messages", strings.NewReader(`{"room_id":"room-1","text":"hello"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHandleParticipantMessageRouteRequiresAuthorizationWhenServerAccessTokenEmpty(t *testing.T) {
+	srv := &Handler{
+		participantBridge: im.NewParticipantBridge("secret"),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/u-manager/messages", strings.NewReader(`{"room_id":"room-1","text":"hello"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHandleParticipantMessageRouteSkipsAuthorizationWhenNoAuth(t *testing.T) {
+	srv := &Handler{
+		participantBridge: im.NewParticipantBridge("secret"),
+		serverNoAuth:      true,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/u-manager/messages", strings.NewReader(`{"room_id":"room-1","text":"hello"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("status = %d, want non-unauthorized when no_auth is true", rec.Code)
+	}
+}
+
+func TestHandleBotSendMessageRequiresIMService(t *testing.T) {
+	srv := &Handler{
+		participantBridge: im.NewParticipantBridge(""),
+		serverNoAuth:      true,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/u-manager/messages", strings.NewReader(`{"room_id":"room-1","text":"hello"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+}
+
+func TestHandleBotSendMessageDoesNotInferRecentThreadScope(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{ID: "msg-root", SenderID: "manager", Content: "How can I help?", CreatedAt: now},
+				},
+			},
+		},
+	})
+	if _, _, err := imSvc.StartThread(im.StartThreadRequest{RoomID: "room-1", RootMessageID: "msg-root"}); err != nil {
+		t.Fatalf("StartThread() error = %v", err)
+	}
+	inbound, err := imSvc.CreateMessage(im.CreateMessageRequest{
+		RoomID:   "room-1",
+		SenderID: "u-admin",
+		Content:  "thread question",
+		RelatesTo: &im.MessageRelation{
+			RelType: im.RelationTypeThread,
+			EventID: "msg-root",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage(thread question) error = %v", err)
+	}
+	room, ok := imSvc.Room("room-1")
+	if !ok {
+		t.Fatal("Room(room-1) = false, want room")
+	}
+	sender, ok := imSvc.User("u-admin")
+	if !ok {
+		t.Fatal("User(u-admin) = false, want user")
+	}
+	bridge := im.NewParticipantBridge("")
+	events, cancel := bridge.Subscribe("manager")
+	defer cancel()
+	bridge.PublishMessageEvent(room, sender, inbound)
+	select {
+	case evt := <-events:
+		if evt.ThreadRootID != "msg-root" {
+			t.Fatalf("bot event ThreadRootID = %q, want msg-root", evt.ThreadRootID)
+		}
+		bridge.Ack("manager", evt.MessageID)
+	case <-time.After(time.Second):
+		t.Fatal("PublishMessageEvent() timed out waiting for threaded event")
+	}
+
+	srv := &Handler{im: imSvc, participantBridge: bridge, serverNoAuth: true}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/manager/messages", strings.NewReader(`{"room_id":"room-1","text":"thread answer"}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var sent struct {
+		MessageID string `json:"message_id"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&sent); err != nil {
+		t.Fatalf("decode send response: %v", err)
+	}
+	messages, err := imSvc.ListMessagesWithOptions("room-1", im.ListMessagesOptions{IncludeThreadReplies: true})
+	if err != nil {
+		t.Fatalf("ListMessagesWithOptions() error = %v", err)
+	}
+	var reply im.Message
+	for _, message := range messages {
+		if message.ID == sent.MessageID {
+			reply = message
+			break
+		}
+	}
+	if reply.ID == "" {
+		t.Fatalf("sent message %q not found in room messages", sent.MessageID)
+	}
+	if reply.RelatesTo != nil {
+		t.Fatalf("reply.RelatesTo = %+v, want nil when bot send omits explicit thread/topic", reply.RelatesTo)
+	}
+}
+
+func TestHandleParticipantSendMessagePreservesMetadata(t *testing.T) {
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{{
+			ID:       "room-1",
+			IsDirect: true,
+			Members:  []string{"u-admin", "manager"},
+		}},
+	})
+
+	srv := &Handler{im: imSvc, participantBridge: im.NewParticipantBridge(""), serverNoAuth: true}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/manager/messages", strings.NewReader(`{
+		"room_id": "room-1",
+		"text": "Read: from README.md",
+		"metadata": {
+			"codex": {
+				"delivery_kind": "tool",
+				"request_id": "msg-user",
+				"source_message_id": "msg-user",
+				"payload_flags": {"reasoning": true}
+			},
+			"openclaw": {
+				"delivery_kind": "tool",
+				"request_id": "msg-user",
+				"source_message_id": "msg-user",
+				"payload_flags": {"reasoning": true}
+			}
+		}
+	}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var sent struct {
+		MessageID string `json:"message_id"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&sent); err != nil {
+		t.Fatalf("decode send response: %v", err)
+	}
+	messages, err := imSvc.ListMessagesWithOptions("room-1", im.ListMessagesOptions{IncludeThreadReplies: true})
+	if err != nil {
+		t.Fatalf("ListMessagesWithOptions() error = %v", err)
+	}
+	var reply im.Message
+	for _, message := range messages {
+		if message.ID == sent.MessageID {
+			reply = message
+			break
+		}
+	}
+	if reply.ID == "" {
+		t.Fatalf("sent message %q not found in room messages", sent.MessageID)
+	}
+	openclaw, ok := reply.Metadata["openclaw"].(map[string]any)
+	if !ok {
+		t.Fatalf("reply.Metadata = %#v, want openclaw object", reply.Metadata)
+	}
+	if openclaw["delivery_kind"] != "tool" || openclaw["request_id"] != "msg-user" {
+		t.Fatalf("openclaw metadata = %#v, want tool delivery for msg-user", openclaw)
+	}
+	codex, ok := reply.Metadata["codex"].(map[string]any)
+	if !ok || codex["delivery_kind"] != "tool" || codex["request_id"] != "msg-user" {
+		t.Fatalf("codex metadata = %#v, want tool delivery for msg-user", reply.Metadata["codex"])
+	}
+	flags, ok := openclaw["payload_flags"].(map[string]any)
+	if !ok || flags["reasoning"] != true {
+		t.Fatalf("payload_flags = %#v, want reasoning=true", openclaw["payload_flags"])
+	}
+}
+
+func TestHandleBotSendMessageAcceptsPicoClawThreadContext(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{ID: "msg-root", SenderID: "manager", Content: "How can I help?", CreatedAt: now},
+				},
+			},
+		},
+	})
+	if _, _, err := imSvc.StartThread(im.StartThreadRequest{RoomID: "room-1", RootMessageID: "msg-root"}); err != nil {
+		t.Fatalf("StartThread() error = %v", err)
+	}
+
+	srv := &Handler{im: imSvc, participantBridge: im.NewParticipantBridge(""), serverNoAuth: true}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/manager/messages", strings.NewReader(`{
+		"chat_id": "room-1",
+		"content": "direct PicoClaw thread answer",
+		"context": {
+			"channel": "csgclaw",
+			"chat_id": "room-1",
+			"chat_type": "direct",
+			"topic_id": "msg-root"
+		}
+	}`))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var sent struct {
+		MessageID string `json:"message_id"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&sent); err != nil {
+		t.Fatalf("decode send response: %v", err)
+	}
+	messages, err := imSvc.ListMessagesWithOptions("room-1", im.ListMessagesOptions{IncludeThreadReplies: true})
+	if err != nil {
+		t.Fatalf("ListMessagesWithOptions() error = %v", err)
+	}
+	var reply im.Message
+	for _, message := range messages {
+		if message.ID == sent.MessageID {
+			reply = message
+			break
+		}
+	}
+	if reply.ID == "" {
+		t.Fatalf("sent message %q not found in room messages", sent.MessageID)
+	}
+	if reply.Content != "direct PicoClaw thread answer" {
+		t.Fatalf("reply.Content = %q, want direct PicoClaw thread answer", reply.Content)
+	}
+	if reply.RelatesTo == nil || reply.RelatesTo.RelType != im.RelationTypeThread || reply.RelatesTo.EventID != "msg-root" {
+		t.Fatalf("reply.RelatesTo = %+v, want m.thread -> msg-root", reply.RelatesTo)
+	}
+}
+
+func TestHandleParticipantSendMessageReplacementRefreshesThreadRootSummary(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{{ID: "msg-user", SenderID: "u-admin", Content: "run it", CreatedAt: now}},
+			},
+		},
+	})
+	srv := &Handler{im: imSvc, participantBridge: im.NewParticipantBridge(""), serverNoAuth: true}
+	send := func(t *testing.T, body string) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/manager/messages", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var sent struct {
+			MessageID string `json:"message_id"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&sent); err != nil {
+			t.Fatalf("decode send response: %v", err)
+		}
+		return sent.MessageID
+	}
+
+	rootID := send(t, `{"room_id":"room-1","message_id":"assistant-turn-1","text":"\u200b"}`)
+	send(t, `{"room_id":"room-1","message_id":"assistant-turn-1-tool-1","thread_root_id":"assistant-turn-1","text":"tool activity"}`)
+	finalID := send(t, `{"room_id":"room-1","message_id":"assistant-turn-1","text":"final answer"}`)
+	if rootID != "assistant-turn-1" || finalID != rootID {
+		t.Fatalf("root/final message ids = %q / %q, want assistant-turn-1", rootID, finalID)
+	}
+
+	timeline, err := imSvc.ListMessages("room-1")
+	if err != nil {
+		t.Fatalf("ListMessages() error = %v", err)
+	}
+	var root im.Message
+	for _, message := range timeline {
+		if message.ID == "assistant-turn-1-tool-1" {
+			t.Fatalf("timeline = %+v, want tool reply hidden from top-level messages", timeline)
+		}
+		if message.ID == rootID {
+			root = message
+		}
+	}
+	if root.Content != "final answer" {
+		t.Fatalf("root.Content = %q, want final answer", root.Content)
+	}
+	if root.Thread == nil || root.Thread.Context.RootExcerpt != "final answer" || root.Thread.ReplyCount != 1 {
+		t.Fatalf("root.Thread = %+v, want refreshed summary with one reply", root.Thread)
+	}
+}
+
+func TestHandleParticipantSendMessageKeepsTopLevelToolCallsSeparateFromFinalResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		isDirect bool
+	}{
+		{name: "dm", isDirect: true},
+		{name: "room"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+				CurrentUserID: "u-admin",
+				Users: []im.User{
+					{ID: "u-admin", Name: "admin"},
+					{ID: "manager", Name: "manager"},
+				},
+				Rooms: []im.Room{
+					{
+						ID:       "room-1",
+						IsDirect: tc.isDirect,
+						Members:  []string{"u-admin", "manager"},
+						Messages: []im.Message{{ID: "msg-user", SenderID: "u-admin", Content: "use some tools", CreatedAt: now}},
+					},
+				},
+			})
+			srv := &Handler{im: imSvc, participantBridge: im.NewParticipantBridge(""), serverNoAuth: true}
+			send := func(t *testing.T, body string) string {
+				t.Helper()
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/csgclaw/participants/manager/messages", strings.NewReader(body))
+				rec := httptest.NewRecorder()
+				srv.Routes().ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+				}
+				var sent struct {
+					MessageID string `json:"message_id"`
+				}
+				if err := json.NewDecoder(rec.Body).Decode(&sent); err != nil {
+					t.Fatalf("decode send response: %v", err)
+				}
+				return sent.MessageID
+			}
+
+			firstToolID := send(t, `{"room_id":"room-1","text":"🔧 `+"`list_dir`"+`\n`+"```"+`\n{\"path\":\"/workspace\"}\n`+"```"+`"}`)
+			secondToolID := send(t, `{"room_id":"room-1","text":"🔧 `+"`exec`"+`\n`+"```"+`\n{\"command\":\"pwd\"}\n`+"```"+`"}`)
+			finalID := send(t, `{"room_id":"room-1","text":"Used two tools."}`)
+			if finalID == "" || finalID == firstToolID || finalID == secondToolID {
+				t.Fatalf("message ids first=%q second=%q final=%q, want final root distinct from tool replies", firstToolID, secondToolID, finalID)
+			}
+
+			timeline, err := imSvc.ListMessages("room-1")
+			if err != nil {
+				t.Fatalf("ListMessages() error = %v", err)
+			}
+			var firstTool, secondTool, final im.Message
+			for _, message := range timeline {
+				switch message.ID {
+				case firstToolID:
+					firstTool = message
+				case secondToolID:
+					secondTool = message
+				case finalID:
+					final = message
+				}
+			}
+			if firstTool.ID == "" || secondTool.ID == "" {
+				t.Fatalf("timeline = %+v, want tool records kept as top-level activity messages", timeline)
+			}
+			if final.ID == "" {
+				t.Fatalf("timeline = %+v, want final response %q", timeline, finalID)
+			}
+			if final.Content != "Used two tools." {
+				t.Fatalf("final.Content = %q, want final response", final.Content)
+			}
+			if final.Thread != nil {
+				t.Fatalf("final.Thread = %+v, want no synthetic activity thread", final.Thread)
+			}
+			if firstTool.RelatesTo != nil || secondTool.RelatesTo != nil {
+				t.Fatalf("tool relates_to = %+v / %+v, want top-level activity messages", firstTool.RelatesTo, secondTool.RelatesTo)
+			}
+			for _, tool := range []im.Message{firstTool, secondTool} {
+				if !strings.HasPrefix(strings.TrimSpace(tool.Content), "🔧 ") {
+					t.Fatalf("tool.Content = %q, want legacy tool call", tool.Content)
+				}
+			}
+			if _, err := imSvc.GetThread("room-1", final.ID); err == nil {
+				t.Fatalf("GetThread(%q) unexpectedly succeeded; want no synthetic thread", final.ID)
+			}
+		})
+	}
+}
+
+func TestPublishParticipantEventQueuesUntilParticipantSubscribes(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-pending",
+						SenderID:  "u-admin",
+						Content:   "queued while disconnected",
+						CreatedAt: now,
+					},
+				},
+			},
+		},
+	})
+	bridge := im.NewParticipantBridge("")
+	srv := &Handler{im: imSvc, participantBridge: bridge}
+
+	sender, ok := imSvc.User("u-admin")
+	if !ok {
+		t.Fatal("missing sender")
+	}
+	room, ok := imSvc.Room("room-1")
+	if !ok || len(room.Messages) != 1 {
+		t.Fatalf("room = %+v, want one message", room)
+	}
+
+	srv.PublishParticipantEvent(im.Event{
+		Type:    im.EventTypeMessageCreated,
+		RoomID:  "room-1",
+		Sender:  &sender,
+		Message: &room.Messages[0],
+	})
+
+	events, cancel := bridge.Subscribe("manager")
+	defer cancel()
+
+	select {
+	case evt := <-events:
+		if evt.MessageID != "msg-pending" || evt.Text != "queued while disconnected" {
+			t.Fatalf("queued event = %+v, want msg-pending queued while disconnected", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Subscribe() timed out waiting for queued bot event")
+	}
+}
+
+func TestPublishParticipantEventFreeRoomOnlyRoutesExplicitMentions(t *testing.T) {
+	svc := mustNewSeededService(t, []agent.Agent{
+		{ID: "agent-a", Name: "agent-a", Role: agent.RoleWorker},
+		{ID: "agent-b", Name: "agent-b", Role: agent.RoleWorker},
+	})
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "user-admin",
+		Users: []im.User{
+			{ID: "user-admin", Name: "admin"},
+			{ID: "user-a", Name: "agent-a"},
+			{ID: "user-b", Name: "agent-b"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:              "room-1",
+				NotifyAllAgents: true,
+				Members:         []string{"user-admin", "user-a", "user-b"},
+			},
+		},
+	})
+	bridge := im.NewParticipantBridge("")
+	// Both workers are connected. Otherwise fanout to A starts asynchronous
+	// recovery that is unrelated to this routing test and outlives its store.
+	_, cancelA := bridge.Subscribe("pt-a")
+	defer cancelA()
+	events, cancel := bridge.Subscribe("pt-b")
+	defer cancel()
+	srv := &Handler{svc: svc, im: imSvc, participantBridge: bridge, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	humanSender, ok := imSvc.User("user-admin")
+	if !ok {
+		t.Fatal("missing human sender")
+	}
+	sender, ok := imSvc.User("user-a")
+	if !ok {
+		t.Fatal("missing agent sender")
+	}
+
+	srv.PublishParticipantEvent(im.Event{
+		Type:   im.EventTypeMessageCreated,
+		RoomID: "room-1",
+		Sender: &humanSender,
+		Message: &im.Message{
+			ID:       "msg-human",
+			SenderID: "user-admin",
+			Content:  "human message without mention",
+		},
+	})
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected free-room delivery without @mention: %+v", event)
+	default:
+	}
+
+	srv.PublishParticipantEvent(im.Event{
+		Type:   im.EventTypeMessageCreated,
+		RoomID: "room-1",
+		Sender: &humanSender,
+		Message: &im.Message{
+			ID:       "msg-human-mention",
+			SenderID: "user-admin",
+			Content:  `<at user_id="user-a">agent-a</at> please handle this`,
+			Mentions: []im.Mention{{ID: "user-a", Name: "agent-a"}},
+		},
+	})
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected delivery to unmentioned worker: %+v", event)
+	default:
+	}
+
+	srv.PublishParticipantEvent(im.Event{
+		Type:   im.EventTypeMessageCreated,
+		RoomID: "room-1",
+		Sender: &sender,
+		Message: &im.Message{
+			ID:       "msg-agent-reply",
+			SenderID: "user-a",
+			Content:  "agent reply without mention",
+		},
+	})
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected implicit delivery for agent reply: %+v", event)
+	default:
+	}
+	room, ok := imSvc.Room("room-1")
+	if !ok || room.NotifyAllAgents {
+		t.Fatalf("room = %+v, want legacy notify-all setting normalized off", room)
+	}
+
+	srv.PublishParticipantEvent(im.Event{
+		Type:   im.EventTypeMessageCreated,
+		RoomID: "room-1",
+		Sender: &sender,
+		Message: &im.Message{
+			ID:       "msg-agent-mention",
+			SenderID: "user-a",
+			Content:  "please review",
+			Mentions: []im.Mention{{ID: "user-b"}},
+		},
+	})
+	select {
+	case event := <-events:
+		if event.MessageID != "msg-agent-mention" || !event.Mentioned {
+			t.Fatalf("explicit agent mention event = %+v, want mentioned msg-agent-mention", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for explicit agent mention delivery")
+	}
+}
+
+func TestPublishParticipantEventReensuresRunningWorkerLifecycle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	started := make(chan string, 1)
+	recreated := make(chan string, 1)
+	restoreDefault := agent.TestOnlySetDefaultControllerOption(func(s *agent.Controller) error {
+		return agent.WithRuntime(fakeCompatRuntime{
+			info: func(context.Context, agentruntime.Handle) (agentruntime.Info, error) {
+				return agentruntime.Info{HandleID: "box-stale", State: agentruntime.StateRunning}, nil
+			},
+			start: func(_ context.Context, h agentruntime.Handle) (agentruntime.State, error) {
+				started <- h.HandleID
+				return agentruntime.StateRunning, nil
+			},
+			new: func(_ context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+				recreated <- spec.AgentName
+				return agentruntime.Handle{RuntimeID: spec.RuntimeID, HandleID: "box-" + spec.AgentName}, nil
+			},
+		})(s)
+	})
+	t.Cleanup(restoreDefault)
+
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{
+			ID:              "u-worker",
+			Name:            "worker",
+			Role:            agent.RoleWorker,
+			RuntimeID:       "rt-u-worker",
+			BoxID:           "box-stale",
+			Status:          string(agentruntime.StateRunning),
+			AgentProfile:    agent.AgentProfile{Name: "worker", Provider: agent.ProviderCodex, ModelID: "gpt-5.5", ProfileComplete: true},
+			ProfileComplete: true,
+			CreatedAt:       time.Date(2026, 4, 1, 11, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	svc, err := agent.NewController(
+		config.ModelConfig{ModelID: "gpt-5.5"},
+		config.ServerConfig{ListenAddr: ":18080", AccessToken: "token"}, "manager-image:test", statePath,
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "u-worker", Name: "worker"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:              "room-1",
+				NotifyAllAgents: true,
+				Members:         []string{"u-admin", "u-worker"},
+				Messages:        []im.Message{{ID: "msg-1", SenderID: "u-admin", Content: "please handle this", Mentions: []im.Mention{{ID: "u-worker"}}, CreatedAt: time.Now().UTC()}},
+			},
+		},
+	})
+	sender, ok := imSvc.User("u-admin")
+	if !ok {
+		t.Fatal("missing sender")
+	}
+	room, ok := imSvc.Room("room-1")
+	if !ok || len(room.Messages) != 1 {
+		t.Fatalf("room = %+v, want one message", room)
+	}
+
+	srv := &Handler{svc: svc, im: imSvc, participantBridge: im.NewParticipantBridge(""), agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	srv.PublishParticipantEvent(im.Event{
+		Type:    im.EventTypeMessageCreated,
+		RoomID:  "room-1",
+		Sender:  &sender,
+		Message: &room.Messages[0],
+	})
+
+	select {
+	case handleID := <-started:
+		if handleID != "box-stale" {
+			t.Fatalf("started running worker handle %q, want %q", handleID, "box-stale")
+		}
+	case name := <-recreated:
+		t.Fatalf("recreated running worker %q, want start-based lifecycle recovery", name)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for running worker lifecycle recovery")
+	}
+}
+
+func TestPublishParticipantEventStartsStoppedWorker(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	started := make(chan string, 1)
+	restoreDefault := agent.TestOnlySetDefaultControllerOption(func(s *agent.Controller) error {
+		return agent.WithRuntime(fakeCompatRuntime{
+			info: func(context.Context, agentruntime.Handle) (agentruntime.Info, error) {
+				return agentruntime.Info{HandleID: "box-stale", State: agentruntime.StateStopped}, nil
+			},
+			start: func(_ context.Context, h agentruntime.Handle) (agentruntime.State, error) {
+				started <- h.HandleID
+				return agentruntime.StateRunning, nil
+			},
+		})(s)
+	})
+	t.Cleanup(restoreDefault)
+
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{
+			ID:              "u-worker",
+			Name:            "worker",
+			Role:            agent.RoleWorker,
+			RuntimeID:       "rt-u-worker",
+			BoxID:           "box-stale",
+			Status:          string(agentruntime.StateStopped),
+			AgentProfile:    agent.AgentProfile{Name: "worker", Provider: agent.ProviderCodex, ModelID: "gpt-5.5", ProfileComplete: true},
+			ProfileComplete: true,
+			CreatedAt:       time.Date(2026, 4, 1, 11, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	svc, err := agent.NewController(
+		config.ModelConfig{ModelID: "gpt-5.5"},
+		config.ServerConfig{ListenAddr: ":18080", AccessToken: "token"}, "manager-image:test", statePath,
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "u-worker", Name: "worker"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:              "room-1",
+				NotifyAllAgents: true,
+				Members:         []string{"u-admin", "u-worker"},
+				Messages:        []im.Message{{ID: "msg-1", SenderID: "u-admin", Content: "please handle this", Mentions: []im.Mention{{ID: "u-worker"}}, CreatedAt: time.Now().UTC()}},
+			},
+		},
+	})
+	sender, ok := imSvc.User("u-admin")
+	if !ok {
+		t.Fatal("missing sender")
+	}
+	room, ok := imSvc.Room("room-1")
+	if !ok || len(room.Messages) != 1 {
+		t.Fatalf("room = %+v, want one message", room)
+	}
+
+	srv := &Handler{svc: svc, im: imSvc, participantBridge: im.NewParticipantBridge(""), agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	srv.PublishParticipantEvent(im.Event{
+		Type:    im.EventTypeMessageCreated,
+		RoomID:  "room-1",
+		Sender:  &sender,
+		Message: &room.Messages[0],
+	})
+
+	select {
+	case handleID := <-started:
+		if handleID != "box-stale" {
+			t.Fatalf("started handle = %q, want %q", handleID, "box-stale")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for missed worker start")
+	}
+}
+
+func TestHandleBotEventsRequeuesWhenSSEWriteFails(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-retry",
+						SenderID:  "u-admin",
+						Content:   "retry after broken stream",
+						CreatedAt: now,
+					},
+				},
+			},
+		},
+	})
+	bridge := im.NewParticipantBridge("")
+	room, ok := imSvc.Room("room-1")
+	if !ok {
+		t.Fatal("Room(room-1) = false, want room")
+	}
+	sender, ok := imSvc.User("u-admin")
+	if !ok {
+		t.Fatal("User(u-admin) = false, want user")
+	}
+	bridge.PublishMessageEvent(room, sender, room.Messages[0])
+
+	srv := &Handler{im: imSvc, participantBridge: bridge}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/csgclaw/participants/manager/events", nil)
+	srv.handleParticipantEventsStream(&failingBotEventWriter{header: make(http.Header)}, req, "manager")
+
+	events, cancel := bridge.Subscribe("manager")
+	defer cancel()
+	select {
+	case evt := <-events:
+		if evt.MessageID != "msg-retry" || evt.Text != "retry after broken stream" {
+			t.Fatalf("requeued event = %+v, want msg-retry retry after broken stream", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Subscribe() timed out waiting for requeued event")
+	}
+}
+
+type failingBotEventWriter struct {
+	header http.Header
+}
+
+func (w *failingBotEventWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *failingBotEventWriter) Write(data []byte) (int, error) {
+	text := string(data)
+	if strings.HasPrefix(text, "id: ") || strings.HasPrefix(text, "event: message") {
+		return 0, errors.New("broken stream")
+	}
+	return len(data), nil
+}
+
+func (w *failingBotEventWriter) WriteHeader(int) {}
+
+func (w *failingBotEventWriter) Flush() {}
+
+func TestReplayRecentBotMessagesReplaysUnansweredHumanMessage(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-missed",
+						SenderID:  "u-admin",
+						Content:   "please reply",
+						CreatedAt: now,
+					},
+				},
+			},
+		},
+	})
+	bridge := im.NewParticipantBridge("")
+	events, cancel := bridge.Subscribe("manager")
+	defer cancel()
+
+	srv := &Handler{im: imSvc, participantBridge: bridge}
+	srv.replayRecentParticipantMessages("manager", "")
+
+	select {
+	case evt := <-events:
+		if evt.MessageID != "msg-missed" || evt.Text != "please reply" {
+			t.Fatalf("replayed event = %+v, want msg-missed please reply", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replayRecentParticipantMessages() timed out waiting for event")
+	}
+}
+
+func TestReplayRecentBotMessagesSkipsRoomWithoutBridgeTarget(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "u-agent-hhtz4b", Name: "qa"},
+			{ID: agent.ManagerParticipantID, Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-qa",
+				IsDirect: true,
+				Members:  []string{"u-admin", "u-agent-hhtz4b"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-qa",
+						SenderID:  "u-admin",
+						Content:   "qa only",
+						CreatedAt: now,
+					},
+				},
+			},
+		},
+	})
+	participantSvc := participant.NewService(participant.NewMemoryStore([]apitypes.Participant{{
+		ID:              agent.ManagerParticipantID,
+		Channel:         participant.ChannelCSGClaw,
+		Type:            participant.TypeAgent,
+		Name:            agent.ManagerName,
+		ChannelUserRef:  agent.ManagerParticipantID,
+		ChannelUserKind: participant.ChannelUserKindLocalUserID,
+		AgentID:         agent.ManagerUserID,
+		LifecycleStatus: participant.LifecycleStatusActive,
+		Mentionable:     true,
+	}}))
+	bridge := im.NewParticipantBridge("")
+	events, cancel := bridge.Subscribe(agent.ManagerParticipantID)
+	defer cancel()
+
+	srv := &Handler{im: imSvc, participant: participantSvc, participantBridge: bridge}
+	srv.replayRecentParticipantMessages(agent.ManagerParticipantID, "")
+
+	select {
+	case evt := <-events:
+		t.Fatalf("replayed event = %+v, want no replay for room without manager membership", evt)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestReplayRecentBotMessagesReplaysParticipantRoomUsingChannelUserRef(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "u-agent-hhtz4b", Name: "qa"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-qa",
+				IsDirect: true,
+				Members:  []string{"u-admin", "u-agent-hhtz4b"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-qa",
+						SenderID:  "u-admin",
+						Content:   "qa only",
+						CreatedAt: now,
+					},
+				},
+			},
+		},
+	})
+	participantSvc := participant.NewService(participant.NewMemoryStore([]apitypes.Participant{{
+		ID:              "agent-hhtz4b",
+		Channel:         participant.ChannelCSGClaw,
+		Type:            participant.TypeAgent,
+		Name:            "qa",
+		ChannelUserRef:  "u-agent-hhtz4b",
+		ChannelUserKind: participant.ChannelUserKindLocalUserID,
+		AgentID:         "u-agent-hhtz4b",
+		LifecycleStatus: participant.LifecycleStatusActive,
+		Mentionable:     true,
+	}}))
+	bridge := im.NewParticipantBridge("")
+	events, cancel := bridge.Subscribe("agent-hhtz4b")
+	defer cancel()
+
+	srv := &Handler{im: imSvc, participant: participantSvc, participantBridge: bridge}
+	srv.replayRecentParticipantMessages("agent-hhtz4b", "")
+
+	select {
+	case evt := <-events:
+		if evt.MessageID != "msg-qa" || evt.Context.Account != "pt-hhtz4b" {
+			t.Fatalf("replayed event = %+v, want participant-keyed QA replay", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replayRecentParticipantMessages() timed out waiting for participant-keyed QA event")
+	}
+}
+
+func TestReplayRecentBotMessagesUsesNewConversationFlow(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	restoreDefault := agent.TestOnlySetDefaultControllerOption(func(s *agent.Controller) error {
+		return agent.WithRuntime(fakeCompatRuntime{kind: agent.RuntimeKindCodex})(s)
+	})
+	t.Cleanup(restoreDefault)
+
+	statePath := filepath.Join(t.TempDir(), "agents.json")
+	if err := writeSeededAgents(statePath, []agent.Agent{
+		{
+			ID:              "u-manager",
+			Name:            "manager",
+			Role:            agent.RoleManager,
+			RuntimeKind:     agent.RuntimeKindCodex,
+			RuntimeID:       "rt-u-manager",
+			Status:          string(agentruntime.StateRunning),
+			ProfileComplete: true,
+			CreatedAt:       time.Date(2026, 4, 1, 11, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	svc, err := agent.NewController(config.ModelConfig{ModelID: "gpt-5.5"}, config.ServerConfig{}, "manager-image:test", statePath)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-new-convo",
+						SenderID:  "u-admin",
+						Content:   `<slash-command name="new" arg="conversation"></slash-command> clear all`,
+						CreatedAt: time.Now().UTC(),
+					},
+				},
+			},
+		},
+	})
+	bridge := im.NewParticipantBridge("")
+	events, cancel := bridge.Subscribe("manager")
+	defer cancel()
+
+	srv := &Handler{svc: svc, im: imSvc, participantBridge: bridge, agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc}
+	srv.replayRecentParticipantMessages("manager", "")
+
+	select {
+	case evt := <-events:
+		if evt.MessageID != "msg-new-convo" || evt.Text != `<slash-command name="new" arg="conversation"></slash-command> clear all` {
+			t.Fatalf("replayed event = %+v, want the canonical new-conversation command", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replayRecentParticipantMessages() timed out waiting for event")
+	}
+}
+
+func TestReplayRecentBotMessagesSkipsAnsweredMessage(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-answered",
+						SenderID:  "u-admin",
+						Content:   "please reply",
+						CreatedAt: now,
+					},
+					{
+						ID:        "msg-reply",
+						SenderID:  "manager",
+						Content:   "done",
+						CreatedAt: now.Add(time.Second),
+					},
+				},
+			},
+		},
+	})
+	bridge := im.NewParticipantBridge("")
+	events, cancel := bridge.Subscribe("manager")
+	defer cancel()
+
+	srv := &Handler{im: imSvc, participantBridge: bridge}
+	srv.replayRecentParticipantMessages("manager", "")
+
+	select {
+	case evt := <-events:
+		t.Fatalf("replayed event = %+v, want no replay for answered message", evt)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestReplayRecentBotMessagesDoesNotDuplicateDeliveredMessage(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-delivered",
+						SenderID:  "u-admin",
+						Content:   "please reply",
+						CreatedAt: now,
+					},
+				},
+			},
+		},
+	})
+	bridge := im.NewParticipantBridge("")
+	events, cancel := bridge.Subscribe("manager")
+	defer cancel()
+
+	room, ok := imSvc.Room("room-1")
+	if !ok {
+		t.Fatal("Room(room-1) = false, want room")
+	}
+	sender, ok := imSvc.User("u-admin")
+	if !ok {
+		t.Fatal("User(u-admin) = false, want user")
+	}
+	bridge.PublishMessageEvent(room, sender, room.Messages[0])
+
+	select {
+	case evt := <-events:
+		if evt.MessageID != "msg-delivered" {
+			t.Fatalf("live event = %+v, want msg-delivered", evt)
+		}
+		bridge.Ack("manager", evt.MessageID)
+	case <-time.After(time.Second):
+		t.Fatal("PublishMessageEvent() timed out waiting for event")
+	}
+
+	srv := &Handler{im: imSvc, participantBridge: bridge}
+	srv.replayRecentParticipantMessages("manager", "")
+
+	select {
+	case evt := <-events:
+		t.Fatalf("replayed event = %+v, want no duplicate for delivered message", evt)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestReplayRecentBotMessagesHonorsLastEventID(t *testing.T) {
+	now := time.Now().UTC()
+	imSvc := im.NewServiceFromBootstrap(im.Bootstrap{
+		CurrentUserID: "u-admin",
+		Users: []im.User{
+			{ID: "u-admin", Name: "admin"},
+			{ID: "manager", Name: "manager"},
+		},
+		Rooms: []im.Room{
+			{
+				ID:       "room-1",
+				IsDirect: true,
+				Members:  []string{"u-admin", "manager"},
+				Messages: []im.Message{
+					{
+						ID:        "msg-seen",
+						SenderID:  "u-admin",
+						Content:   "already delivered",
+						CreatedAt: now,
+					},
+					{
+						ID:        "msg-new",
+						SenderID:  "u-admin",
+						Content:   "new after reconnect",
+						CreatedAt: now.Add(time.Second),
+					},
+				},
+			},
+		},
+	})
+	bridge := im.NewParticipantBridge("")
+	events, cancel := bridge.Subscribe("manager")
+	defer cancel()
+
+	srv := &Handler{im: imSvc, participantBridge: bridge}
+	srv.replayRecentParticipantMessages("manager", "msg-seen")
+
+	select {
+	case evt := <-events:
+		if evt.MessageID != "msg-new" || evt.Text != "new after reconnect" {
+			t.Fatalf("replayed event = %+v, want msg-new new after reconnect", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replayRecentParticipantMessages() timed out waiting for event")
+	}
+
+	select {
+	case evt := <-events:
+		t.Fatalf("extra replayed event = %+v, want only messages after Last-Event-ID", evt)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestHandleBotLLMModelsReturnsBridgeCatalog(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "agents.json")
+	agents := []agent.Agent{
+		{
+			ID:          agent.ManagerUserID,
+			Name:        agent.ManagerName,
+			Role:        agent.RoleManager,
+			RuntimeKind: agent.RuntimeKindCodex,
+			Profile:     config.DefaultLLMProfile,
+			AgentProfile: agent.AgentProfile{
+				Provider:        agent.ProviderAPI,
+				BaseURL:         "http://127.0.0.1:4000",
+				APIKey:          "sk-test",
+				ModelID:         "gpt-5.4",
+				ReasoningEffort: agent.DefaultReasoningEffort,
+				ProfileComplete: true,
+			},
+			CreatedAt: time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC),
+		},
+	}
+	if err := writeSeededAgents(statePath, agents); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	svc, err := agent.NewControllerWithLLM(config.SingleProfileLLM(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "gpt-5.4",
+	}), config.ServerConfig{}, "manager-image:test", statePath,
+		agent.WithRuntime(fakeCompatRuntime{kind: agent.RuntimeKindCodex}),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceWithLLM() error = %v", err)
+	}
+	bridge := llm.NewService(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "gpt-5.4",
+	}, svc)
+
+	srv := &Handler{
+		svc:               svc,
+		participantBridge: im.NewParticipantBridge("secret"),
+		llm:               bridge,
+		serverAccessToken: "secret", agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-manager/llm/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"id":"gpt-5.4"`) {
+		t.Fatalf("body = %s, want model catalog", rec.Body.String())
+	}
+}
+
+func TestHandleBotLLMModelsLegacyRouteReturnsBridgeCatalog(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "agents.json")
+	agents := []agent.Agent{
+		{
+			ID:          agent.ManagerUserID,
+			Name:        agent.ManagerName,
+			Role:        agent.RoleManager,
+			RuntimeKind: agent.RuntimeKindCodex,
+			Profile:     config.DefaultLLMProfile,
+			AgentProfile: agent.AgentProfile{
+				Provider:        agent.ProviderAPI,
+				BaseURL:         "http://127.0.0.1:4000",
+				APIKey:          "sk-test",
+				ModelID:         "gpt-5.4",
+				ReasoningEffort: agent.DefaultReasoningEffort,
+				ProfileComplete: true,
+			},
+			CreatedAt: time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC),
+		},
+	}
+	if err := writeSeededAgents(statePath, agents); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+	svc, err := agent.NewControllerWithLLM(config.SingleProfileLLM(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "gpt-5.4",
+	}), config.ServerConfig{}, "manager-image:test", statePath,
+		agent.WithRuntime(fakeCompatRuntime{kind: agent.RuntimeKindCodex}),
+	)
+	if err != nil {
+		t.Fatalf("NewServiceWithLLM() error = %v", err)
+	}
+	bridge := llm.NewService(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "gpt-5.4",
+	}, svc)
+
+	srv := &Handler{
+		svc:               svc,
+		participantBridge: im.NewParticipantBridge("secret"),
+		llm:               bridge,
+		serverAccessToken: "secret", agentEngine: agentengine.New(svc), workspace: svc.Workspace(), agentModels: svc.Models(), agentRuntime: svc,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-manager/llm/models", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"id":"gpt-5.4"`) {
+		t.Fatalf("body = %s, want model catalog", rec.Body.String())
+	}
+}
+
+func mustNewService(t *testing.T) *agent.Controller {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	hubSvc, err := hub.NewService(config.HubConfig{Registries: []config.HubRegistryConfig{{Name: config.DefaultOfficialHubRegistryName, Kind: config.HubRegistryKindRemote, Enabled: false}}}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	svc, err := agent.NewController(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "model-1",
+	}, config.ServerConfig{}, "manager-image:test", "",
+		agent.WithHubService(hubSvc),
+		agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{
+			DefaultManagerTemplate: config.DefaultBootstrapManagerTemplate,
+			DefaultWorkerTemplate:  config.DefaultBootstrapWorkerTemplate,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	return svc
+}
+
+func mustNewSeededService(t *testing.T, agents []agent.Agent) *agent.Controller {
+	t.Helper()
+
+	svc, _ := mustNewSeededServiceWithPath(t, agents)
+	return svc
+}
+
+func mustNewSeededServiceWithOptions(t *testing.T, agents []agent.Agent, opts ...agent.ControllerOption) *agent.Controller {
+	t.Helper()
+
+	svc, _ := mustNewSeededServiceWithPathAndOptions(t, agents, opts...)
+	return svc
+}
+
+func mustNewSeededServiceWithPath(t *testing.T, agents []agent.Agent) (*agent.Controller, string) {
+	t.Helper()
+
+	return mustNewSeededServiceWithPathAndOptions(t, agents)
+}
+
+func mustNewSeededServiceWithPathAndOptions(t *testing.T, agents []agent.Agent, opts ...agent.ControllerOption) (*agent.Controller, string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(agent.TestOnlySetSandboxProvider(sandboxtest.NewProvider()))
+
+	if agents == nil {
+		agents = []agent.Agent{}
+	}
+
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "agents.json")
+	t.Setenv("CSGCLAW_TEST_AGENT_ROOT", filepath.Join(dir, config.AgentsDirName))
+	if err := writeSeededAgents(statePath, agents); err != nil {
+		t.Fatalf("writeSeededAgents() error = %v", err)
+	}
+
+	hubSvc, err := hub.NewService(config.HubConfig{Registries: []config.HubRegistryConfig{{Name: config.DefaultOfficialHubRegistryName, Kind: config.HubRegistryKindRemote, Enabled: false}}}, hub.DefaultStoreFactory)
+	if err != nil {
+		t.Fatalf("hub.NewService() error = %v", err)
+	}
+
+	serviceOpts := []agent.ControllerOption{
+		agent.WithHubService(hubSvc),
+		agent.WithBootstrapDefaultTemplates(config.BootstrapConfig{
+			DefaultManagerTemplate: config.DefaultBootstrapManagerTemplate,
+			DefaultWorkerTemplate:  config.DefaultBootstrapWorkerTemplate,
+		}),
+	}
+	serviceOpts = append(serviceOpts, opts...)
+
+	svc, err := agent.NewController(config.ModelConfig{
+		Provider: config.ProviderLLMAPI,
+		BaseURL:  "http://127.0.0.1:4000",
+		APIKey:   "sk-test",
+		ModelID:  "model-1",
+	}, config.ServerConfig{}, "manager-image:test", statePath, serviceOpts...)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	return svc, statePath
+}
+
+func writeSeededAgents(statePath string, agents []agent.Agent) error {
+	agents = normalizeSeededAgents(agents)
+	data, err := json.Marshal(map[string]any{
+		"agents": agents,
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(statePath, append(data, '\n'), 0o600)
+}
+
+func normalizeSeededAgents(agents []agent.Agent) []agent.Agent {
+	out := make([]agent.Agent, len(agents))
+	for i, item := range agents {
+		out[i] = item
+		if strings.TrimSpace(out[i].RuntimeKind) != "" {
+			continue
+		}
+		switch strings.TrimSpace(out[i].Role) {
+		case agent.RoleManager:
+			out[i].RuntimeKind = agent.RuntimeKindCodex
+		case agent.RoleWorker:
+			out[i].RuntimeKind = agent.RuntimeKindPicoClawSandbox
+			if strings.TrimSpace(out[i].Image) == "" {
+				out[i].Image = "manager-image:test"
+			}
+		case agent.RoleAgent:
+			out[i].RuntimeKind = agent.RuntimeKindCodex
+		}
+	}
+	return out
+}
+
+func containsMember(members []string, want string) bool {
+	for _, member := range members {
+		if member == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsUser(users []im.User, want string) bool {
+	for _, user := range users {
+		if user.ID == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAPIMessageID(messages []im.Message, want string) bool {
+	for _, message := range messages {
+		if message.ID == want {
+			return true
+		}
+	}
+	return false
+}
+
+func mustReceiveEvent(t *testing.T, events <-chan im.Event) im.Event {
+	t.Helper()
+
+	select {
+	case evt := <-events:
+		return evt
+	default:
+		t.Fatal("expected event")
+		return im.Event{}
+	}
+}
+
+func mustReceiveEventWithin(t *testing.T, events <-chan im.Event, timeout time.Duration) im.Event {
+	t.Helper()
+
+	select {
+	case evt := <-events:
+		return evt
+	case <-time.After(timeout):
+		t.Fatalf("expected event within %s", timeout)
+		return im.Event{}
+	}
+}
+
+func waitForCondition(t *testing.T, timeout, interval time.Duration, fn func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(interval)
+	}
+	t.Fatalf("condition not met within %s", timeout)
+}

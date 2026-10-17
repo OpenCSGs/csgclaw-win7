@@ -1,0 +1,3951 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"csgclaw/internal/agentengine"
+	agent "csgclaw/internal/agentengine/agents"
+	"csgclaw/internal/agentsession"
+	"csgclaw/internal/agenttask"
+	"csgclaw/internal/apitypes"
+	"csgclaw/internal/apps"
+	"csgclaw/internal/auth"
+	csgclawchannel "csgclaw/internal/channel/csgclaw"
+	"csgclaw/internal/channel/csgclaw/notification"
+	"csgclaw/internal/channel/feishu"
+	feishularkcli "csgclaw/internal/channel/feishu/larkcli"
+	"csgclaw/internal/codexcli"
+	"csgclaw/internal/config"
+	"csgclaw/internal/connectors"
+	"csgclaw/internal/dshcli"
+	"csgclaw/internal/im"
+	"csgclaw/internal/llm"
+	"csgclaw/internal/mcp"
+	"csgclaw/internal/modelprovider"
+	"csgclaw/internal/participant"
+	"csgclaw/internal/roomtask"
+	agentruntime "csgclaw/internal/runtime"
+	"csgclaw/internal/runtime/picoclawsandbox"
+	"csgclaw/internal/runtimecatalog"
+	"csgclaw/internal/sandbox"
+	"csgclaw/internal/sandboxproviders"
+	"csgclaw/internal/scheduledtask"
+	"csgclaw/internal/taskcore"
+	"csgclaw/internal/team"
+	hub "csgclaw/internal/template"
+	"csgclaw/internal/upgrade"
+	"csgclaw/internal/utils"
+	"csgclaw/internal/version"
+	"csgclaw/internal/worklease"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	goruntime "runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Handler struct {
+	svc                        AgentRecords
+	participant                *participant.Service
+	im                         *im.Service
+	csgclaw                    *csgclawchannel.Service
+	imBus                      *im.Bus
+	eventStreamShutdown        <-chan struct{}
+	workBus                    *worklease.Bus
+	workControlBus             *worklease.ControlBus
+	participantWork            worklease.ParticipantWorkReporter
+	imProvisioner              *im.Provisioner
+	participantBridge          *im.ParticipantBridge
+	feishu                     *feishu.Service
+	llm                        *llm.Service
+	hub                        *hub.Service
+	mcp                        *mcp.Service
+	roomTaskSvc                *roomtask.Service
+	teamSvc                    *team.Service
+	agentTaskSvc               *agenttask.Service
+	scheduledTaskSvc           *scheduledtask.Service
+	connectors                 *connectors.Service
+	apps                       *apps.Service
+	appPlatformMu              sync.Mutex
+	gitLabConnectorMu          sync.Mutex
+	appPlatformAgents          map[string]string
+	agentRuntimes              *runtimecatalog.Service
+	teamAdapters               *team.AdapterRegistry
+	teamPlanJobsMu             sync.Mutex
+	teamPlanJobs               map[string]struct{}
+	configPath                 string
+	advertiseBaseURL           string
+	internalBaseURL            string
+	runtimeDistribution        string
+	serverAccessToken          string
+	desktopSessionToken        string
+	serverNoAuth               bool
+	upgradeManager             *upgrade.Manager
+	upgradeConfigPath          string
+	upgradeApply               func(upgrade.ApplyHelperOptions) error
+	serverRestartApply         func(upgrade.RestartHelperOptions) error
+	localRuntimeImages         func(context.Context, config.Config) ([]string, error)
+	environmentRuntimeReset    func() error
+	notificationDeliver        notification.Fanouter
+	activityDecider            ActivityDecider
+	userInputResponder         UserInputResponder
+	agentEngine                agentengine.Interface
+	channelBindings            ChannelBindingReconciler
+	sessionBindings            *agentsession.Store
+	localDirectoryPicker       func(context.Context) (string, error)
+	feishuRegistrationStateDir string
+	runtimeExtensionSourcesSet bool
+	larkCLISigningOnce         sync.Once
+	larkCLISigningSecret       string
+	larkCLISigningErr          error
+
+	participantActivityTurnsMu sync.Mutex
+	participantActivityTurns   map[string]participantActivityTurn
+	sessionTurnsMu             sync.Mutex
+	sessionTurns               map[string]map[agentengine.TurnID]agentSessionTurn
+	workspace                  AgentWorkspace
+
+	// ChannelBindingReconciler keeps Channel Worker lifecycle with the Channel
+	// layer instead of routing it backward through Agent Runtime lifecycle.
+	agentModels  AgentModels
+	agentRuntime AgentRuntimeSupport
+}
+
+type ChannelBindingReconciler interface {
+	RefreshAgentChannel(context.Context, agent.Agent, string) error
+}
+
+const (
+	createOperationTimeout    = 10 * time.Minute
+	agentRuntimeStatusTimeout = 2 * time.Second
+)
+
+var sseHeartbeatInterval = 15 * time.Second
+var locateCodexCLI = func() (string, error) {
+	return codexcli.BundledPath()
+}
+
+func detachedCreateContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), createOperationTimeout)
+}
+
+type imBootstrapResponse struct {
+	CurrentUserID      string    `json:"current_user_id"`
+	Users              []im.User `json:"users"`
+	Rooms              []im.Room `json:"rooms"`
+	InviteDraftUserIDs []string  `json:"invite_draft_user_ids,omitempty"`
+}
+
+type imEventResponse struct {
+	AttachmentID string                          `json:"attachment_id,omitempty"`
+	Type         string                          `json:"type"`
+	RoomID       string                          `json:"room_id,omitempty"`
+	TeamID       string                          `json:"team_id,omitempty"`
+	Room         *im.Room                        `json:"room,omitempty"`
+	User         *im.User                        `json:"user,omitempty"`
+	Message      *im.Message                     `json:"message,omitempty"`
+	Participant  *apitypes.Participant           `json:"participant,omitempty"`
+	Team         *apitypes.Team                  `json:"team,omitempty"`
+	Thread       *im.ThreadView                  `json:"thread,omitempty"`
+	Sender       *im.User                        `json:"sender,omitempty"`
+	Upgrade      *apitypes.UpgradeStatus         `json:"upgrade,omitempty"`
+	Work         *apitypes.ParticipantWorkUpdate `json:"work,omitempty"`
+}
+
+type bootstrapConfigResponse struct {
+	DefaultManagerTemplate   string                                        `json:"default_manager_template"`
+	DefaultWorkerTemplate    string                                        `json:"default_worker_template"`
+	SandboxProvider          string                                        `json:"sandbox_provider"`
+	RuntimeKind              string                                        `json:"runtime_kind"`
+	ManagerRuntime           managerRuntimeResponse                        `json:"manager_runtime"`
+	ShowUpgrade              bool                                          `json:"show_upgrade"`
+	DirectoryPickerAvailable bool                                          `json:"directory_picker_available"`
+	EffectiveManagerImage    string                                        `json:"effective_manager_image"`
+	AdvertiseBaseURL         string                                        `json:"advertise_base_url,omitempty"`
+	SupportedRuntimeKinds    []string                                      `json:"supported_runtime_kinds"`
+	WorkerRuntimeChoices     []workerRuntimeChoiceResponse                 `json:"worker_runtime_choices,omitempty"`
+	RuntimeDefaultImages     map[string]string                             `json:"runtime_default_images,omitempty"`
+	RuntimeOptionSchemas     map[string][]agentruntime.RuntimeOptionSchema `json:"runtime_option_schemas,omitempty"`
+}
+
+type workerRuntimeChoiceResponse struct {
+	Name           string `json:"name"`
+	Label          string `json:"label"`
+	SandboxEnabled bool   `json:"sandbox_enabled"`
+	Installed      bool   `json:"installed"`
+	Installable    bool   `json:"installable,omitempty"`
+	Message        string `json:"message,omitempty"`
+	MessageCode    string `json:"message_code,omitempty"`
+}
+
+type managerRuntimeResponse struct {
+	Name            string `json:"name"`
+	Label           string `json:"label"`
+	SandboxEnabled  bool   `json:"sandbox_enabled"`
+	Installed       bool   `json:"installed"`
+	Path            string `json:"path,omitempty"`
+	OS              string `json:"os"`
+	DocsURL         string `json:"docs_url"`
+	InstallGuidance string `json:"install_guidance,omitempty"`
+	Message         string `json:"message,omitempty"`
+}
+
+const sandboxRuntimeChoiceAvailabilityTimeout = 2 * time.Second
+
+var (
+	sandboxProviderAvailability = sandboxproviders.Availability
+	sandboxProviderForRuntime   = sandboxproviders.Provider
+)
+
+type updateBootstrapConfigRequest struct {
+	DefaultManagerTemplate *string `json:"default_manager_template,omitempty"`
+	DefaultWorkerTemplate  *string `json:"default_worker_template,omitempty"`
+}
+
+type agentResponse struct {
+	ID                   string                             `json:"id"`
+	Name                 string                             `json:"name"`
+	Description          string                             `json:"description,omitempty"`
+	Instructions         string                             `json:"instructions,omitempty"`
+	Runtime              apitypes.AgentRuntime              `json:"runtime,omitempty"`
+	RuntimeID            string                             `json:"-"`
+	RuntimeKind          string                             `json:"-"`
+	RuntimeName          string                             `json:"runtime_name,omitempty"`
+	SandboxEnabled       bool                               `json:"sandbox_enabled,omitempty"`
+	Image                string                             `json:"image,omitempty"`
+	Avatar               string                             `json:"-"`
+	BoxID                string                             `json:"-"`
+	Role                 string                             `json:"role"`
+	Status               string                             `json:"-"`
+	CreatedAt            time.Time                          `json:"created_at"`
+	UpdatedAt            time.Time                          `json:"updated_at,omitempty"`
+	Profile              string                             `json:"-"`
+	ProfileConfig        apitypes.AgentProfile              `json:"model_config,omitempty"`
+	RuntimeOptions       map[string]any                     `json:"-"`
+	MCPServers           map[string]any                     `json:"mcpServers,omitempty"`
+	RuntimeOptionSchemas []agentruntime.RuntimeOptionSchema `json:"-"`
+	MemorySupported      bool                               `json:"memory_supported,omitempty"`
+	AgentProfile         agent.AgentProfileView             `json:"-"`
+	ProfileComplete      bool                               `json:"-"`
+	DetectionResults     []agent.ProfileDetectionResult     `json:"-"`
+	UserID               string                             `json:"user_id,omitempty"`
+	UserName             string                             `json:"user_name,omitempty"`
+	ParticipantIDs       []string                           `json:"participant_ids,omitempty"`
+	ParticipantNames     []string                           `json:"participant_names,omitempty"`
+	Participants         []apitypes.Participant             `json:"participants,omitempty"`
+	LarkCLI              *apitypes.AgentLarkCLIStatus       `json:"lark_cli,omitempty"`
+	SkippedResources     []mcp.SkippedTemplateResource      `json:"skipped_resources,omitempty"`
+}
+
+func (r *agentResponse) UnmarshalJSON(data []byte) error {
+	var apiAgent apitypes.Agent
+	if err := json.Unmarshal(data, &apiAgent); err != nil {
+		return err
+	}
+	*r = agentResponse{
+		ID:               apiAgent.ID,
+		Name:             apiAgent.Name,
+		Description:      apiAgent.Description,
+		Instructions:     apiAgent.Instructions,
+		MemorySupported:  apiAgent.MemorySupported,
+		Runtime:          apiAgent.Runtime,
+		RuntimeKind:      apiAgent.RuntimeKind,
+		RuntimeName:      apiAgent.RuntimeName,
+		SandboxEnabled:   apiAgent.SandboxEnabled,
+		Image:            apiAgent.Image,
+		BoxID:            apiAgent.BoxID,
+		Role:             apiAgent.Role,
+		Status:           apiAgent.Status,
+		CreatedAt:        apiAgent.CreatedAt,
+		UpdatedAt:        apiAgent.UpdatedAt,
+		Profile:          apiAgent.Profile,
+		ProfileConfig:    apiAgent.ProfileConfig,
+		RuntimeOptions:   apiAgent.Runtime.Options,
+		MCPServers:       sanitizeMCPServersResponse(apiAgent.MCPServers),
+		AgentProfile:     agentProfileViewFromAPI(apiAgent.ProfileConfig),
+		UserID:           apiAgent.UserID,
+		UserName:         apiAgent.UserName,
+		ParticipantIDs:   apiAgent.ParticipantIDs,
+		ParticipantNames: apiAgent.ParticipantNames,
+		Participants:     apiAgent.Participants,
+		LarkCLI:          apiAgent.LarkCLI,
+	}
+	if len(apiAgent.Runtime.OptionSchemas) > 0 {
+		data, err := json.Marshal(apiAgent.Runtime.OptionSchemas)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &r.RuntimeOptionSchemas); err != nil {
+			return err
+		}
+	}
+	var legacy struct {
+		RuntimeID            string                             `json:"runtime_id"`
+		RuntimeKind          string                             `json:"runtime_kind"`
+		RuntimeName          string                             `json:"runtime_name"`
+		SandboxEnabled       *bool                              `json:"sandbox_enabled"`
+		Avatar               string                             `json:"avatar"`
+		BoxID                string                             `json:"box_id"`
+		Status               string                             `json:"status"`
+		RuntimeOptions       map[string]any                     `json:"runtime_options"`
+		RuntimeOptionSchemas []agentruntime.RuntimeOptionSchema `json:"runtime_option_schemas"`
+		AgentProfile         agent.AgentProfileView             `json:"agent_profile"`
+		ProfileComplete      bool                               `json:"profile_complete"`
+		DetectionResults     []agent.ProfileDetectionResult     `json:"detection_results"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	if strings.TrimSpace(legacy.RuntimeID) != "" {
+		r.RuntimeID = legacy.RuntimeID
+	}
+	if strings.TrimSpace(legacy.RuntimeKind) != "" {
+		r.RuntimeKind = legacy.RuntimeKind
+	}
+	if strings.TrimSpace(legacy.RuntimeName) != "" {
+		r.RuntimeName = legacy.RuntimeName
+	}
+	if legacy.SandboxEnabled != nil {
+		r.SandboxEnabled = *legacy.SandboxEnabled
+	}
+	if strings.TrimSpace(legacy.Avatar) != "" {
+		r.Avatar = legacy.Avatar
+	}
+	if strings.TrimSpace(legacy.BoxID) != "" {
+		r.BoxID = legacy.BoxID
+	}
+	if strings.TrimSpace(legacy.Status) != "" {
+		r.Status = legacy.Status
+	}
+	if len(legacy.RuntimeOptions) > 0 {
+		r.RuntimeOptions = legacy.RuntimeOptions
+	}
+	if len(legacy.RuntimeOptionSchemas) > 0 {
+		r.RuntimeOptionSchemas = legacy.RuntimeOptionSchemas
+	}
+	if !agentProfileViewEmpty(legacy.AgentProfile) {
+		r.AgentProfile = legacy.AgentProfile
+	}
+	r.ProfileComplete = legacy.ProfileComplete
+	if len(legacy.DetectionResults) > 0 {
+		r.DetectionResults = legacy.DetectionResults
+	}
+	return nil
+}
+
+func agentProfileViewFromAPI(profile apitypes.AgentProfile) agent.AgentProfileView {
+	return agent.AgentProfileView{
+		ModelProviderID:      profile.ModelProviderID,
+		BaseURL:              profile.BaseURL,
+		APIKeySet:            profile.APIKeySet,
+		APIKeyPreview:        profile.APIKeyPreview,
+		Headers:              profile.Headers,
+		ModelID:              profile.ModelID,
+		ReasoningEffort:      profile.ReasoningEffort,
+		EnableFastMode:       profile.EnableFastMode,
+		RequestOptions:       profile.RequestOptions,
+		Env:                  profile.Env,
+		EnvRestartRequired:   profile.EnvRestartRequired,
+		ImageUpgradeRequired: profile.ImageUpgradeRequired,
+		DetectionResults:     agentDetectionResultsFromAPI(profile.DetectionResults),
+	}
+}
+
+func agentProfileViewEmpty(profile agent.AgentProfileView) bool {
+	return strings.TrimSpace(profile.ModelProviderID) == "" &&
+		strings.TrimSpace(profile.BaseURL) == "" &&
+		!profile.APIKeySet &&
+		strings.TrimSpace(profile.APIKeyPreview) == "" &&
+		len(profile.Headers) == 0 &&
+		strings.TrimSpace(profile.ModelID) == "" &&
+		strings.TrimSpace(profile.ReasoningEffort) == "" &&
+		!profile.EnableFastMode &&
+		len(profile.RequestOptions) == 0 &&
+		len(profile.Env) == 0 &&
+		!profile.EnvRestartRequired &&
+		!profile.ImageUpgradeRequired &&
+		len(profile.DetectionResults) == 0
+}
+
+func agentDetectionResultsFromAPI(items []apitypes.ProfileDetectionResult) []agent.ProfileDetectionResult {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]agent.ProfileDetectionResult, 0, len(items))
+	for _, item := range items {
+		out = append(out, agent.ProfileDetectionResult{
+			Provider: item.Provider,
+			Status:   item.Status,
+			ModelID:  item.ModelID,
+			Error:    item.Error,
+		})
+	}
+	return out
+}
+
+type directoryPickerResponse struct {
+	Path string `json:"path"`
+}
+
+func (h *Handler) handleBootstrapConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		cfg, path, err := h.loadBootstrapConfig()
+		_ = path
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, h.bootstrapConfigView(r.Context(), cfg))
+	case http.MethodPut:
+		var req updateBootstrapConfigRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+			return
+		}
+		cfg, path, err := h.loadBootstrapConfig()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if req.DefaultManagerTemplate != nil {
+			cfg.Bootstrap.DefaultManagerTemplate = *req.DefaultManagerTemplate
+		}
+		if req.DefaultWorkerTemplate != nil {
+			cfg.Bootstrap.DefaultWorkerTemplate = *req.DefaultWorkerTemplate
+		}
+		if err := cfg.Bootstrap.Validate(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := cfg.Save(path); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if h.svc != nil {
+			if req.DefaultManagerTemplate != nil || req.DefaultWorkerTemplate != nil {
+				defaults, err := hub.ResolveBootstrapDefaults(r.Context(), cfg.Bootstrap, h.hub)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				switch defaults.ManagerRuntimeKind {
+				case agent.RuntimeKindPicoClawSandbox, agent.RuntimeKindOpenClawSandbox:
+					if err := h.agentRuntime.SetGatewayRuntime(defaults.ManagerRuntimeKind, defaults.ManagerImage); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, h.bootstrapConfigView(r.Context(), cfg))
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) listAgentImageCandidates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg, _, err := h.loadBootstrapConfig()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	lister := h.localRuntimeImages
+	if lister == nil {
+		lister = listLocalRuntimeImages
+	}
+	images, err := lister(r.Context(), cfg)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if images == nil {
+		images = []string{}
+	}
+	writeJSON(w, http.StatusOK, images)
+}
+
+func (h *Handler) handleLocalDirectoryPicker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	picker := h.localDirectoryPicker
+	if picker == nil {
+		picker = selectLocalDirectory
+	}
+	path, err := picker(r.Context())
+	if err != nil {
+		switch {
+		case errors.Is(err, errDirectorySelectionCanceled):
+			w.WriteHeader(http.StatusNoContent)
+		case errors.Is(err, errDirectoryPickerUnsupported):
+			http.Error(w, err.Error(), http.StatusNotImplemented)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, directoryPickerResponse{Path: path})
+}
+
+func listLocalRuntimeImages(ctx context.Context, cfg config.Config) ([]string, error) {
+	provider, err := sandboxproviders.Provider(cfg.Sandbox)
+	if err != nil {
+		return nil, err
+	}
+	return listLocalRuntimeImagesWithProvider(ctx, provider)
+}
+
+func listLocalRuntimeImagesWithProvider(ctx context.Context, provider sandbox.Provider) ([]string, error) {
+	if provider == nil {
+		return []string{}, nil
+	}
+	homeDir, err := agent.SandboxRuntimeHome(agent.ManagerName)
+	if err != nil {
+		return nil, err
+	}
+	return provider.ListImages(ctx, homeDir)
+}
+
+func (h *Handler) loadBootstrapConfig() (config.Config, string, error) {
+	path := strings.TrimSpace(h.configPath)
+	if path == "" {
+		defaultPath, err := config.DefaultPath()
+		if err != nil {
+			return config.Config{}, "", err
+		}
+		path = defaultPath
+	}
+	if _, err := os.Stat(path); err != nil {
+		if !os.IsNotExist(err) {
+			return config.Config{}, "", err
+		}
+		cfg := config.Config{
+			Server: config.ServerConfig{
+				ListenAddr:  config.DefaultListenAddr(),
+				AccessToken: config.DefaultAccessToken,
+				NoAuth:      false,
+				ShowUpgrade: true,
+			},
+			Bootstrap: config.BootstrapConfig{},
+			Sandbox: config.SandboxConfig{
+				Provider: config.DefaultSandboxProvider,
+			},
+		}
+		return cfg, path, nil
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return config.Config{}, "", err
+	}
+	return cfg, path, nil
+}
+
+func bootstrapConfigView(ctx context.Context, cfg config.Config, hubSvc *hub.Service, runtimeOptionSchemas map[string][]agentruntime.RuntimeOptionSchema) bootstrapConfigResponse {
+	resp := bootstrapConfigResponse{
+		DefaultManagerTemplate:   cfg.Bootstrap.ResolvedDefaultManagerTemplate(),
+		DefaultWorkerTemplate:    cfg.Bootstrap.ResolvedDefaultWorkerTemplate(),
+		SandboxProvider:          strings.TrimSpace(cfg.Sandbox.Provider),
+		ShowUpgrade:              cfg.Server.ShowUpgrade,
+		DirectoryPickerAvailable: localDirectoryPickerAvailable(),
+		AdvertiseBaseURL:         config.ResolveAdvertiseBaseURL(cfg.Server),
+		ManagerRuntime:           managerRuntimeReadiness(),
+		SupportedRuntimeKinds: []string{
+			agentruntime.RuntimeConfigForKind(agent.RuntimeKindPicoClawSandbox).Kind(),
+			agentruntime.RuntimeConfigForKind(agent.RuntimeKindOpenClawSandbox).Kind(),
+			agentruntime.RuntimeConfigForKind(agent.RuntimeKindCodex).Kind(),
+			agentruntime.RuntimeConfigForKind(agent.RuntimeKindDSH).Kind(),
+		},
+		RuntimeDefaultImages: map[string]string{},
+		RuntimeOptionSchemas: runtimeOptionSchemas,
+		WorkerRuntimeChoices: workerRuntimeChoices(ctx, cfg),
+	}
+	defaults, err := hub.ResolveBootstrapDefaults(ctx, cfg.Bootstrap, hubSvc)
+	if err != nil {
+		resp.RuntimeKind = bootstrapRuntimeKind("")
+		return resp
+	}
+	resp.RuntimeKind = bootstrapRuntimeKind(defaults.ManagerRuntimeKind)
+	resp.EffectiveManagerImage = defaults.ManagerImage
+	if defaults.ManagerRuntimeKind != "" && defaults.ManagerImage != "" {
+		resp.RuntimeDefaultImages[bootstrapRuntimeKind(defaults.ManagerRuntimeKind)] = defaults.ManagerImage
+	}
+	if defaults.WorkerRuntimeKind != "" && defaults.WorkerImage != "" {
+		resp.RuntimeDefaultImages[bootstrapRuntimeKind(defaults.WorkerRuntimeKind)] = defaults.WorkerImage
+	}
+	fillBuiltinWorkerRuntimeDefaultImages(ctx, &resp, hubSvc)
+	return resp
+}
+
+func managerRuntimeReadiness() managerRuntimeResponse {
+	resp := managerRuntimeResponse{
+		Name:            agent.RuntimeNameCodex,
+		Label:           "Codex CLI",
+		SandboxEnabled:  false,
+		Installed:       true,
+		OS:              goruntime.GOOS,
+		DocsURL:         "https://developers.openai.com/codex",
+		InstallGuidance: codexInstallGuidance(goruntime.GOOS),
+	}
+	if path, err := locateCodexCLI(); err == nil {
+		resp.Path = path
+		return resp
+	}
+	resp.Installed = false
+	resp.Message = "Bundled Codex CLI is unavailable"
+	return resp
+}
+
+func codexInstallGuidance(_ string) string {
+	return "Codex CLI is bundled with CSGClaw. Reinstall CSGClaw if the bundled executable is missing."
+}
+
+func workerRuntimeChoices(ctx context.Context, cfg config.Config) []workerRuntimeChoiceResponse {
+	sandboxInstalled := true
+	sandboxMessage := ""
+	sandboxMessageCode := ""
+	if err := sandboxRuntimeAvailability(ctx, cfg.Sandbox); err != nil {
+		sandboxInstalled = false
+		sandboxMessage = friendlySandboxRuntimeMessage(cfg.Sandbox, err)
+		sandboxMessageCode = sandboxRuntimeMessageCode(cfg.Sandbox, err)
+	}
+	choices := []workerRuntimeChoiceResponse{
+		{
+			Name:           agent.RuntimeNameCodex,
+			Label:          "Codex CLI",
+			SandboxEnabled: false,
+			Installed:      true,
+		},
+		{
+			Name:           agent.RuntimeNameDSH,
+			Label:          "DeepSeek Harness",
+			SandboxEnabled: false,
+			Installable:    true,
+		},
+		{
+			Name:           agent.RuntimeNameOpenClaw,
+			Label:          "OpenClaw",
+			SandboxEnabled: true,
+			Installed:      sandboxInstalled,
+			Message:        sandboxMessage,
+			MessageCode:    sandboxMessageCode,
+		},
+		{
+			Name:           agent.RuntimeNamePicoClaw,
+			Label:          "PicoClaw",
+			SandboxEnabled: true,
+			Installed:      sandboxInstalled,
+			Message:        sandboxMessage,
+			MessageCode:    sandboxMessageCode,
+		},
+	}
+	if _, err := locateCodexCLI(); err != nil {
+		choices[0].Installed = false
+		choices[0].Message = "Bundled Codex CLI is unavailable"
+	}
+	if _, err := (dshcli.Provider{}).Ensure(ctx); err != nil {
+		choices[1].Installed = false
+		choices[1].Message = "DeepSeek Harness is not installed"
+		choices[1].MessageCode = "dsh_not_installed"
+	} else {
+		choices[1].Installed = true
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.Sandbox.Provider), config.CSGHubProvider) {
+		return choices[:2]
+	}
+	return choices
+}
+
+func sandboxRuntimeMessageCode(cfg config.SandboxConfig, err error) string {
+	if !strings.EqualFold(strings.TrimSpace(cfg.Resolved().Provider), config.DockerProvider) {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "docker_availability_timeout"
+	}
+	if sandbox.IsUnavailable(err) {
+		return "docker_unavailable"
+	}
+	return ""
+}
+
+func sandboxRuntimeAvailability(ctx context.Context, cfg config.SandboxConfig) error {
+	if err := sandboxProviderAvailability(cfg); err != nil {
+		return err
+	}
+	provider, err := sandboxProviderForRuntime(cfg)
+	if err != nil {
+		return err
+	}
+	checker, ok := provider.(sandbox.AvailabilityChecker)
+	if !ok {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, sandboxRuntimeChoiceAvailabilityTimeout)
+	defer cancel()
+	return checker.CheckAvailability(probeCtx)
+}
+
+func friendlySandboxRuntimeMessage(cfg config.SandboxConfig, err error) string {
+	if strings.EqualFold(strings.TrimSpace(cfg.Resolved().Provider), config.DockerProvider) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return "Docker availability check timed out. Make sure Docker Desktop or Docker Engine is running."
+		}
+		if sandbox.IsUnavailable(err) {
+			return "Docker is not running or cannot be reached. Start Docker Desktop or Docker Engine and try again."
+		}
+	}
+	return err.Error()
+}
+
+func (h *Handler) defaultWorkerCreateSpec(agentID, name string) agent.CreateAgentSpec {
+	spec := agent.CreateAgentSpec{
+		ID:             agentID,
+		Name:           name,
+		Role:           agent.RoleWorker,
+		RuntimeName:    agent.RuntimeNameCodex,
+		SandboxEnabled: false,
+		RuntimeKind:    agent.RuntimeKindCodex,
+	}
+	if _, err := locateCodexCLI(); err == nil {
+		return spec
+	}
+	if h == nil || h.svc == nil {
+		return spec
+	}
+	runtimeKind := h.agentRuntime.GatewayRuntime()
+	spec.RuntimeKind = runtimeKind
+	spec.RuntimeName = agent.RuntimeNamePicoClaw
+	spec.SandboxEnabled = true
+	switch runtimeKind {
+	case agent.RuntimeKindOpenClawSandbox:
+		spec.RuntimeName = agent.RuntimeNameOpenClaw
+	case agent.RuntimeKindPicoClawSandbox:
+		spec.RuntimeName = agent.RuntimeNamePicoClaw
+	}
+	return spec
+}
+
+func fillBuiltinWorkerRuntimeDefaultImages(ctx context.Context, resp *bootstrapConfigResponse, hubSvc *hub.Service) {
+	if resp == nil {
+		return
+	}
+	if resp.RuntimeDefaultImages == nil {
+		resp.RuntimeDefaultImages = map[string]string{}
+	}
+	resp.RuntimeDefaultImages[agentruntime.RuntimeConfigForKind(agent.RuntimeKindPicoClawSandbox).Kind()] = picoclawsandbox.DefaultImage
+	if hubSvc == nil {
+		return
+	}
+	builtinWorkerTemplates := map[string]string{
+		agentruntime.RuntimeConfigForKind(agent.RuntimeKindOpenClawSandbox).Kind(): "builtin.openclaw-worker",
+	}
+	for runtimeKind, templateID := range builtinWorkerTemplates {
+		if strings.TrimSpace(resp.RuntimeDefaultImages[runtimeKind]) != "" {
+			continue
+		}
+		item, err := hubSvc.Get(ctx, templateID)
+		if err != nil {
+			continue
+		}
+		if bootstrapRuntimeKind(item.RuntimeKind) != runtimeKind {
+			continue
+		}
+		if image := strings.TrimSpace(item.Image); image != "" {
+			resp.RuntimeDefaultImages[runtimeKind] = image
+		}
+	}
+}
+
+func (h *Handler) bootstrapConfigView(ctx context.Context, cfg config.Config) bootstrapConfigResponse {
+	var schemas map[string][]agentruntime.RuntimeOptionSchema
+	if h != nil {
+		schemas = h.runtimeOptionSchemasByKind([]string{
+			agent.RuntimeKindPicoClawSandbox,
+			agent.RuntimeKindOpenClawSandbox,
+			agent.RuntimeKindCodex,
+			agent.RuntimeKindDSH,
+		})
+	}
+	return bootstrapConfigView(ctx, cfg, h.hub, schemas)
+}
+
+func bootstrapRuntimeKind(runtime string) string {
+	cfg := agentruntime.RuntimeConfigForKind(runtime)
+	if kind := cfg.Kind(); kind != "" {
+		return kind
+	}
+	return agentruntime.RuntimeConfigForKind(agent.RuntimeKindPicoClawSandbox).Kind()
+}
+
+type createMessageRequest struct {
+	RoomID          string                       `json:"room_id"`
+	ClientMessageID string                       `json:"client_message_id,omitempty"`
+	SenderID        string                       `json:"sender_id"`
+	Content         string                       `json:"content"`
+	Locale          string                       `json:"locale,omitempty"`
+	MentionID       string                       `json:"mention_id,omitempty"`
+	Metadata        map[string]any               `json:"metadata,omitempty"`
+	RelatesTo       *im.MessageRelation          `json:"relates_to,omitempty"`
+	Attachments     []im.MessageAttachmentUpload `json:"attachments,omitempty"`
+}
+
+type addRoomMembersRequest struct {
+	RoomID    string   `json:"room_id"`
+	InviterID string   `json:"inviter_id"`
+	UserIDs   []string `json:"user_ids"`
+	Locale    string   `json:"locale"`
+}
+
+type removeRoomMemberRequest struct {
+	InviterID string `json:"inviter_id"`
+	Locale    string `json:"locale"`
+}
+
+func NewHandler(svc AgentServices, engine agentengine.Interface, imSvc *im.Service, imBus *im.Bus, participantBridge *im.ParticipantBridge, feishu *feishu.Service, llmSvc *llm.Service) *Handler {
+	return NewHandlerWithAccessToken(svc, engine, imSvc, imBus, participantBridge, feishu, llmSvc, "")
+}
+
+func NewHandlerWithAccessToken(svc AgentServices, engine agentengine.Interface, imSvc *im.Service, imBus *im.Bus, participantBridge *im.ParticipantBridge, feishu *feishu.Service, llmSvc *llm.Service, serverAccessToken string) *Handler {
+	return NewHandlerWithAuth(svc, engine, imSvc, imBus, participantBridge, feishu, llmSvc, serverAccessToken, false)
+}
+
+func NewHandlerWithAuth(svc AgentServices, engine agentengine.Interface, imSvc *im.Service, imBus *im.Bus, participantBridge *im.ParticipantBridge, feishu *feishu.Service, llmSvc *llm.Service, serverAccessToken string, serverNoAuth bool) *Handler {
+	h := &Handler{
+		svc:               svc.Records,
+		agentEngine:       engine,
+		im:                imSvc,
+		csgclaw:           csgclawchannel.NewService(imSvc),
+		imBus:             imBus,
+		imProvisioner:     im.NewProvisioner(imSvc, imBus),
+		participantBridge: participantBridge,
+		feishu:            feishu,
+		llm:               llmSvc,
+		serverAccessToken: serverAccessToken,
+		serverNoAuth:      serverNoAuth,
+		upgradeApply:      upgrade.StartApplyHelper, workspace: svc.Workspace, agentModels: svc.Models, agentRuntime: svc.Runtime,
+	}
+	return h
+}
+
+// SetEventStreamShutdown supplies the shutdown notification for passive event
+// subscriptions. Configure it before serving requests.
+func (h *Handler) SetEventStreamShutdown(done <-chan struct{}) {
+	if h != nil {
+		h.eventStreamShutdown = done
+	}
+}
+
+func (h *Handler) SetNotificationDeliver(d notification.Fanouter) {
+	if h != nil {
+		h.notificationDeliver = d
+	}
+}
+
+func (h *Handler) SetParticipantService(svc *participant.Service) {
+	if h != nil {
+		h.participant = svc
+		h.configureRuntimeExtensionSources()
+	}
+}
+
+func (h *Handler) SetParticipantWorkService(
+	reporter worklease.ParticipantWorkReporter,
+	bus *worklease.Bus,
+	controlBus ...*worklease.ControlBus,
+) {
+	if h != nil {
+		h.participantWork = reporter
+		h.workBus = bus
+		if len(controlBus) > 0 {
+			h.workControlBus = controlBus[0]
+		}
+	}
+}
+
+func (h *Handler) SetActivityDecider(decider ActivityDecider) {
+	if h != nil {
+		h.activityDecider = decider
+	}
+}
+
+func (h *Handler) SetUserInputResponder(responder UserInputResponder) {
+	if h != nil {
+		h.userInputResponder = responder
+	}
+}
+
+func (h *Handler) SetAgentEngine(engine agentengine.Interface, bindings *agentsession.Store) {
+	if h != nil {
+		h.agentEngine = engine
+		h.sessionBindings = bindings
+		h.runtimeExtensionSourcesSet = false
+		h.configureRuntimeExtensionSources()
+	}
+}
+
+func (h *Handler) SetChannelBindingReconciler(reconciler ChannelBindingReconciler) {
+	if h != nil {
+		h.channelBindings = reconciler
+	}
+}
+
+func (h *Handler) configureRuntimeExtensionSources() {
+	if h == nil || h.runtimeExtensionSourcesSet || h.participant == nil || h.agentEngine == nil {
+		return
+	}
+	registrar, ok := h.agentEngine.(interface {
+		RegisterRuntimeExtensionSource(string, agentengine.RuntimeExtensionSource) error
+	})
+	if !ok {
+		return
+	}
+	source, err := feishularkcli.NewSource(feishularkcli.Options{
+		Participants: h.participant,
+		BaseURL:      h.internalSourceBaseURL,
+		AccessToken:  h.larkCLIRevisionAccessToken,
+		HelperPath:   larkCLISourceHelperPath,
+	})
+	if err != nil {
+		return
+	}
+	if err := registrar.RegisterRuntimeExtensionSource("feishu-participant", source); err != nil {
+		if !strings.Contains(err.Error(), "already registered") {
+			return
+		}
+	}
+	h.runtimeExtensionSourcesSet = true
+}
+
+func (h *Handler) localChannel() *csgclawchannel.Service {
+	if h == nil {
+		return nil
+	}
+	if h.csgclaw != nil {
+		return h.csgclaw
+	}
+	return csgclawchannel.NewService(h.im)
+}
+
+func (h *Handler) requireLocalChannel(w http.ResponseWriter) (*csgclawchannel.Service, bool) {
+	channel := h.localChannel()
+	if channel == nil {
+		http.Error(w, "im service is not configured", http.StatusServiceUnavailable)
+		return nil, false
+	}
+	return channel, true
+}
+
+func (h *Handler) SetUpgradeManager(manager *upgrade.Manager) {
+	h.upgradeManager = manager
+}
+
+func (h *Handler) SetHubService(svc *hub.Service) {
+	h.hub = svc
+}
+
+func (h *Handler) SetMCPService(svc *mcp.Service) {
+	if h != nil {
+		h.mcp = svc
+	}
+}
+
+func (h *Handler) SetTeamService(svc *team.Service) {
+	if h != nil {
+		h.teamSvc = svc
+	}
+}
+
+func (h *Handler) SetAgentTaskService(svc *agenttask.Service) {
+	if h != nil {
+		h.agentTaskSvc = svc
+	}
+}
+
+func (h *Handler) SetScheduledTaskService(svc *scheduledtask.Service) {
+	if h != nil {
+		h.scheduledTaskSvc = svc
+	}
+}
+
+func (h *Handler) SetConnectorService(svc *connectors.Service) {
+	if h != nil {
+		h.connectors = svc
+	}
+}
+
+func (h *Handler) SetAgentRuntimeService(svc *runtimecatalog.Service) {
+	if h != nil {
+		h.agentRuntimes = svc
+	}
+}
+
+func (h *Handler) SetTeamAdapterRegistry(registry *team.AdapterRegistry) {
+	if h != nil {
+		h.teamAdapters = registry
+	}
+}
+
+func (h *Handler) SetUpgradeConfigPath(configPath string) {
+	h.upgradeConfigPath = strings.TrimSpace(configPath)
+}
+
+func (h *Handler) SetServerRestartApplyFunc(apply func(upgrade.RestartHelperOptions) error) {
+	if apply == nil {
+		h.serverRestartApply = upgrade.StartRestartHelper
+		return
+	}
+	h.serverRestartApply = apply
+}
+
+func (h *Handler) SetUpgradeApplyFunc(apply func(upgrade.ApplyHelperOptions) error) {
+	if apply == nil {
+		h.upgradeApply = upgrade.StartApplyHelper
+		return
+	}
+	h.upgradeApply = apply
+}
+
+func (h *Handler) SetConfigPath(path string) {
+	if h != nil {
+		h.configPath = strings.TrimSpace(path)
+	}
+}
+
+func (h *Handler) SetAdvertiseBaseURL(baseURL string) {
+	if h != nil {
+		h.advertiseBaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	}
+}
+
+func (h *Handler) SetInternalBaseURL(baseURL string) {
+	if h != nil {
+		h.internalBaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	}
+}
+
+func (h *Handler) SetRuntimeDistribution(distribution string) {
+	if h != nil {
+		h.runtimeDistribution = strings.TrimSpace(distribution)
+	}
+}
+
+func (h *Handler) SetDesktopSessionToken(token string) {
+	if h != nil {
+		h.desktopSessionToken = strings.TrimSpace(token)
+	}
+}
+
+func (h *Handler) validateServerAccessToken(authHeader string) bool {
+	if h.apps != nil && strings.HasPrefix(authHeader, "Bearer agent.") {
+		return false
+	}
+	if h.serverNoAuth {
+		return true
+	}
+	if token := strings.TrimSpace(h.desktopSessionToken); token != "" && authHeader == "Bearer "+token {
+		return true
+	}
+	token := strings.TrimSpace(h.serverAccessToken)
+	return authHeader == "Bearer "+token
+}
+
+func (h *Handler) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (h *Handler) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, apitypes.VersionResponse{
+		Version: version.Current(),
+	})
+}
+
+func (h *Handler) handleUpgradeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.upgradeManager == nil {
+		http.Error(w, "upgrade manager is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if h.runtimeDistribution != "electron" {
+		if outcome, err := upgrade.ConsumeApplyStatus(h.upgradeConfigPath); err != nil {
+			http.Error(w, fmt.Sprintf("read upgrade helper status: %v", err), http.StatusInternalServerError)
+			return
+		} else {
+			switch outcome.Status {
+			case upgrade.ApplyStatusFailed:
+				if outcome.Message != "" {
+					h.upgradeManager.MarkUpgradeFailedWithDetails(errors.New(outcome.Message), outcome.ErrorKind, outcome.LogPath)
+				}
+			case upgrade.ApplyStatusManualRestartRequired:
+				h.upgradeManager.MarkManualRestartRequired()
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, h.upgradeManager.Status())
+}
+
+func (h *Handler) handleUpgradeChannel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.upgradeManager == nil {
+		http.Error(w, "upgrade manager is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var req apitypes.UpdateUpgradeChannelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	channel, err := upgrade.NormalizeChannel(req.Channel)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	currentStatus := h.upgradeManager.Status()
+	installedChannel := upgrade.InferChannelFromVersion(currentStatus.CurrentVersion)
+	if channel != installedChannel && !currentStatus.AutoUpgradeSupported {
+		if currentStatus.AutoUpgradeUnsupportedReason == "desktop_managed" {
+			http.Error(w, "desktop updates are managed by Electron", http.StatusConflict)
+			return
+		}
+		http.Error(w, "current installation is not an official csgclaw bundle; please upgrade manually", http.StatusConflict)
+		return
+	}
+	status, err := h.upgradeManager.SetChannel(r.Context(), string(channel))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if channel == installedChannel {
+		writeJSON(w, http.StatusOK, status)
+		return
+	}
+	if !status.UpdateAvailable {
+		http.Error(w, "target channel does not provide a different installable version", http.StatusConflict)
+		return
+	}
+
+	apply := h.upgradeApply
+	if apply == nil {
+		apply = upgrade.StartApplyHelper
+	}
+	status = h.upgradeManager.MarkUpgrading()
+	if err := apply(upgrade.ApplyHelperOptions{
+		ConfigPath:    h.upgradeConfigPath,
+		Channel:       string(channel),
+		SwitchChannel: true,
+	}); err != nil {
+		h.upgradeManager.MarkUpgradeFailed(err)
+		http.Error(w, fmt.Sprintf("start channel switch helper: %v", err), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, status)
+}
+
+func (h *Handler) handleUpgradeApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.upgradeManager == nil {
+		http.Error(w, "upgrade manager is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	status := h.upgradeManager.Status()
+	if !status.AutoUpgradeSupported {
+		if status.AutoUpgradeUnsupportedReason == "desktop_managed" {
+			http.Error(w, "desktop updates are managed by Electron", http.StatusConflict)
+			return
+		}
+		http.Error(w, "current installation is not an official csgclaw bundle; please upgrade manually", http.StatusConflict)
+		return
+	}
+
+	apply := h.upgradeApply
+	if apply == nil {
+		apply = upgrade.StartApplyHelper
+	}
+	h.upgradeManager.MarkUpgrading()
+	if err := apply(upgrade.ApplyHelperOptions{ConfigPath: h.upgradeConfigPath, Channel: status.Channel}); err != nil {
+		h.upgradeManager.MarkUpgradeFailed(err)
+		http.Error(w, fmt.Sprintf("start upgrade helper: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, apitypes.UpgradeActionResponse{
+		Status:  "accepted",
+		Message: "upgrade helper started",
+	})
+}
+
+func (h *Handler) handleAgents(w http.ResponseWriter, r *http.Request) {
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	agents := h.agentEngine.Agents()
+	switch r.Method {
+	case http.MethodGet:
+		ctx, cancel := context.WithTimeout(r.Context(), agentRuntimeStatusTimeout)
+		defer cancel()
+		items, err := agents.List(ctx, agentengine.AgentListOptions{Reload: true, ProbeRuntime: true})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if caller := appRequestAgentID(r); caller != "" {
+			public := []map[string]any{}
+			for _, item := range items {
+				if h.platformVisibleAgent(caller, item.ID) {
+					public = append(public, platformAgentSummary(serviceAgentFromEngine(item)))
+				}
+			}
+			writeJSON(w, http.StatusOK, public)
+			return
+		}
+		writeJSON(w, http.StatusOK, h.presentEngineAgentsForRequest(r, items))
+	case http.MethodPost:
+		h.handleCreateAgentWorker(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleAgentByID(w http.ResponseWriter, r *http.Request) {
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	agents := h.agentEngine.Agents()
+
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		// A detail request is an explicit inspection point. Unlike the roster
+		// path, it may make the bounded optional readiness probe needed to tell
+		// whether a running gateway can accept work.
+		ctx, cancel := context.WithTimeout(r.Context(), agentRuntimeStatusTimeout)
+		defer cancel()
+		item, err := agents.Get(ctx, id, agentengine.AgentGetOptions{Reload: true, ProbeRuntime: true})
+		if err != nil {
+			writeAgentGetError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, h.presentEngineAgentForRequest(r, item))
+	case http.MethodPatch:
+		var req agent.UpdateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+			return
+		}
+		current, err := agents.Get(r.Context(), id, agentengine.AgentGetOptions{})
+		if err != nil {
+			http.Error(w, "agent not found", http.StatusNotFound)
+			return
+		}
+		update := engineUpdateRequest(req, current.ResourceVersion)
+		billingModel := current.Spec.Model
+		if agentUpdateIncludes(update, "model") {
+			billingModel = update.Spec.Model
+		}
+		billingProfile := serviceProfileFromEngine(agentengine.ModelView{ModelSpec: billingModel})
+		updated, err := agents.Update(r.Context(), id, update)
+		if err != nil {
+			writeAgentOperationErrorWithBillingURL(
+				w,
+				err,
+				http.StatusBadRequest,
+				llm.OpenCSGBillingURL(billingProfile),
+			)
+			return
+		}
+		serviceUpdated := serviceAgentFromEngine(updated)
+		h.publishUpdatedAgentUser(serviceUpdated)
+		writeJSON(w, http.StatusOK, h.presentEngineAgentForRequest(r, updated))
+	case http.MethodDelete:
+		var err error
+		if h.participant != nil {
+			_, err = h.participant.DeleteAgent(r.Context(), id)
+		} else {
+			err = agents.Delete(r.Context(), id)
+		}
+		if err != nil {
+			writeAgentOperationError(w, err, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) publishUpdatedAgentUser(updated agent.Agent) {
+	if h == nil || h.im == nil {
+		return
+	}
+	user, ok, err := h.im.UpdateAgentUser(im.UpdateAgentUserRequest{
+		ID:          updated.ID,
+		Name:        updated.Name,
+		Description: updated.Description,
+		Role:        updated.Role,
+	})
+	if err != nil || !ok {
+		return
+	}
+	if h.participant != nil {
+		name := updated.Name
+		for _, item := range h.participant.List(participant.ListOptions{Channel: participant.ChannelCSGClaw, AgentID: updated.ID}) {
+			if strings.TrimSpace(item.ID) == "" {
+				continue
+			}
+			_, _, _ = h.participant.Update(context.Background(), participant.ChannelCSGClaw, item.ID, participant.UpdateRequest{
+				Name: &name,
+			})
+		}
+	}
+	if h.imBus != nil {
+		userCopy := user
+		h.imBus.Publish(im.Event{
+			Type: im.EventTypeUserUpdated,
+			User: &userCopy,
+		})
+	}
+}
+
+func (h *Handler) handleAgentProfileByID(w http.ResponseWriter, r *http.Request) {
+	selector := strings.TrimSpace(pathValue(r, "id"))
+	if selector == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	selected, err := h.agentEngine.Agents().Get(r.Context(), selector, agentengine.AgentGetOptions{Reload: r.Method == http.MethodGet})
+	if err != nil {
+		http.Error(w, "agent not found", http.StatusNotFound)
+		return
+	}
+	h.handleAgentProfile(w, r, selected.ID)
+}
+
+func (h *Handler) handleAgentRecreateByID(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleAgentRecreate(w, r, id)
+}
+
+func (h *Handler) handleAgentUpgradeByID(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleAgentUpgrade(w, r, id)
+}
+
+func (h *Handler) handleAgentProfile(w http.ResponseWriter, r *http.Request, id string) {
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	agents := h.agentEngine.Agents()
+	switch r.Method {
+	case http.MethodGet:
+		selected, err := agents.Get(r.Context(), id, agentengine.AgentGetOptions{Reload: true})
+		if err != nil {
+			http.Error(w, "agent not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, profileResponseFromAgentView(serviceProfileViewFromEngine(selected.Status.Model)))
+	case http.MethodPut:
+		var req agent.AgentProfile
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+			return
+		}
+		selected, err := agents.Get(r.Context(), id, agentengine.AgentGetOptions{})
+		if err != nil {
+			http.Error(w, "agent not found", http.StatusNotFound)
+			return
+		}
+		model := engineModelFromProfile(req)
+		billingProfile := serviceProfileFromEngine(agentengine.ModelView{ModelSpec: model})
+		selected.Spec.Model = model
+		updated, err := agents.Update(r.Context(), id, agentengine.AgentUpdateRequest{Spec: selected.Spec, FieldMask: []string{"model"}, ResourceVersion: selected.ResourceVersion})
+		if err != nil {
+			writeAgentOperationErrorWithBillingURL(
+				w,
+				err,
+				http.StatusBadRequest,
+				llm.OpenCSGBillingURL(billingProfile),
+			)
+			return
+		}
+		writeJSON(w, http.StatusOK, profileResponseFromAgentView(serviceProfileViewFromEngine(updated.Status.Model)))
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleAgentRecreate(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	recreated, err := h.agentEngine.Agents().Recreate(r.Context(), id, agentengine.AgentRecreateOptions{})
+	if err != nil {
+		writeAgentOperationError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, h.presentEngineAgentForRequest(r, recreated))
+}
+
+func (h *Handler) handleAgentUpgrade(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	recreated, err := h.agentEngine.Agents().Recreate(r.Context(), id, agentengine.AgentRecreateOptions{UpgradeImage: true})
+	if err != nil {
+		writeAgentOperationError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, h.presentEngineAgentForRequest(r, recreated))
+}
+
+func (h *Handler) handleAgentProfileModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.svc == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var req agent.ProfileModelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	models, err := h.agentModels.ListModelsForRequest(r.Context(), req)
+	if err != nil {
+		writeAgentOperationError(w, err, http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, agent.ProfileModelsResponse{
+		Provider: req.Provider,
+		Models:   models,
+	})
+}
+
+func (h *Handler) handleAgentProfileDefaults(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.svc == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusOK, profileResponseFromAgentView(h.agentModels.ProfileDefaultsView()))
+}
+
+func (h *Handler) handleAgentStart(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	agents := h.agentEngine.Agents()
+	current, err := agents.Get(r.Context(), id, agentengine.AgentGetOptions{Reload: true})
+	if err != nil {
+		writeAgentOperationError(w, err, http.StatusBadRequest)
+		return
+	}
+	current.Spec.DesiredState = agentengine.AgentDesiredStateRunning
+	started, err := agents.Update(r.Context(), id, agentengine.AgentUpdateRequest{Spec: current.Spec, FieldMask: []string{"desired_state"}, ResourceVersion: current.ResourceVersion})
+	if err != nil {
+		writeAgentOperationError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, h.presentEngineAgentForRequest(r, started))
+}
+
+func (h *Handler) handleAgentStartByID(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleAgentStart(w, r, id)
+}
+
+func (h *Handler) handleAgentStop(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	agents := h.agentEngine.Agents()
+	current, err := agents.Get(r.Context(), id, agentengine.AgentGetOptions{Reload: true})
+	if err != nil {
+		writeAgentOperationError(w, err, http.StatusBadRequest)
+		return
+	}
+	current.Spec.DesiredState = agentengine.AgentDesiredStateStopped
+	stopped, err := agents.Update(r.Context(), id, agentengine.AgentUpdateRequest{Spec: current.Spec, FieldMask: []string{"desired_state"}, ResourceVersion: current.ResourceVersion})
+	if err != nil {
+		writeAgentOperationError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, h.presentEngineAgentForRequest(r, stopped))
+}
+
+func (h *Handler) handleAgentStopByID(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleAgentStop(w, r, id)
+}
+
+func (h *Handler) handleAgentApplyBindings(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.svc == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	channel, err := applyBindingsChannel(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.svc.Reload(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	target, ok := h.svc.Agent(id)
+	if !ok {
+		http.Error(w, fmt.Sprintf("agent %q not found", id), http.StatusNotFound)
+		return
+	}
+	refreshed, _, err := h.refreshAgentChannel(r.Context(), target, channel)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	writeJSON(w, http.StatusOK, h.presentAgentResponse(refreshed))
+}
+
+type applyAgentBindingsRequest struct {
+	Channel string `json:"channel"`
+}
+
+func applyBindingsChannel(r *http.Request) (string, error) {
+	if r == nil {
+		return "", nil
+	}
+	channel := strings.TrimSpace(r.URL.Query().Get("channel"))
+	if channel != "" {
+		return channel, nil
+	}
+	if r.Body == nil {
+		return feishu.ChannelID, nil
+	}
+	var req applyAgentBindingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if errors.Is(err, io.EOF) {
+			return feishu.ChannelID, nil
+		}
+		return "", fmt.Errorf("decode apply bindings request: %w", err)
+	}
+	channel = strings.TrimSpace(req.Channel)
+	if channel == "" {
+		// Legacy Feishu skills called this endpoint before channel was explicit.
+		return feishu.ChannelID, nil
+	}
+	return channel, nil
+}
+
+func (h *Handler) handleAgentApplyBindingsByID(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleAgentApplyBindings(w, r, id)
+}
+
+func (h *Handler) handleAgentLogs(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.svc.Reload(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	lines := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("lines")); raw != "" {
+		if _, err := fmt.Sscanf(raw, "%d", &lines); err != nil || lines <= 0 {
+			http.Error(w, "invalid lines value", http.StatusBadRequest)
+			return
+		}
+	}
+	follow := parseBoolQuery(r.URL.Query().Get("follow"))
+
+	logWriter := io.Writer(w)
+	if follow {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming is not supported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		logWriter = flushWriter{ResponseWriter: w, flusher: flusher}
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if err := h.workspace.StreamLogs(r.Context(), id, follow, lines, logWriter); err != nil {
+		if !parseBoolQuery(r.URL.Query().Get("follow")) {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		if _, writeErr := io.WriteString(w, err.Error()+"\n"); writeErr != nil {
+			return
+		}
+	}
+}
+
+func (h *Handler) handleAgentLogsByID(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleAgentLogs(w, r, id)
+}
+
+type flushWriter struct {
+	http.ResponseWriter
+	flusher http.Flusher
+}
+
+func (w flushWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if n > 0 {
+		w.flusher.Flush()
+	}
+	return n, err
+}
+
+func parseBoolQuery(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) handleCreateAgentWorker(w http.ResponseWriter, r *http.Request) {
+	var req apitypes.CreateAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	hubSvc, err := h.hubServiceForRequest(r)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("resolve hub service: %v", err), http.StatusInternalServerError)
+		return
+	}
+	createReq := agentCreateRequestFromAPI(req)
+	if h.agentEngine == nil {
+		http.Error(w, "agent service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	skippedResources := []mcp.SkippedTemplateResource{}
+	ctx := agentengine.WithLocalTemplateService(r.Context(), hubSvc)
+	ctx = agentengine.WithTemplateMCPAvailability(ctx, h.mcp, &skippedResources)
+	agents := h.agentEngine.Agents()
+	var created agentengine.Agent
+	if createReq.Replace {
+		current, getErr := agents.Get(ctx, createReq.Spec.ID, agentengine.AgentGetOptions{})
+		if getErr != nil {
+			writeAgentOperationErrorWithBillingURL(w, getErr, http.StatusBadRequest, llm.OpenCSGBillingURL(createReq.Spec.AgentProfile))
+			return
+		}
+		update := engineReplaceRequest(createReq, current)
+		created, err = agents.Recreate(ctx, current.ID, agentengine.AgentRecreateOptions{Update: &update})
+	} else {
+		created, err = agents.Create(ctx, engineCreateRequest(createReq))
+	}
+	if err != nil {
+		writeAgentOperationErrorWithBillingURL(w, err, http.StatusBadRequest, llm.OpenCSGBillingURL(createReq.Spec.AgentProfile))
+		return
+	}
+	response := h.presentEngineAgentForRequest(r, created)
+	response.SkippedResources = skippedResources
+	writeJSON(w, http.StatusCreated, response)
+}
+
+func writeAgentOperationError(w http.ResponseWriter, err error, defaultStatus int) {
+	writeAgentOperationErrorWithBillingURL(w, err, defaultStatus, "")
+}
+
+func writeAgentGetError(w http.ResponseWriter, err error) {
+	if agentengine.ErrorCodeOf(err) == agentengine.ErrorAgentNotFound {
+		http.Error(w, "agent not found", http.StatusNotFound)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+func writeAgentOperationErrorWithBillingURL(w http.ResponseWriter, err error, defaultStatus int, billingURL string) {
+	if errors.Is(err, agent.ErrHomeCleanup) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": map[string]any{
+				"code":    "agent_home_cleanup_failed",
+				"message": "agent local files are still in use",
+			},
+		})
+		return
+	}
+	if sandbox.IsUnavailable(err) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]any{
+				"code":    "docker_unavailable",
+				"message": "Docker is not running or cannot be reached",
+			},
+		})
+		return
+	}
+	if status, code, message, ok := modelprovider.UserFacingUpstreamError(err); ok {
+		errorPayload := map[string]any{
+			"code":    code,
+			"message": message,
+		}
+		normalizedCode := strings.ToLower(strings.TrimSpace(code))
+		if (normalizedCode == "insufficient_balance" || normalizedCode == "act-err-0") && strings.TrimSpace(billingURL) != "" {
+			errorPayload["billing_url"] = strings.TrimSpace(billingURL)
+		}
+		writeJSON(w, status, map[string]any{
+			"error": errorPayload,
+		})
+		return
+	}
+	status := defaultStatus
+	if isAgentAPIResourceNotFoundError(err) {
+		status = http.StatusNotFound
+	}
+	http.Error(w, err.Error(), status)
+}
+
+func isAgentAPIResourceNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return (strings.HasPrefix(message, "agent \"") || strings.HasPrefix(message, "mcp server \"")) &&
+		strings.HasSuffix(message, " not found")
+}
+
+func agentCreateRequestFromAPI(req apitypes.CreateAgentRequest) agent.CreateRequest {
+	profileReq := req.ProfileConfig
+	if profileReq == nil {
+		profileReq = req.AgentProfile
+	}
+	prof := agentProfileFromAPI(profileReq)
+	runtimeName := strings.TrimSpace(req.Runtime.Name)
+	runtimeKind := strings.TrimSpace(req.Runtime.Kind)
+	sandboxEnabled := req.Runtime.SandboxEnabled
+	if runtimeKind == "" {
+		runtimeKind = strings.TrimSpace(req.RuntimeKind)
+	}
+	if runtimeName == "" {
+		runtimeName = req.RuntimeName
+		sandboxEnabled = req.SandboxEnabled
+	}
+	runtimeOptions := utils.CloneAnyMapShallowNestedStringMaps(req.Runtime.Options)
+	if len(runtimeOptions) == 0 {
+		runtimeOptions = utils.CloneAnyMapShallowNestedStringMaps(req.RuntimeOptions)
+	}
+	mcpServers := utils.CloneAnyMapShallowNestedStringMaps(req.MCPServers)
+	if req.MCPServers != nil && mcpServers == nil {
+		mcpServers = map[string]any{}
+	}
+	return agent.CreateRequest{
+		Spec: agent.CreateAgentSpec{
+			ID:             req.ID,
+			Name:           req.Name,
+			Description:    req.Description,
+			Instructions:   req.Instructions,
+			Image:          req.Image,
+			RuntimeKind:    runtimeKind,
+			RuntimeName:    runtimeName,
+			SandboxEnabled: sandboxEnabled,
+			FromTemplate:   req.FromTemplate,
+			Role:           req.Role,
+			Status:         req.Status,
+			CreatedAt:      req.CreatedAt,
+			UpdatedAt:      req.CreatedAt,
+			Profile:        req.Profile,
+			RuntimeOptions: runtimeOptions,
+			MCPServers:     mcpServers,
+			MCPServersSet:  req.MCPServersSet,
+			AgentProfile:   prof,
+		},
+		Replace:   req.Replace,
+		FieldMask: req.FieldMask,
+	}
+}
+
+func (h *Handler) handleHubTemplates(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		hubSvc, err := h.hubServiceForRequest(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if hubSvc == nil {
+			http.Error(w, "hub service is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		items, err := hubSvc.List(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		items, err = h.filterHubTemplatesForConfiguredProvider(items)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, presentHubTemplates(items))
+	case http.MethodPost:
+		hubSvc, err := h.hubServiceForRequest(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if hubSvc == nil || h.svc == nil {
+			http.Error(w, "hub service is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		var req apitypes.CreateHubTemplateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+			return
+		}
+		var authStatus auth.Status
+		if strings.TrimSpace(req.Registry) == config.DefaultOfficialHubRegistryName {
+			authStatus, err = appAuthStatus(r)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !authStatus.Authenticated {
+				http.Error(w, "OpenCSG sign-in is required to publish templates", http.StatusUnauthorized)
+				return
+			}
+		}
+		if req.Deploy && strings.TrimSpace(req.Registry) != config.DefaultOfficialHubRegistryName {
+			http.Error(w, "only community templates can be deployed", http.StatusBadRequest)
+			return
+		}
+		var item hub.Template
+		publishingTemplate := strings.TrimSpace(req.TemplateID) != ""
+		if publishingTemplate {
+			item, err = hubSvc.PublishTemplate(r.Context(), req.TemplateID, req.Registry, req.IncludeMemory)
+		} else {
+			var spec hub.PublishSpec
+			spec, err = h.workspace.HubPublishSpec(req.AgentID, req.IncludeMemory)
+			if err == nil {
+				spec.Registry = req.Registry
+				if strings.TrimSpace(req.Name) != "" {
+					spec.ID = strings.TrimSpace(req.Name)
+					spec.Name = strings.TrimSpace(req.Name)
+				}
+				if req.Description != nil {
+					spec.Description = strings.TrimSpace(*req.Description)
+				}
+				err = hub.ValidatePublishTemplateName(spec.Name)
+				if err == nil {
+					err = validateAgentTemplatePublishTarget(spec, req.Registry)
+				}
+			}
+			if err == nil {
+				item, err = hubSvc.Publish(r.Context(), spec)
+			}
+		}
+		if err != nil {
+			status := http.StatusBadGateway
+			code := hub.RemoteAPIErrorCode(err)
+			if !publishingTemplate {
+				status = http.StatusBadRequest
+			}
+			if code == "SYS-ERR-4" {
+				status = http.StatusBadRequest
+			}
+			if errors.Is(err, hub.ErrTemplateAlreadyExists) {
+				status = http.StatusConflict
+				if code == "" {
+					code = "template_already_exists"
+				}
+			}
+			if errors.Is(err, hub.ErrTemplateSensitiveInfo) {
+				status = http.StatusBadRequest
+				if code == "" {
+					code = "SENSITIVE-ERR-0"
+				}
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "not found") {
+				status = http.StatusNotFound
+				if code == "" {
+					code = "template_not_found"
+				}
+			}
+			if code == "" {
+				code = "template_publish_failed"
+			}
+			writeHubTemplateError(w, status, code, err.Error(), "")
+			return
+		}
+		if req.Deploy {
+			if err := createCommunityAgentInstance(r.Context(), item, authStatus); err != nil {
+				status := http.StatusBadGateway
+				code := ""
+				if errors.Is(err, errCommunityInstanceTemplatePending) {
+					status = http.StatusConflict
+					code = communityInstanceTemplatePendingCode
+				} else if errors.Is(err, errCommunityInstanceSensitiveCheck) {
+					status = http.StatusConflict
+					code = communityInstanceSensitiveCheckCode
+				} else if errors.Is(err, errCommunityInstanceResourceUnavailable) {
+					status = http.StatusServiceUnavailable
+					code = communityInstanceResourceUnavailableCode
+				}
+				if code == "" {
+					code = "template_deploy_failed"
+				}
+				writeHubTemplateError(w, status, code, communityInstanceUpstreamMessage(err), item.ID)
+				return
+			}
+		}
+		writeJSON(w, http.StatusCreated, presentHubTemplate(item))
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func writeHubTemplateError(w http.ResponseWriter, status int, code, message, publishedTemplateID string) {
+	payload := map[string]any{
+		"code":    strings.TrimSpace(code),
+		"message": strings.TrimSpace(message),
+	}
+	if publishedTemplateID = strings.TrimSpace(publishedTemplateID); publishedTemplateID != "" {
+		payload["published_template_id"] = publishedTemplateID
+	}
+	writeJSON(w, status, map[string]any{"error": payload})
+}
+
+func validateAgentTemplatePublishTarget(spec hub.PublishSpec, registry string) error {
+	runtimeName := agentruntime.NormalizeRuntimeName(spec.RuntimeKind)
+	if strings.TrimSpace(registry) == config.DefaultOfficialHubRegistryName &&
+		!hub.CanPublishCommunityTemplateRuntime(runtimeName) {
+		return fmt.Errorf("only Codex and DSH agents can be published to the community")
+	}
+	return nil
+}
+
+func (h *Handler) filterHubTemplatesForConfiguredProvider(items []hub.Template) ([]hub.Template, error) {
+	if strings.TrimSpace(h.configPath) == "" {
+		return items, nil
+	}
+	cfg, _, err := h.loadBootstrapConfig()
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(cfg.Sandbox.Provider), config.CSGHubProvider) {
+		return items, nil
+	}
+
+	filtered := make([]hub.Template, 0, len(items))
+	for _, item := range items {
+		runtimeName := agentruntime.NormalizeRuntimeName(item.RuntimeKind)
+		if strings.EqualFold(strings.TrimSpace(item.Role), hub.TemplateRoleWorker) &&
+			(runtimeName == agentruntime.NameCodex || runtimeName == agentruntime.NameDSH) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
+}
+
+func (h *Handler) handleHubTemplateByID(w http.ResponseWriter, r *http.Request) {
+	h.handleHubTemplateByResolvedID(w, r, hubTemplateIDPathValue(r))
+}
+
+func (h *Handler) handleHubTemplateByResolvedID(w http.ResponseWriter, r *http.Request, id string) {
+	hubSvc, err := h.hubServiceForRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if hubSvc == nil {
+		http.Error(w, "hub service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		item, err := hubSvc.Get(r.Context(), id)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "not found") {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		presented, err := h.presentHubTemplateDetail(r.Context(), item)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		writeJSON(w, http.StatusOK, presented)
+	case http.MethodDelete:
+		if err := hubSvc.Delete(r.Context(), id); err != nil {
+			status := http.StatusBadRequest
+			switch {
+			case errors.Is(err, hub.ErrTemplateNotFound), strings.Contains(strings.ToLower(err.Error()), "not found"):
+				status = http.StatusNotFound
+			case errors.Is(err, hub.ErrRegistryNotDeletable), errors.Is(err, hub.ErrRegistryNotWritable):
+				status = http.StatusForbidden
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleHubTemplateWorkspaceFileByID(w http.ResponseWriter, r *http.Request) {
+	h.handleHubTemplateWorkspaceFile(w, r, hubTemplateIDPathValue(r))
+}
+
+func presentHubTemplates(items []hub.Template) []apitypes.HubTemplate {
+	out := make([]apitypes.HubTemplate, 0, len(items))
+	for _, item := range items {
+		out = append(out, presentHubTemplate(item))
+	}
+	return out
+}
+
+func presentHubTemplate(item hub.Template) apitypes.HubTemplate {
+	presented := apitypes.HubTemplate{
+		ID:             item.ID,
+		Namespace:      item.Namespace,
+		Name:           item.Name,
+		Description:    item.Description,
+		Role:           item.Role,
+		RuntimeKind:    bootstrapRuntimeKind(item.RuntimeKind),
+		Version:        item.Version,
+		Image:          item.Image,
+		ImageEnv:       append([]apitypes.ImageEnvContract(nil), item.ImageEnv...),
+		RuntimeOptions: utils.CloneAnyMap(item.RuntimeOptions),
+		UpdatedAt:      item.UpdatedAt,
+		Source: apitypes.HubTemplateSource{
+			Name: item.Source.Name,
+			Kind: item.Source.Kind,
+		},
+		Workspace: apitypes.HubTemplateWorkspace{
+			Kind: item.WorkspaceRef.Kind,
+		},
+	}
+	if item.Metadata != nil && item.Metadata.SensitiveCheck != nil {
+		check := item.Metadata.SensitiveCheck
+		failures := make([]apitypes.HubTemplateSensitiveCheckFailureDetail, 0, len(check.FailureDetails))
+		for _, detail := range check.FailureDetails {
+			failures = append(failures, apitypes.HubTemplateSensitiveCheckFailureDetail{
+				Path: detail.Path, Status: detail.Status, Message: detail.Message,
+			})
+		}
+		presented.Metadata = &apitypes.HubTemplateMetadata{SensitiveCheck: &apitypes.HubTemplateSensitiveCheck{
+			Status: check.Status, FailureDetails: failures,
+		}}
+	}
+	return presented
+}
+
+func agentProfileFromAPI(req *apitypes.CreateAgentProfile) agent.AgentProfile {
+	if req == nil {
+		return agent.AgentProfile{}
+	}
+	return agent.AgentProfile{
+		ImageGeneration: modelprovider.CloneImageGeneration(req.ImageGeneration),
+		VideoGeneration: modelprovider.CloneVideoGeneration(req.VideoGeneration),
+		ModelProviderID: req.ModelProviderID,
+		BaseURL:         req.BaseURL,
+		APIKey:          req.APIKey,
+		Headers:         req.Headers,
+		ModelID:         req.ModelID,
+		ReasoningEffort: req.ReasoningEffort,
+		EnableFastMode:  req.EnableFastMode,
+		RequestOptions:  req.RequestOptions,
+		Env:             req.Env,
+	}
+}
+
+func (h *Handler) workerIMProvisioner() *im.Provisioner {
+	if h == nil || h.im == nil {
+		return nil
+	}
+	if h.imProvisioner == nil {
+		h.imProvisioner = im.NewProvisioner(h.im, h.imBus)
+	}
+	return h.imProvisioner
+}
+
+func (h *Handler) handleIMBootstrap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.reloadIM(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, h.presentBootstrap(h.im.Bootstrap()))
+}
+
+func (h *Handler) handleRooms(w http.ResponseWriter, r *http.Request) {
+	channel, ok := h.requireLocalChannel(w)
+	if !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		if err := h.reloadIM(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, channel.ListRooms())
+	case http.MethodPost:
+		h.handleCreateRoom(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleUsers(w http.ResponseWriter, r *http.Request) {
+	if h.im == nil {
+		http.Error(w, "im service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		if err := h.reloadIM(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, h.presentUsers(h.im.ListUsers()))
+	case http.MethodPost:
+		h.handleCreateUser(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
+	channel, ok := h.requireLocalChannel(w)
+	if !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		if err := h.reloadIM(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		roomID, err := roomIDFromQuery(r)
+		if err != nil {
+			writeAPIError(w, err, http.StatusBadRequest)
+			return
+		}
+
+		messages, err := channel.ListMessagesWithOptions(roomID, im.ListMessagesOptions{
+			IncludeThreadReplies: parseBoolQuery(r.URL.Query().Get("include_thread_replies")),
+		})
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				writeAPIError(w, err, http.StatusNotFound)
+				return
+			}
+			writeAPIError(w, err, http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, messages)
+	case http.MethodPost:
+		h.handleCreateMessage(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleThreadsByRoomID(w http.ResponseWriter, r *http.Request) {
+	roomID := pathValue(r, "id")
+	if roomID == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if h.im == nil {
+		http.Error(w, "im service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		if err := h.reloadIM(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		opts, err := threadListOptionsFromQuery(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		threads, err := h.im.ListThreads(roomID, opts)
+		if err != nil {
+			writeIMError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, threads)
+	case http.MethodPost:
+		var req im.StartThreadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+			return
+		}
+		req.RoomID = roomID
+		thread, created, err := h.im.StartThread(req)
+		if err != nil {
+			writeIMError(w, err)
+			return
+		}
+		if created {
+			h.publishThreadEvent(im.EventTypeThreadCreated, thread)
+			writeJSON(w, http.StatusCreated, thread)
+			return
+		}
+		writeJSON(w, http.StatusOK, thread)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleThreadByID(w http.ResponseWriter, r *http.Request) {
+	roomID := pathValue(r, "id")
+	rootID := pathValue(r, "thread_id")
+	if roomID == "" || rootID == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if h.im == nil {
+		http.Error(w, "im service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.reloadIM(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	thread, err := h.im.GetThread(roomID, rootID)
+	if err != nil {
+		writeIMError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, thread)
+}
+
+func (h *Handler) handleThreadRelationsByID(w http.ResponseWriter, r *http.Request) {
+	roomID := pathValue(r, "id")
+	rootID := pathValue(r, "event_id")
+	if roomID == "" || rootID == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if h.im == nil {
+		http.Error(w, "im service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.reloadIM(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	relations, err := h.im.ListThreadRelations(roomID, rootID)
+	if err != nil {
+		writeIMError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, relations)
+}
+
+func threadListOptionsFromQuery(r *http.Request) (im.ThreadListOptions, error) {
+	opts := im.ThreadListOptions{
+		Include: strings.TrimSpace(r.URL.Query().Get("include")),
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 0 {
+			return im.ThreadListOptions{}, fmt.Errorf("invalid limit")
+		}
+		opts.Limit = value
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("from")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 0 {
+			return im.ThreadListOptions{}, fmt.Errorf("invalid from")
+		}
+		opts.From = value
+	}
+	return opts, nil
+}
+
+func writeIMError(w http.ResponseWriter, err error) {
+	if code, status := knownAPIError(err, http.StatusBadRequest); code != "" {
+		writeCodedAPIError(w, status, code, err.Error())
+		return
+	}
+	if strings.Contains(err.Error(), "not found") {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
+func writeAPIError(w http.ResponseWriter, err error, fallbackStatus int) {
+	if code, status := knownAPIError(err, fallbackStatus); code != "" {
+		writeCodedAPIError(w, status, code, err.Error())
+		return
+	}
+	http.Error(w, err.Error(), fallbackStatus)
+}
+
+func knownAPIError(err error, fallbackStatus int) (string, int) {
+	switch {
+	case errors.Is(err, im.ErrTitleRequired):
+		return "title_required", fallbackStatus
+	case errors.Is(err, im.ErrCreatorIDRequired):
+		return "creator_id_required", fallbackStatus
+	case errors.Is(err, im.ErrCreatorNotFound):
+		return "creator_not_found", fallbackStatus
+	case errors.Is(err, im.ErrUserNotFound):
+		return "user_not_found", fallbackStatus
+	case errors.Is(err, im.ErrRoomIDRequired):
+		return "room_id_required", fallbackStatus
+	case errors.Is(err, im.ErrRoomNotFound):
+		return "room_not_found", http.StatusNotFound
+	case errors.Is(err, roomtask.ErrRoomHasActiveTasks):
+		return "room_has_active_tasks", http.StatusConflict
+	case errors.Is(err, im.ErrInviterIDRequired):
+		return "inviter_id_required", fallbackStatus
+	case errors.Is(err, im.ErrInviterNotFound):
+		return "inviter_not_found", fallbackStatus
+	case errors.Is(err, im.ErrInviterNotRoomMember):
+		return "inviter_not_room_member", fallbackStatus
+	case errors.Is(err, im.ErrUserIDsRequired):
+		return "user_ids_required", fallbackStatus
+	case errors.Is(err, im.ErrNoNewUsersToInvite):
+		return "no_new_users_to_invite", fallbackStatus
+	default:
+		return "", fallbackStatus
+	}
+}
+
+func (h *Handler) handleRoomByID(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleLocalRoomByID(w, r, id)
+}
+
+func (h *Handler) handleLocalRoomByID(w http.ResponseWriter, r *http.Request, id string) {
+	channel, ok := h.requireLocalChannel(w)
+	if !ok {
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPatch:
+		var req apitypes.UpdateRoomRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+			return
+		}
+		room, err := channel.UpdateRoom(id, req)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				writeCodedAPIError(w, http.StatusNotFound, "room_not_found", im.ErrRoomNotFound.Error())
+				return
+			}
+			writeAPIError(w, err, http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, room)
+	case http.MethodDelete:
+		var deletedRoom im.Room
+		hasDeletedRoom := false
+		if h.im != nil {
+			deletedRoom, hasDeletedRoom = h.im.Room(id)
+		}
+		releaseRoomDeletion := func() {}
+		if hasDeletedRoom && h.roomTaskSvc != nil {
+			var err error
+			releaseRoomDeletion, err = h.roomTaskSvc.BeginRoomDeletion(id)
+			if err != nil {
+				writeAPIError(w, err, http.StatusConflict)
+				return
+			}
+		}
+		defer releaseRoomDeletion()
+		if err := channel.DeleteRoom(id); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				writeCodedAPIError(w, http.StatusNotFound, "room_not_found", im.ErrRoomNotFound.Error())
+				return
+			}
+			writeAPIError(w, err, http.StatusBadRequest)
+			return
+		}
+		if hasDeletedRoom {
+			h.publishRoomEvent(im.EventTypeRoomDeleted, deletedRoom)
+		} else {
+			h.publishRoomDeleted(id)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleClearRoomMessages(w http.ResponseWriter, r *http.Request) {
+	roomID := strings.TrimSpace(pathValue(r, "id"))
+	if roomID == "" {
+		writeAPIError(w, im.ErrRoomIDRequired, http.StatusBadRequest)
+		return
+	}
+	if h == nil || h.im == nil {
+		http.Error(w, "im service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	room, err := h.im.ClearRoomMessages(roomID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeCodedAPIError(w, http.StatusNotFound, "room_not_found", im.ErrRoomNotFound.Error())
+			return
+		}
+		writeAPIError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, room)
+}
+
+func (h *Handler) handleRoomMembersByIDPath(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleRoomMembersByID(w, r, id)
+}
+
+func (h *Handler) handleRoomMembersByID(w http.ResponseWriter, r *http.Request, roomID string) {
+	channel, ok := h.requireLocalChannel(w)
+	if !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		if err := h.reloadIM(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	case http.MethodPost:
+		h.handleAddRoomMembers(w, r, roomID)
+		return
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	members, err := channel.ListRoomMembers(roomID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeCodedAPIError(w, http.StatusNotFound, "room_not_found", im.ErrRoomNotFound.Error())
+			return
+		}
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, members)
+}
+
+func (h *Handler) handleRoomMemberDeletePath(w http.ResponseWriter, r *http.Request) {
+	roomID := strings.TrimSpace(pathValue(r, "id"))
+	memberID := strings.TrimSpace(pathValue(r, "member_id"))
+	if roomID == "" || memberID == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	channel, ok := h.requireLocalChannel(w)
+	if !ok {
+		return
+	}
+	var req removeRoomMemberRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	serviceReq := im.AddRoomMembersRequest{
+		RoomID:    roomID,
+		InviterID: h.resolveCSGClawParticipantUserID(req.InviterID),
+		UserIDs:   h.resolveCSGClawParticipantUserIDs([]string{memberID}),
+		Locale:    req.Locale,
+	}
+
+	if h.im != nil && h.roomTaskSvc != nil {
+		if current, found := h.im.Room(roomID); found && current.IsOnDemand() {
+			for _, member := range serviceReq.UserIDs {
+				if h.participantBridgeTargetForRoomMember(member).matches(current.ManagerID) {
+					http.Error(w, "cannot remove the collaboration manager", http.StatusConflict)
+					return
+				}
+				for _, task := range h.roomTaskSvc.List(roomID) {
+					if h.participantBridgeTargetForRoomMember(task.AssignedTo).matches(member) && (task.Status == taskcore.StatusInProgress || task.Status == taskcore.StatusAssigned && task.DispatchedAt != nil || task.RecoveryRequired) {
+						http.Error(w, "stop the running worker before removing it", http.StatusConflict)
+						return
+					}
+				}
+			}
+		}
+	}
+	room, err := channel.RemoveRoomMembers(serviceReq)
+	if err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	if room.IsOnDemand() && h.roomTaskSvc != nil {
+		if err := h.roomTaskSvc.MembersChanged(room.ID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, room)
+}
+
+func (h *Handler) handleUserByID(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	h.handleLocalUserByID(w, r, id)
+}
+
+func (h *Handler) handleLocalUserByID(w http.ResponseWriter, r *http.Request, id string) {
+	if h.im == nil {
+		http.Error(w, "im service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodDelete:
+		if err := h.im.DeleteUser(id); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				writeAPIError(w, err, http.StatusNotFound)
+				return
+			}
+			if strings.Contains(err.Error(), "cannot delete current user") {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	provisioner := h.workerIMProvisioner()
+	if provisioner == nil {
+		http.Error(w, "im provisioner is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req apitypes.CreateUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	id := strings.TrimSpace(req.ID)
+	name := strings.TrimSpace(req.Name)
+	description := strings.TrimSpace(req.Description)
+	role := strings.TrimSpace(req.Role)
+	id = h.resolveCSGClawLocalUserID(id)
+
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	if name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if id == im.ManagerUserID {
+		if user, ok := h.im.User(id); ok {
+			writeJSON(w, http.StatusCreated, h.presentUser(user))
+			return
+		}
+	}
+
+	if h.participant != nil && h.svc != nil && shouldCreateWorkerForUser(id, role) {
+		hubSvc, err := h.hubServiceForRequest(r)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("resolve hub service: %v", err), http.StatusInternalServerError)
+			return
+		}
+		participantID := workerParticipantIDFromUserID(id)
+		workerAgentID := workerAgentIDFromUserID(id)
+		if existing, ok := h.participant.Get(participant.ChannelCSGClaw, participantID); ok && strings.TrimSpace(existing.Type) == participant.TypeAgent {
+			userID := firstNonEmptyString(existing.ChannelUserRef, id)
+			_, userExisted := h.im.User(userID)
+			_, roomExisted := h.directRoomWithMembers(workerParticipantIDFromUserID(im.AdminUserID), existing.ID)
+			user, room, err := h.ensureUserForExistingCSGClawAgentParticipant(existing, im.EnsureAgentUserRequest{
+				ID:          userID,
+				Name:        firstNonEmptyString(existing.Name, name),
+				Description: description,
+				Role:        firstNonEmptyString(role, agent.RoleWorker),
+			})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			presented := h.presentUser(user)
+			if !userExisted {
+				h.publishUserEvent(im.EventTypeUserCreated, presented)
+			}
+			if !roomExisted && room != nil {
+				h.publishRoomEvent(im.EventTypeRoomCreated, *room)
+			}
+			writeJSON(w, http.StatusCreated, presented)
+			return
+		}
+		created, err := h.participant.Create(r.Context(), participant.CreateRequest{
+			ID:              participantID,
+			Channel:         participant.ChannelCSGClaw,
+			Type:            participant.TypeAgent,
+			Name:            name,
+			AgentHubService: hubSvc,
+			ChannelUser: participant.ChannelUserSpec{
+				Ref:  id,
+				Kind: participant.ChannelUserKindLocalUserID,
+			},
+			AgentBinding: participant.AgentBindingSpec{
+				Mode:    participant.BindingModeCreate,
+				AgentID: workerAgentID,
+				Agent: func() *agent.CreateAgentSpec {
+					spec := h.defaultWorkerCreateSpec(workerAgentID, name)
+					return &spec
+				}(),
+			},
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if user, ok := h.im.User(created.ChannelUserRef); ok {
+			h.publishUserEvent(im.EventTypeUserCreated, user)
+			if room, ok := h.directRoomWithMembers(workerParticipantIDFromUserID(im.AdminUserID), workerParticipantIDFromUserID(user.ID)); ok {
+				h.publishRoomEvent(im.EventTypeRoomCreated, room)
+			}
+			writeJSON(w, http.StatusCreated, h.presentUser(user))
+			return
+		}
+		http.Error(w, "created worker user not found", http.StatusInternalServerError)
+		return
+	}
+
+	result, err := provisioner.EnsureAgentUser(r.Context(), im.AgentIdentity{
+		ID:          id,
+		Name:        name,
+		Description: description,
+		Role:        role,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, h.presentUser(result.User))
+}
+
+func (h *Handler) ensureUserForExistingCSGClawAgentParticipant(item apitypes.Participant, req im.EnsureAgentUserRequest) (im.User, *im.Room, error) {
+	if h == nil || h.im == nil {
+		return im.User{}, nil, fmt.Errorf("im service is not configured")
+	}
+	if strings.TrimSpace(req.ID) == "" {
+		req.ID = firstNonEmptyString(item.ChannelUserRef, item.ID)
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		req.Name = firstNonEmptyString(item.Name, item.ID)
+	}
+	if strings.TrimSpace(req.Role) == "" {
+		req.Role = agent.RoleWorker
+	}
+	return h.im.EnsureAgentUser(req)
+}
+
+func (h *Handler) updateCsgclawUser(w http.ResponseWriter, r *http.Request) {
+	if h.im == nil {
+		http.Error(w, "im service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	id := pathValueOrLastSegment(r, "id")
+	if strings.TrimSpace(id) == "" {
+		http.NotFound(w, r)
+		return
+	}
+	var req apitypes.UpdateUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	updated, ok, err := h.im.UpdateUser(im.UpdateUserRequest{
+		ID:          id,
+		Name:        req.Name,
+		Description: req.Description,
+		Role:        req.Role,
+		Avatar:      req.Avatar,
+		Locale:      req.Locale,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !ok {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	presented := h.presentUser(updated)
+	h.publishUserEvent(im.EventTypeUserUpdated, presented)
+	writeJSON(w, http.StatusOK, presented)
+}
+
+func pathValueOrLastSegment(r *http.Request, key string) string {
+	if value := pathValue(r, key); value != "" {
+		return value
+	}
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	path := strings.Trim(strings.TrimSpace(r.URL.Path), "/")
+	if path == "" {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	return strings.TrimSpace(parts[len(parts)-1])
+}
+
+func shouldCreateWorkerForUser(id, role string) bool {
+	id = strings.TrimSpace(id)
+	switch strings.ToLower(id) {
+	case "", im.AdminUserID, "u-admin", "admin", "pt-admin", im.ManagerUserID, "u-manager", "manager", agent.ManagerParticipantID, agent.ManagerUserID:
+		return false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "", agent.RoleWorker, agent.RoleAgent:
+		return true
+	case agent.RoleManager, "admin":
+		return false
+	default:
+		return true
+	}
+}
+
+func workerParticipantIDFromUserID(id string) string {
+	id = strings.TrimSpace(id)
+	switch id {
+	case "", im.AdminUserID, "u-admin", "admin", "pt-admin":
+		if id == "" {
+			return ""
+		}
+		return "pt-admin"
+	case im.ManagerUserID, "u-manager", "manager", "pt-manager", agent.ManagerUserID:
+		return agent.ManagerParticipantID
+	}
+	suffix := localIdentitySuffix(id)
+	if suffix == "" {
+		return ""
+	}
+	return "pt-" + suffix
+}
+
+func workerAgentIDFromUserID(id string) string {
+	id = strings.TrimSpace(id)
+	switch id {
+	case "", im.AdminUserID, "u-admin", "admin", "pt-admin":
+		return ""
+	case im.ManagerUserID, "u-manager", "manager", "pt-manager", agent.ManagerUserID:
+		return agent.ManagerUserID
+	}
+	suffix := localIdentitySuffix(id)
+	if suffix == "" {
+		return ""
+	}
+	return agent.AgentIDPrefix + suffix
+}
+
+func localIdentitySuffix(id string) string {
+	id = strings.TrimSpace(id)
+	for {
+		trimmed := id
+		for _, prefix := range []string{"user-", "agent-", "pt-", "u-"} {
+			if strings.HasPrefix(trimmed, prefix) {
+				trimmed = strings.TrimPrefix(trimmed, prefix)
+				break
+			}
+		}
+		if trimmed == id {
+			break
+		}
+		id = trimmed
+	}
+	return strings.TrimSpace(id)
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func (h *Handler) directRoomWithMembers(left, right string) (im.Room, bool) {
+	if h == nil || h.im == nil {
+		return im.Room{}, false
+	}
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	leftUserID := h.im.ResolveUserID(left)
+	rightUserID := h.im.ResolveUserID(right)
+	for _, room := range h.im.ListRooms() {
+		if !room.IsDirect {
+			continue
+		}
+		if roomHasMemberAlias(h.im, room.Members, leftUserID) && roomHasMemberAlias(h.im, room.Members, rightUserID) {
+			return room, true
+		}
+	}
+	return im.Room{}, false
+}
+
+func roomHasMemberAlias(svc *im.Service, members []string, id string) bool {
+	id = strings.TrimSpace(id)
+	if svc != nil {
+		id = svc.ResolveUserID(id)
+	}
+	for _, member := range members {
+		member = strings.TrimSpace(member)
+		if svc != nil {
+			member = svc.ResolveUserID(member)
+		}
+		if member == id {
+			return true
+		}
+	}
+	return false
+}
+
+func roomHasMember(members []string, id string) bool {
+	id = strings.TrimSpace(id)
+	for _, member := range members {
+		if strings.TrimSpace(member) == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
+	receivedAt := time.Now()
+	channel, ok := h.requireLocalChannel(w)
+	if !ok {
+		return
+	}
+	defer cleanupMessagePayload(r)
+	req, err := parseCreateMessageHTTP(w, r)
+	if err != nil {
+		writeMessagePayloadError(w, err)
+		return
+	}
+
+	serviceReq, err := req.toServiceRequest()
+	if err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	serviceReq.DiagnosticStart = receivedAt
+	serviceReq = h.resolveCSGClawParticipantMessageRequest(serviceReq)
+	if caller := strings.TrimSpace(r.Header.Get("X-CSGClaw-Caller-Agent")); caller != "" {
+		if !h.participantBridgeTargetForRoomMember(serviceReq.SenderID).matches(caller) {
+			http.Error(w, "message sender must match runtime caller", http.StatusForbidden)
+			return
+		}
+	}
+
+	message, created, err := channel.SendMessageOnce(serviceReq)
+	if err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	if created {
+		h.publishMessageCreated(serviceReq.RoomID, message.SenderID, message)
+		h.publishThreadUpdated(serviceReq.RoomID, message)
+		h.handleTeamRoomCommand(r.Context(), serviceReq.RoomID, message.SenderID, message.Content)
+	}
+	writeJSON(w, http.StatusCreated, message)
+}
+
+func (h *Handler) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
+	channel, ok := h.requireLocalChannel(w)
+	if !ok {
+		return
+	}
+	var req apitypes.CreateRoomRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	req.CreatorID = h.resolveCSGClawParticipantUserID(req.CreatorID)
+	req.MemberIDs = h.resolveCSGClawParticipantUserIDs(req.MemberIDs)
+	if apitypes.NormalizeRoomType(req.Type) == apitypes.RoomTypeOnDemand {
+		if req.ManagerID == "" {
+			req.ManagerID = agent.ManagerParticipantID
+		}
+		req.ManagerID = h.resolveCSGClawParticipantUserID(req.ManagerID)
+		if h.im == nil {
+			http.Error(w, "manager unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		manager, found := h.im.User(req.ManagerID)
+		if !found || !strings.EqualFold(manager.Role, "manager") {
+			http.Error(w, "valid manager required", http.StatusBadRequest)
+			return
+		}
+	}
+
+	room, err := channel.CreateRoom(req)
+	if err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusCreated, room)
+}
+
+func (h *Handler) handleIMMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	h.handleCreateMessage(w, r)
+}
+
+func (h *Handler) handleIMRooms(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	h.handleCreateRoom(w, r)
+}
+
+func (h *Handler) handleIMRoomMembers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	h.handleAddRoomMembers(w, r, "")
+}
+
+func (h *Handler) handleAddRoomMembers(w http.ResponseWriter, r *http.Request, pathRoomID string) {
+	channel, ok := h.requireLocalChannel(w)
+	if !ok {
+		return
+	}
+	var req addRoomMembersRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	pathRoomID = strings.TrimSpace(pathRoomID)
+	if pathRoomID != "" {
+		bodyRoomID := strings.TrimSpace(req.RoomID)
+		if bodyRoomID != "" && bodyRoomID != pathRoomID {
+			http.Error(w, "room_id does not match path room id", http.StatusBadRequest)
+			return
+		}
+		req.RoomID = pathRoomID
+	}
+
+	serviceReq, err := req.toServiceRequest()
+	if err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	serviceReq.InviterID = h.resolveCSGClawParticipantUserID(serviceReq.InviterID)
+	serviceReq.UserIDs = h.resolveCSGClawParticipantUserIDs(serviceReq.UserIDs)
+
+	room, err := channel.AddRoomMembers(serviceReq)
+	if err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, room)
+}
+
+func (h *Handler) handleIMEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.imBus == nil && h.workBus == nil {
+		http.Error(w, "events are not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	var imEvents <-chan im.Event
+	var cancelIM func()
+	if h.imBus != nil {
+		imEvents, cancelIM = h.imBus.Subscribe()
+		defer cancelIM()
+	}
+	var workEvents <-chan worklease.Event
+	var cancelWork func()
+	if h.workBus != nil {
+		workEvents, cancelWork = h.workBus.Subscribe()
+		defer cancelWork()
+	}
+
+	_, _ = io.WriteString(w, ": connected\n\n")
+	flusher.Flush()
+
+	ticker := time.NewTicker(sseHeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-h.eventStreamShutdown:
+			return
+		case <-ticker.C:
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case evt, ok := <-imEvents:
+			if !ok {
+				imEvents = nil
+				continue
+			}
+			if !writeSSEEvent(w, flusher, presentEvent(evt)) {
+				return
+			}
+		case evt, ok := <-workEvents:
+			if !ok {
+				workEvents = nil
+				continue
+			}
+			work := evt.Work
+			if !writeSSEEvent(w, flusher, imEventResponse{Type: evt.Type, RoomID: evt.RoomID, Work: &work}) {
+				return
+			}
+		}
+	}
+}
+
+func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, event any) bool {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return false
+	}
+	if _, err := io.Copy(w, bytes.NewReader([]byte("data: "))); err != nil {
+		return false
+	}
+	if _, err := io.Copy(w, bytes.NewReader(data)); err != nil {
+		return false
+	}
+	if _, err := io.WriteString(w, "\n\n"); err != nil {
+		return false
+	}
+	flusher.Flush()
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func displayRole(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case agent.RoleManager:
+		return "manager"
+	case agent.RoleWorker:
+		return "Worker"
+	default:
+		return "Agent"
+	}
+}
+
+func roomIDFromQuery(r *http.Request) (string, error) {
+	roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
+	if roomID == "" {
+		return "", im.ErrRoomIDRequired
+	}
+	return roomID, nil
+}
+
+func (h *Handler) presentBootstrap(state im.Bootstrap) imBootstrapResponse {
+	return imBootstrapResponse{
+		CurrentUserID:      state.CurrentUserID,
+		Users:              h.presentUsers(state.Users),
+		Rooms:              state.Rooms,
+		InviteDraftUserIDs: state.InviteDraftUserIDs,
+	}
+}
+
+func (h *Handler) presentUsers(users []im.User) []im.User {
+	out := make([]im.User, 0, len(users))
+	for _, user := range users {
+		out = append(out, h.presentUser(user))
+	}
+	return out
+}
+
+func (h *Handler) presentUser(user im.User) im.User {
+	if user.ID == im.AdminUserID && strings.TrimSpace(user.Description) == "" {
+		user.Description = im.DefaultAdminDescription
+	}
+	user.Participants = h.humanParticipantsForUser(user)
+	return user
+}
+
+func (h *Handler) humanParticipantsForUser(user im.User) []apitypes.Participant {
+	if h == nil || h.participant == nil || strings.TrimSpace(user.ID) == "" {
+		return nil
+	}
+	items := h.participant.List(participant.ListOptions{Type: participant.TypeHuman})
+	matches := make([]apitypes.Participant, 0, len(items))
+	for _, item := range items {
+		if !humanParticipantMatchesUser(item, user) {
+			continue
+		}
+		matches = append(matches, item)
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	return presentParticipants(matches)
+}
+
+func humanParticipantMatchesUser(item apitypes.Participant, user im.User) bool {
+	if !strings.EqualFold(strings.TrimSpace(item.Type), participant.TypeHuman) {
+		return false
+	}
+	userID := strings.TrimSpace(user.ID)
+	if userID == "" {
+		return false
+	}
+	return localUserIDFromAny(item.ID) == userID ||
+		localUserIDFromAny(item.ChannelUserRef) == userID ||
+		strings.TrimSpace(item.ID) == userID ||
+		strings.TrimSpace(item.ChannelUserRef) == userID
+}
+
+func localUserIDFromAny(id string) string {
+	id = strings.TrimSpace(id)
+	switch id {
+	case "":
+		return ""
+	case "admin", "u-admin", "pt-admin":
+		return im.AdminUserID
+	case "manager", "u-manager", "pt-manager", agent.ManagerUserID:
+		return im.ManagerUserID
+	}
+	if strings.HasPrefix(id, "user-") {
+		return id
+	}
+	suffix := localIdentitySuffix(id)
+	if suffix == "" {
+		return ""
+	}
+	return "user-" + suffix
+}
+
+func presentAgents(items []agent.Agent) []agentResponse {
+	out := make([]agentResponse, 0, len(items))
+	for _, item := range items {
+		out = append(out, presentAgent(item))
+	}
+	return out
+}
+
+func (h *Handler) presentAgentsForRequest(r *http.Request, items []agent.Agent) []agentResponse {
+	out := make([]agentResponse, 0, len(items))
+	for _, item := range items {
+		out = append(out, h.presentAgentResponse(item))
+	}
+	var byAgent map[string][]apitypes.Participant
+	if h != nil && h.participant != nil {
+		byAgent = participantsByAgentID(h.presentParticipants(h.participant.List(participant.ListOptions{})))
+	}
+	for i := range out {
+		participantItems := byAgent[out[i].ID]
+		out[i].ParticipantIDs, out[i].ParticipantNames = participantSummaries(participantItems)
+		out[i].UserID, out[i].UserName = agentLocalUserSummary(participantItems)
+		if includeParticipants(r) {
+			out[i].Participants = participantItems
+		}
+		h.backfillAgentLocalUser(&out[i])
+	}
+	return out
+}
+
+func (h *Handler) presentEngineAgentsForRequest(r *http.Request, items []agentengine.Agent) []agentResponse {
+	presented := make([]agent.Agent, 0, len(items))
+	for _, item := range items {
+		presented = append(presented, serviceAgentFromEngine(item))
+	}
+	responses := h.presentAgentsForRequest(r, presented)
+	for index := range responses {
+		responses[index].MemorySupported = items[index].Status.Capabilities.Memory
+	}
+	return responses
+}
+
+func (h *Handler) presentEngineAgentForRequest(r *http.Request, item agentengine.Agent) agentResponse {
+	response := h.presentAgentForRequest(r, serviceAgentFromEngine(item))
+	response.MemorySupported = item.Status.Capabilities.Memory
+	return response
+}
+
+func (h *Handler) presentAgentForRequest(r *http.Request, item agent.Agent) agentResponse {
+	resp := h.presentAgentResponse(item)
+	if h != nil && h.participant != nil {
+		items := h.presentParticipants(h.participant.List(participant.ListOptions{AgentID: item.ID}))
+		resp.ParticipantIDs, resp.ParticipantNames = participantSummaries(items)
+		resp.UserID, resp.UserName = agentLocalUserSummary(items)
+		if includeParticipants(r) {
+			resp.Participants = items
+		}
+	}
+	h.backfillAgentLocalUser(&resp)
+	return resp
+}
+
+func (h *Handler) backfillAgentLocalUser(resp *agentResponse) {
+	if h == nil || h.im == nil || resp == nil || strings.TrimSpace(resp.UserID) != "" {
+		return
+	}
+	expectedUserID := localUserIDFromAny(resp.ID)
+	if expectedUserID == "" {
+		return
+	}
+	user, ok := h.im.User(expectedUserID)
+	if !ok || localUserIDFromAny(user.ID) != expectedUserID {
+		return
+	}
+	resp.UserID = strings.TrimSpace(user.ID)
+	resp.UserName = strings.TrimSpace(user.Name)
+}
+
+func (h *Handler) presentAgentResponse(item agent.Agent) agentResponse {
+	resp := presentAgent(item)
+	if resp.Runtime.SandboxEnabled && h != nil && h.svc != nil {
+		resp.Runtime.SandboxProvider = h.agentRuntime.SandboxProviderName()
+	}
+	if item.ID != agent.ManagerUserID && item.Role != agent.RoleManager {
+		resp.RuntimeOptionSchemas = h.runtimeOptionSchemasForKind(item.RuntimeKind)
+	}
+	if h != nil && h.svc != nil {
+		resp.MemorySupported = h.svc.SupportsMemory(item.RuntimeKind)
+	}
+	resp.Runtime.OptionSchemas = runtimeOptionSchemasForAPI(resp.RuntimeOptionSchemas)
+	resp.LarkCLI = h.agentLarkCLIStatus(item)
+	return resp
+}
+
+func runtimeOptionSchemasForAPI(items []agentruntime.RuntimeOptionSchema) []map[string]any {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		record := map[string]any{}
+		data, err := json.Marshal(item)
+		if err == nil {
+			_ = json.Unmarshal(data, &record)
+		}
+		if len(record) > 0 {
+			out = append(out, record)
+		}
+	}
+	return out
+}
+
+func (h *Handler) runtimeOptionSchemasByKind(kinds []string) map[string][]agentruntime.RuntimeOptionSchema {
+	if h == nil {
+		return nil
+	}
+	out := map[string][]agentruntime.RuntimeOptionSchema{}
+	for _, kind := range kinds {
+		schemas := h.runtimeOptionSchemasForKind(kind)
+		if len(schemas) == 0 {
+			continue
+		}
+		out[bootstrapRuntimeKind(kind)] = schemas
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (h *Handler) runtimeOptionSchemasForKind(kind string) []agentruntime.RuntimeOptionSchema {
+	if h == nil || h.agentRuntime == nil {
+		return nil
+	}
+	return h.agentRuntime.RuntimeOptionsSchema(strings.TrimSpace(kind))
+}
+
+func includeParticipants(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("include_participants")), "true")
+}
+
+func participantsByAgentID(items []apitypes.Participant) map[string][]apitypes.Participant {
+	out := make(map[string][]apitypes.Participant)
+	for _, item := range items {
+		if strings.TrimSpace(item.AgentID) == "" {
+			continue
+		}
+		for _, id := range participantAgentIndexKeys(item.AgentID) {
+			out[id] = append(out[id], item)
+		}
+	}
+	return out
+}
+
+func participantAgentIndexKeys(id string) []string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	typed := agent.CanonicalID(id)
+	keys := []string{typed}
+	for _, alias := range []string{id, strings.TrimPrefix(typed, agent.AgentIDPrefix), "u-" + strings.TrimPrefix(typed, agent.AgentIDPrefix)} {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		seen := false
+		for _, key := range keys {
+			if key == alias {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			keys = append(keys, alias)
+		}
+	}
+	return keys
+}
+
+func participantSummaries(items []apitypes.Participant) ([]string, []string) {
+	ids := make([]string, 0, len(items))
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		if id := strings.TrimSpace(item.ID); id != "" {
+			ids = append(ids, id)
+		}
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = strings.TrimSpace(item.ID)
+		}
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	if len(ids) == 0 {
+		ids = nil
+	}
+	if len(names) == 0 {
+		names = nil
+	}
+	return ids, names
+}
+
+func agentLocalUserSummary(items []apitypes.Participant) (string, string) {
+	for _, item := range items {
+		if !strings.EqualFold(strings.TrimSpace(item.Channel), participant.ChannelCSGClaw) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(item.Type), participant.TypeAgent) {
+			continue
+		}
+		userID := strings.TrimSpace(item.UserID)
+		if userID == "" {
+			userID = strings.TrimSpace(item.ChannelUserRef)
+		}
+		userID = localUserIDFromAny(userID)
+		if userID == "" {
+			continue
+		}
+		userName := strings.TrimSpace(item.UserName)
+		if userName == "" {
+			userName = strings.TrimSpace(item.Name)
+		}
+		return userID, userName
+	}
+	return "", ""
+}
+
+func (h *Handler) resolveCSGClawParticipantMessageRequest(req im.CreateMessageRequest) im.CreateMessageRequest {
+	req.SenderID = h.resolveCSGClawParticipantUserID(req.SenderID)
+	req.MentionID = h.resolveCSGClawParticipantUserID(req.MentionID)
+	return req
+}
+
+func (h *Handler) resolveCSGClawParticipantUserIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if resolved := h.resolveCSGClawParticipantUserID(id); resolved != "" {
+			out = append(out, resolved)
+		}
+	}
+	return out
+}
+
+func (h *Handler) resolveCSGClawParticipantUserID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" || h == nil || h.participant == nil {
+		return csgclawParticipantIDFromAny(id)
+	}
+	item, ok := h.participant.Get(participant.ChannelCSGClaw, id)
+	if ok {
+		if participantID := strings.TrimSpace(item.ID); participantID != "" {
+			return participantID
+		}
+		return csgclawParticipantIDFromAny(id)
+	}
+	for _, candidate := range h.participant.List(participant.ListOptions{Channel: participant.ChannelCSGClaw}) {
+		if !participantMatchesIdentity(candidate, id) {
+			continue
+		}
+		if participantID := strings.TrimSpace(candidate.ID); participantID != "" {
+			return participantID
+		}
+	}
+	return csgclawParticipantIDFromAny(id)
+}
+
+func (h *Handler) resolveCSGClawLocalUserID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	if h != nil && h.im != nil {
+		if user, ok := h.im.User(id); ok {
+			return strings.TrimSpace(user.ID)
+		}
+	}
+	switch id {
+	case "admin", "u-admin", "pt-admin":
+		return im.AdminUserID
+	case "manager", "u-manager", "pt-manager", agent.ManagerUserID:
+		return im.ManagerUserID
+	}
+	if strings.HasPrefix(id, "user-") {
+		return id
+	}
+	suffix := localIdentitySuffix(id)
+	if suffix == "" {
+		return ""
+	}
+	return "user-" + suffix
+}
+
+func csgclawParticipantIDFromAny(id string) string {
+	id = strings.TrimSpace(id)
+	switch id {
+	case "":
+		return ""
+	case "admin", "u-admin", "user-admin", "pt-admin":
+		return "pt-admin"
+	case "manager", "u-manager", "user-manager", "pt-manager", agent.ManagerUserID:
+		return agent.ManagerParticipantID
+	}
+	if strings.HasPrefix(id, "pt-") {
+		return id
+	}
+	suffix := localIdentitySuffix(id)
+	if suffix == "" {
+		return ""
+	}
+	return "pt-" + suffix
+}
+
+func presentAgent(item agent.Agent) agentResponse {
+	av := agent.RedactedProfileViewForAgent(item)
+	if strings.TrimSpace(av.Name) == strings.TrimSpace(item.Name) {
+		av.Name = ""
+	}
+	if strings.TrimSpace(av.Description) == strings.TrimSpace(item.Description) {
+		av.Description = ""
+	}
+	runtimeOptions := item.RuntimeOptions
+	if runtimeOptions == nil {
+		runtimeOptions = map[string]any{}
+	}
+	profile := profileResponseFromAgentView(av)
+	runtimeCfg := item.RuntimeConfig()
+	return agentResponse{
+		ID:           item.ID,
+		Name:         item.Name,
+		Description:  item.Description,
+		Instructions: item.Instructions,
+		Runtime: apitypes.AgentRuntime{
+			Name:           runtimeCfg.Name,
+			SandboxEnabled: runtimeCfg.Sandboxed,
+			State:          item.Status,
+			Availability:   runtimeAvailabilityResponse(item.Availability),
+			StartupPending: item.StartupPending,
+			SandboxID:      item.BoxID,
+			Options:        runtimeOptions,
+		},
+		RuntimeID:        item.RuntimeID,
+		RuntimeKind:      runtimeCfg.Kind(),
+		RuntimeName:      runtimeCfg.Name,
+		SandboxEnabled:   runtimeCfg.Sandboxed,
+		Image:            item.Image,
+		Avatar:           item.Avatar,
+		BoxID:            item.BoxID,
+		Role:             item.Role,
+		Status:           item.Status,
+		CreatedAt:        item.CreatedAt,
+		UpdatedAt:        item.UpdatedAt,
+		Profile:          item.Profile,
+		RuntimeOptions:   runtimeOptions,
+		MCPServers:       sanitizeMCPServersResponse(item.MCPServers),
+		ProfileConfig:    profile,
+		AgentProfile:     av,
+		ProfileComplete:  item.ProfileComplete,
+		DetectionResults: append([]agent.ProfileDetectionResult(nil), item.DetectionResults...),
+	}
+}
+
+func runtimeAvailabilityResponse(value *agent.RuntimeAvailability) *apitypes.RuntimeAvailability {
+	if value == nil {
+		return nil
+	}
+	out := &apitypes.RuntimeAvailability{
+		State:  string(value.State),
+		Reason: value.Reason,
+	}
+	if !value.CheckedAt.IsZero() {
+		checkedAt := value.CheckedAt.UTC()
+		out.CheckedAt = &checkedAt
+	}
+	if !value.ExpiresAt.IsZero() {
+		expiresAt := value.ExpiresAt.UTC()
+		out.ExpiresAt = &expiresAt
+	}
+	return out
+}
+
+func sanitizeMCPServersResponse(servers map[string]any) map[string]any {
+	servers = utils.CloneAnyMap(servers)
+	if len(servers) == 0 {
+		return nil
+	}
+	sanitizedServers := make(map[string]any, len(servers))
+	for name, rawServer := range servers {
+		server, ok := rawServer.(map[string]any)
+		if !ok {
+			sanitizedServers[name] = rawServer
+			continue
+		}
+		server = utils.CloneAnyMap(server)
+		if env, ok := sanitizeMCPSecretValues(server["env"]); ok {
+			server = utils.OverlayAnyMap(server, map[string]any{
+				"env": env,
+			})
+		}
+		if headers, ok := sanitizeMCPSecretValues(server["headers"]); ok {
+			server = utils.OverlayAnyMap(server, map[string]any{
+				"headers": headers,
+			})
+		}
+		sanitizedServers[name] = server
+	}
+	return sanitizedServers
+}
+
+func sanitizeMCPSecretValues(raw any) (map[string]any, bool) {
+	var keys []string
+	switch values := raw.(type) {
+	case map[string]any:
+		keys = make([]string, 0, len(values))
+		for key := range values {
+			keys = append(keys, key)
+		}
+	case map[string]string:
+		keys = make([]string, 0, len(values))
+		for key := range values {
+			keys = append(keys, key)
+		}
+	default:
+		return nil, false
+	}
+	if len(keys) == 0 {
+		return nil, true
+	}
+	out := make(map[string]any, len(keys))
+	for _, key := range keys {
+		out[key] = participant.RedactedSecretValue
+	}
+	return out, true
+}
+
+func profileResponseFromAgentView(view agent.AgentProfileView) apitypes.AgentProfile {
+	return apitypes.AgentProfile{
+		ImageGeneration:      modelprovider.CloneImageGeneration(view.ImageGeneration),
+		VideoGeneration:      modelprovider.CloneVideoGeneration(view.VideoGeneration),
+		ModelProviderID:      view.ModelProviderID,
+		BaseURL:              view.BaseURL,
+		APIKeySet:            view.APIKeySet,
+		APIKeyPreview:        view.APIKeyPreview,
+		Headers:              view.Headers,
+		ModelID:              view.ModelID,
+		ReasoningEffort:      view.ReasoningEffort,
+		EnableFastMode:       view.EnableFastMode,
+		RequestOptions:       view.RequestOptions,
+		Env:                  view.Env,
+		EnvRestartRequired:   view.EnvRestartRequired,
+		ImageUpgradeRequired: view.ImageUpgradeRequired,
+		DetectionResults:     profileDetectionResultsFromAgent(view.DetectionResults),
+	}
+}
+
+func profileDetectionResultsFromAgent(items []agent.ProfileDetectionResult) []apitypes.ProfileDetectionResult {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]apitypes.ProfileDetectionResult, 0, len(items))
+	for _, item := range items {
+		out = append(out, apitypes.ProfileDetectionResult{
+			Provider: item.Provider,
+			Status:   item.Status,
+			ModelID:  item.ModelID,
+			Error:    item.Error,
+		})
+	}
+	return out
+}
+
+func presentEvent(evt im.Event) imEventResponse {
+	return imEventResponse{
+		AttachmentID: evt.AttachmentID,
+		Type:         evt.Type,
+		RoomID:       evt.RoomID,
+		TeamID:       evt.TeamID,
+		Room:         evt.Room,
+		User:         evt.User,
+		Message:      evt.Message,
+		Participant:  evt.Participant,
+		Team:         evt.Team,
+		Thread:       evt.Thread,
+		Sender:       evt.Sender,
+		Upgrade:      evt.Upgrade,
+	}
+}
+
+func (r createMessageRequest) toServiceRequest() (im.CreateMessageRequest, error) {
+	roomID := strings.TrimSpace(r.RoomID)
+	if roomID == "" {
+		return im.CreateMessageRequest{}, im.ErrRoomIDRequired
+	}
+
+	return im.CreateMessageRequest{
+		RoomID:          roomID,
+		ClientMessageID: strings.TrimSpace(r.ClientMessageID),
+		SenderID:        r.SenderID,
+		Content:         r.Content,
+		Locale:          r.Locale,
+		MentionID:       r.MentionID,
+		Metadata:        r.Metadata,
+		RelatesTo:       r.RelatesTo,
+		Attachments:     r.Attachments,
+	}, nil
+}
+
+func (r addRoomMembersRequest) toServiceRequest() (im.AddRoomMembersRequest, error) {
+	roomID := strings.TrimSpace(r.RoomID)
+	if roomID == "" {
+		return im.AddRoomMembersRequest{}, im.ErrRoomIDRequired
+	}
+
+	return im.AddRoomMembersRequest{
+		RoomID:    roomID,
+		InviterID: r.InviterID,
+		UserIDs:   r.UserIDs,
+		Locale:    r.Locale,
+	}, nil
+}
+
+func (h *Handler) reloadIM() error {
+	if h == nil || h.im == nil {
+		return nil
+	}
+	return h.im.Reload()
+}
+
+func (h *Handler) publishMessageCreated(conversationID, senderID string, message im.Message) {
+	if h.imBus == nil {
+		return
+	}
+	sender, ok := h.im.User(senderID)
+	if !ok {
+		return
+	}
+	messageCopy := message
+	senderCopy := sender
+	h.imBus.Publish(im.Event{
+		Type:    im.EventTypeMessageCreated,
+		RoomID:  conversationID,
+		Message: &messageCopy,
+		Sender:  &senderCopy,
+	})
+}
+
+func (h *Handler) handleTeamRoomCommand(ctx context.Context, roomID string, senderID string, content string) {
+	if h == nil || h.teamSvc == nil {
+		return
+	}
+	if h.im != nil {
+		if room, ok := h.im.Room(roomID); ok && room.IsOnDemand() {
+			return
+		}
+	}
+	adapter, ok := h.teamAdapterForChannel(team.DefaultExecutionChannel)
+	if !ok {
+		return
+	}
+	parser := team.NewCommandParser(h.teamSvc, adapter, func(id string) bool {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return false
+		}
+		if strings.HasPrefix(strings.ToLower(id), "bot-") {
+			return false
+		}
+		return !h.isAgentSender(id)
+	})
+	parser.HandleMessage(ctx, team.DefaultExecutionChannel, roomID, senderID, content)
+}
+
+func (h *Handler) publishThreadUpdated(roomID string, message im.Message) {
+	if h.imBus == nil || h.im == nil || message.RelatesTo == nil || strings.TrimSpace(message.RelatesTo.RelType) != im.RelationTypeThread {
+		return
+	}
+	thread, err := h.im.GetThread(roomID, message.RelatesTo.EventID)
+	if err != nil {
+		return
+	}
+	h.publishThreadEvent(im.EventTypeThreadUpdated, thread)
+}
+
+func (h *Handler) publishThreadEvent(eventType string, thread im.ThreadView) {
+	if h.imBus == nil {
+		return
+	}
+	threadCopy := thread
+	h.imBus.Publish(im.Event{
+		Type:   eventType,
+		RoomID: thread.RoomID,
+		Thread: &threadCopy,
+	})
+}
+
+func (h *Handler) publishRoomEvent(eventType string, room im.Room) {
+	if h.imBus == nil {
+		return
+	}
+	roomCopy := room
+	h.imBus.Publish(im.Event{
+		Type:   eventType,
+		RoomID: room.ID,
+		Room:   &roomCopy,
+	})
+}
+
+func (h *Handler) publishRoomDeleted(roomID string) {
+	if h.imBus == nil {
+		return
+	}
+	h.imBus.Publish(im.Event{
+		Type:   im.EventTypeRoomDeleted,
+		RoomID: strings.TrimSpace(roomID),
+	})
+}
+
+func (h *Handler) publishUserEvent(eventType string, user im.User) {
+	if h.imBus == nil {
+		return
+	}
+	userCopy := user
+	h.imBus.Publish(im.Event{
+		Type: eventType,
+		User: &userCopy,
+	})
+}
+
+func (h *Handler) publishParticipantEvent(eventType string, item apitypes.Participant) {
+	if h.imBus == nil {
+		return
+	}
+	participantCopy := item
+	h.imBus.Publish(im.Event{
+		Type:        eventType,
+		Participant: &participantCopy,
+	})
+}
+
+func (h *Handler) publishTeamEvent(eventType string, item apitypes.Team) {
+	if h.imBus == nil {
+		return
+	}
+	teamCopy := item
+	h.imBus.Publish(im.Event{
+		Type:   eventType,
+		TeamID: item.ID,
+		Team:   &teamCopy,
+	})
+}

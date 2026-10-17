@@ -1,0 +1,369 @@
+package template
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"csgclaw/internal/agentworkspace"
+	"csgclaw/internal/apitypes"
+	"csgclaw/internal/runtime"
+	toml "github.com/pelletier/go-toml/v2"
+)
+
+const (
+	localTemplatesDirName    = "templates"
+	localManifestFileName    = "agent.toml"
+	localInstructionsDirName = "instructions"
+	localSkillsDirName       = "skills"
+	localMCPsDirName         = "mcps"
+	localMemoriesDirName     = "memories"
+	localMCPFileName         = "mcp.json"
+	localPublishTempPrefix   = ".hub-template-"
+)
+
+var (
+	ErrTemplateNotFound       = errors.New("hub template not found")
+	ErrTemplateIDRequired     = errors.New("hub template id is required")
+	ErrTemplateNameRequired   = errors.New("hub template name is required")
+	ErrTemplateNameInvalid    = errors.New("hub template name must start with an English letter, be at most 24 characters long, and contain only English letters, numbers, underscores, or hyphens")
+	ErrTemplateAlreadyExists  = errors.New("hub template already exists")
+	ErrTemplateSensitiveInfo  = errors.New("template contains sensitive information")
+	ErrRuntimeKindRequired    = errors.New("hub runtime kind is required")
+	ErrWorkspaceDirRequired   = errors.New("hub workspace directory is required")
+	ErrWorkspacePathUnsafe    = errors.New("hub workspace path is unsafe")
+	ErrWorkspaceSymlinkDenied = errors.New("hub workspace symlinks are not supported")
+)
+
+type LocalStore struct {
+	root string
+}
+
+func NewLocalStore(root string) *LocalStore {
+	return &LocalStore{root: strings.TrimSpace(root)}
+}
+
+func (s *LocalStore) List(context.Context) ([]Template, error) {
+	entries, err := os.ReadDir(s.templatesRoot())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read local hub templates: %w", err)
+	}
+
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := strings.TrimSpace(entry.Name())
+		if err := validateLocalTemplateID(id); err != nil {
+			slog.Warn("skip invalid local hub template path", "id", id, "error", err)
+			continue
+		}
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	items := make([]Template, 0, len(ids))
+	for _, id := range ids {
+		item, err := s.Get(context.Background(), id)
+		if err != nil {
+			slog.Warn("skip invalid local hub template", "id", id, "error", err)
+			continue
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (s *LocalStore) Get(_ context.Context, id string) (Template, error) {
+	id, manifest, err := s.loadTemplate(id)
+	if err != nil {
+		return Template{}, err
+	}
+	updatedAt, err := parseManifestUpdatedAt(manifest.UpdatedAt)
+	if err != nil {
+		return Template{}, fmt.Errorf("validate local hub manifest %q: %w", id, err)
+	}
+	runtimeOptions, err := normalizeTemplateRuntimeOptions(manifest.RuntimeKind, manifest.RuntimeOptions)
+	if err != nil {
+		return Template{}, fmt.Errorf("validate local hub manifest %q runtime options: %w", id, err)
+	}
+	return Template{
+		ID:             id,
+		Name:           manifest.Name,
+		Description:    manifest.Description,
+		Role:           TemplateRoleWorker,
+		RuntimeKind:    normalizeTemplateRuntimeKind(manifest.RuntimeKind),
+		Version:        strings.TrimSpace(manifest.Version),
+		Image:          manifestImageRef(manifest.Image),
+		ImageEnv:       manifestImageEnv(manifest.Image),
+		RuntimeOptions: runtimeOptions,
+		WorkspaceRef:   s.workspaceRef(id),
+		UpdatedAt:      updatedAt,
+	}, nil
+}
+
+func (s *LocalStore) FetchWorkspace(_ context.Context, id string) (WorkspaceRef, error) {
+	id, manifest, err := s.loadTemplate(id)
+	if err != nil {
+		return WorkspaceRef{}, err
+	}
+	root := s.templateRoot(id)
+	if !templateLayoutExists(root) && !legacyTemplateWorkspaceExists(root) {
+		return WorkspaceRef{}, nil
+	}
+	return materializeTemplateDir(root, manifest.RuntimeKind)
+}
+
+func (s *LocalStore) ListWorkspace(_ context.Context, id, workspacePath string) (apitypes.WorkspaceListing, error) {
+	if _, _, err := s.loadTemplate(id); err != nil {
+		return apitypes.WorkspaceListing{}, err
+	}
+	return agentworkspace.ListDirectory(s.templateRoot(strings.TrimSpace(id)), workspacePath)
+}
+
+func (s *LocalStore) ReadWorkspaceFile(_ context.Context, id, workspacePath string) (apitypes.WorkspaceFile, error) {
+	if _, _, err := s.loadTemplate(id); err != nil {
+		return apitypes.WorkspaceFile{}, err
+	}
+	return agentworkspace.ReadFile(s.templateRoot(strings.TrimSpace(id)), workspacePath)
+}
+
+func (s *LocalStore) WriteWorkspaceFile(_ context.Context, id, workspacePath, content string) error {
+	if _, _, err := s.loadTemplate(id); err != nil {
+		return err
+	}
+	if filepath.ToSlash(strings.TrimSpace(workspacePath)) != localInstructionsDirName+"/"+requiredInstructionsFile {
+		return ErrWorkspacePathUnsafe
+	}
+	path := filepath.Join(s.templateRoot(strings.TrimSpace(id)), localInstructionsDirName, requiredInstructionsFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(strings.TrimRight(content, "\n")+"\n"), 0o644)
+}
+
+func (s *LocalStore) Publish(_ context.Context, spec PublishSpec) (Template, error) {
+	normalized, err := normalizePublishSpec(spec)
+	if err != nil {
+		return Template{}, err
+	}
+
+	if err := os.MkdirAll(s.templatesRoot(), 0o755); err != nil {
+		return Template{}, fmt.Errorf("create local hub templates dir: %w", err)
+	}
+	targetDir := s.templateRoot(normalized.ID)
+	if _, err := os.Stat(targetDir); err == nil {
+		return Template{}, fmt.Errorf("%w: %s", ErrTemplateAlreadyExists, normalized.Name)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Template{}, fmt.Errorf("stat local hub template %q: %w", normalized.ID, err)
+	}
+
+	tmpDir, err := os.MkdirTemp(s.templatesRoot(), localPublishTempPrefix)
+	if err != nil {
+		return Template{}, fmt.Errorf("create local hub template temp dir: %w", err)
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
+
+	if err := s.writeManifest(filepath.Join(tmpDir, localManifestFileName), normalized); err != nil {
+		return Template{}, err
+	}
+	if normalized.WorkspaceRef.Kind == WorkspaceKindDir {
+		if err := writeTemplateLayout(normalized.WorkspaceRef, tmpDir, normalized.RuntimeKind, normalized.MCPServers, normalized.IncludeMemory); err != nil {
+			return Template{}, err
+		}
+	}
+
+	if err := os.Rename(tmpDir, targetDir); err != nil {
+		return Template{}, fmt.Errorf("publish local hub template %q: %w", normalized.ID, err)
+	}
+	cleanup = false
+
+	return s.Get(context.Background(), normalized.ID)
+}
+
+func (s *LocalStore) Delete(_ context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateLocalTemplateID(id); err != nil {
+		return err
+	}
+	targetDir := s.templateRoot(id)
+	info, err := os.Stat(targetDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrTemplateNotFound
+		}
+		return fmt.Errorf("stat local hub template %q: %w", id, err)
+	}
+	if !info.IsDir() {
+		return ErrTemplateNotFound
+	}
+	if err := os.RemoveAll(targetDir); err != nil {
+		return fmt.Errorf("delete local hub template %q: %w", id, err)
+	}
+	return nil
+}
+
+func (s *LocalStore) templatesRoot() string {
+	return filepath.Join(s.root, localTemplatesDirName)
+}
+
+func (s *LocalStore) templateRoot(id string) string {
+	return filepath.Join(s.templatesRoot(), id)
+}
+
+func (s *LocalStore) manifestPath(id string) string {
+	return filepath.Join(s.templateRoot(id), localManifestFileName)
+}
+
+func (s *LocalStore) workspaceRoot(id string) string {
+	return s.templateRoot(id)
+}
+
+func (s *LocalStore) workspaceRef(id string) WorkspaceRef {
+	root := s.templateRoot(id)
+	if !templateLayoutExists(root) && !legacyTemplateWorkspaceExists(root) {
+		return WorkspaceRef{}
+	}
+	return WorkspaceRef{Kind: WorkspaceKindDir, Path: root}
+}
+
+func templateLayoutExists(root string) bool {
+	info, err := os.Stat(filepath.Join(root, localInstructionsDirName))
+	return err == nil && info.IsDir()
+}
+
+func legacyTemplateWorkspaceExists(root string) bool {
+	info, err := os.Stat(filepath.Join(root, "workspace"))
+	return err == nil && info.IsDir()
+}
+
+func (s *LocalStore) loadTemplate(id string) (string, templateManifest, error) {
+	id = strings.TrimSpace(id)
+	if err := validateLocalTemplateID(id); err != nil {
+		return "", templateManifest{}, err
+	}
+	return loadManifestFS(os.DirFS(s.root), filepath.ToSlash(filepath.Join(localTemplatesDirName, id, localManifestFileName)), "local hub")
+}
+
+func (s *LocalStore) writeManifest(path string, spec PublishSpec) error {
+	manifest := templateManifest{
+		Name:        spec.Name,
+		Description: spec.Description,
+		RuntimeKind: normalizeTemplateRuntimeKind(spec.RuntimeKind),
+		Version:     spec.Version,
+		Image: templateImageSection{
+			Ref: spec.Image,
+		},
+		RuntimeOptions: cloneTemplateRuntimeOptions(spec.RuntimeOptions),
+		UpdatedAt:      spec.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}
+	data, err := toml.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("encode local hub manifest: %w", err)
+	}
+	data = append([]byte("schema_version = \""+currentAgentFileSchemaVersion+"\"\n"), data...)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write local hub manifest: %w", err)
+	}
+	return nil
+}
+
+func normalizePublishSpec(spec PublishSpec) (PublishSpec, error) {
+	spec.ID = strings.TrimSpace(spec.ID)
+	if spec.ID == "" {
+		spec.ID = strings.TrimSpace(spec.Name)
+	}
+	if err := validateLocalTemplateID(spec.ID); err != nil {
+		return PublishSpec{}, err
+	}
+
+	spec.Name = strings.TrimSpace(spec.Name)
+	if spec.Name == "" {
+		return PublishSpec{}, ErrTemplateNameRequired
+	}
+	spec.RuntimeKind = normalizeTemplateRuntimeKind(spec.RuntimeKind)
+	spec.Version = strings.TrimSpace(spec.Version)
+	spec.Image = strings.TrimSpace(spec.Image)
+	spec.Description = strings.TrimSpace(spec.Description)
+	runtimeOptions, err := normalizeTemplateRuntimeOptions(spec.RuntimeKind, spec.RuntimeOptions)
+	if err != nil {
+		return PublishSpec{}, err
+	}
+	spec.RuntimeOptions = runtimeOptions
+	if !spec.IncludeMemory || (spec.RuntimeKind == runtime.KindCodex && spec.RuntimeOptions["memory_mode"] == "disabled") {
+		spec.WorkspaceRef.MemoryPath = ""
+	}
+	if spec.RuntimeKind == "" {
+		return PublishSpec{}, ErrRuntimeKindRequired
+	}
+	if requiresTemplateImage(spec.RuntimeKind) && spec.Image == "" {
+		return PublishSpec{}, fmt.Errorf("image.ref is required for runtime_kind %q", spec.RuntimeKind)
+	}
+	spec.WorkspaceRef.Kind = strings.TrimSpace(spec.WorkspaceRef.Kind)
+	spec.WorkspaceRef.Path = strings.TrimSpace(spec.WorkspaceRef.Path)
+	if spec.WorkspaceRef.Kind == "" && spec.WorkspaceRef.Path == "" {
+		if spec.UpdatedAt.IsZero() {
+			spec.UpdatedAt = time.Now().UTC()
+		} else {
+			spec.UpdatedAt = spec.UpdatedAt.UTC()
+		}
+		return spec, nil
+	}
+	if spec.WorkspaceRef.Kind == "" {
+		spec.WorkspaceRef.Kind = WorkspaceKindDir
+	}
+	if spec.WorkspaceRef.Kind != WorkspaceKindDir {
+		return PublishSpec{}, ErrWorkspaceDirRequired
+	}
+	if spec.WorkspaceRef.Path == "" {
+		return PublishSpec{}, ErrWorkspaceDirRequired
+	}
+	info, err := os.Stat(spec.WorkspaceRef.Path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return PublishSpec{}, fmt.Errorf("%w: %s", ErrWorkspaceDirRequired, spec.WorkspaceRef.Path)
+		}
+		return PublishSpec{}, fmt.Errorf("stat hub workspace: %w", err)
+	}
+	if !info.IsDir() {
+		return PublishSpec{}, ErrWorkspaceDirRequired
+	}
+	if spec.UpdatedAt.IsZero() {
+		spec.UpdatedAt = time.Now().UTC()
+	} else {
+		spec.UpdatedAt = spec.UpdatedAt.UTC()
+	}
+	return spec, nil
+}
+
+func validateLocalTemplateID(id string) error {
+	id = strings.TrimSpace(id)
+	switch {
+	case id == "":
+		return ErrTemplateIDRequired
+	case id == "." || id == "..":
+		return ErrWorkspacePathUnsafe
+	}
+	if strings.Contains(id, "/") || strings.Contains(id, "\\") {
+		return ErrWorkspacePathUnsafe
+	}
+	if filepath.Base(id) != id || filepath.Clean(id) != id {
+		return ErrWorkspacePathUnsafe
+	}
+	return nil
+}

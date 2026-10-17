@@ -1,0 +1,2225 @@
+package codex
+
+import (
+	"bytes"
+	"context"
+	"csgclaw/internal/agentengine/contract"
+	"csgclaw/internal/diagnostics"
+	"csgclaw/internal/modelprovider"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"csgclaw/internal/activity"
+	"csgclaw/internal/codexcli"
+	"csgclaw/internal/config"
+	agentruntime "csgclaw/internal/runtime"
+	runtimeinstructions "csgclaw/internal/runtime/instructions"
+)
+
+const (
+	appServerTurnInterruptTimeout      = 5 * time.Second
+	appServerTrackedTurnLimit          = 256
+	appServerPublishFileToolName       = "csgclaw_publish_file"
+	appServerUploadFileToolName        = "csgclaw_upload_file"
+	appServerMaxPublishedFileNameBytes = 255
+	appServerMaxUploadBytes            = 50 << 20
+)
+
+var (
+	appServerStopTimeout                = 3 * time.Second
+	appServerSemanticInactivityTimeout  = 10 * time.Minute
+	appServerFirstTurnNoProgressTimeout = 5 * time.Minute
+	// Active turns are bounded by inactivity and caller cancellation, not total elapsed time.
+	appServerMaximumTurnDuration = time.Duration(0)
+)
+
+var appServerCommandContext = codexcli.AppServerCommandContextWithOverrides
+
+type appServerManager struct {
+	deps      managerDeps
+	hydrateMu sync.Mutex
+	mu        sync.RWMutex
+	sessions  map[string]*liveSession
+}
+
+func newAppServerManager(deps managerDeps) *appServerManager {
+	return &appServerManager{
+		deps:     deps,
+		sessions: make(map[string]*liveSession),
+	}
+}
+
+func (m *appServerManager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	runtimeIDs := make([]string, 0, len(m.sessions))
+	for runtimeID := range m.sessions {
+		runtimeIDs = append(runtimeIDs, runtimeID)
+	}
+	m.mu.RUnlock()
+
+	var closeErr error
+	for _, runtimeID := range runtimeIDs {
+		if err := m.Stop(context.Background(), SessionHandle{RuntimeID: runtimeID}); err != nil && !errors.Is(err, os.ErrNotExist) {
+			closeErr = errors.Join(closeErr, fmt.Errorf("stop codex app-server runtime %q: %w", runtimeID, err))
+		}
+	}
+	return closeErr
+}
+
+func (m *appServerManager) hasSession(runtimeID string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sessions[strings.TrimSpace(runtimeID)] != nil
+}
+
+func (m *appServerManager) Start(ctx context.Context, spec SessionSpec) (*Session, error) {
+	spec.RuntimeID = strings.TrimSpace(spec.RuntimeID)
+	if spec.RuntimeID == "" {
+		return nil, fmt.Errorf("runtime id is required")
+	}
+	spec.Profile = spec.Profile.Normalized()
+
+	m.mu.RLock()
+	current := m.sessions[spec.RuntimeID]
+	m.mu.RUnlock()
+	if current != nil && current.session != nil && processAlive(current.session.ProcessID) {
+		cloned := *current.session
+		cloned.ExtensionDigests = maps.Clone(cloned.ExtensionDigests)
+		return &cloned, nil
+	}
+
+	stderrFile, err := m.deps.OpenFile(spec.StderrPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open stderr log %s: %w", spec.StderrPath, err)
+	}
+
+	telemetry, telemetryErr := newNativeTelemetry()
+	if telemetryErr != nil {
+		slog.Warn("native diagnostics unavailable", "error", telemetryErr)
+	}
+	ownedTelemetry := false
+	defer func() {
+		if !ownedTelemetry {
+			telemetry.close()
+		}
+	}()
+	cmd, err := appServerCommandContext(ctx, spec.BinaryPath, append(appServerOverrides(spec), telemetry.overrides()...))
+	if err != nil {
+		_ = stderrFile.Close()
+		return nil, fmt.Errorf("prepare codex app-server command: %w", err)
+	}
+	cmd.Dir = spec.WorkspaceDir
+	environment, extensionDigests, err := buildSessionEnvironment(spec)
+	if err != nil {
+		_ = stderrFile.Close()
+		return nil, fmt.Errorf("prepare Runtime extension environment: %w", err)
+	}
+	cmd.Env = environment
+	if telemetry != nil {
+		// Keep completed-turn exports timely; this does not block the turn itself.
+		cmd.Env = append(cmd.Env, "OTEL_BSP_SCHEDULE_DELAY=1000")
+	}
+	cmd.Stderr = stderrFile
+	if sysProcAttr := newSessionSysProcAttr(); sysProcAttr != nil {
+		cmd.SysProcAttr = sysProcAttr
+	}
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		_ = stderrFile.Close()
+		return nil, fmt.Errorf("codex app-server stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stderrFile.Close()
+		return nil, fmt.Errorf("codex app-server stdout pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stderrFile.Close()
+		return nil, fmt.Errorf("start codex app-server: %w", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(stderrFile, &slog.HandlerOptions{}))
+	appClient := newAppServerClient(stdin, logger)
+	conversationSessions := cloneConversationSessions(spec.ConversationSessions)
+	if conversationSessions == nil {
+		conversationSessions = make(map[string]string)
+	}
+	filePublishingThreads := make(map[string]bool)
+	for conversationKey := range cloneFilePublishingConversations(spec.FilePublishingConversations) {
+		if threadID := strings.TrimSpace(conversationSessions[conversationKey]); threadID != "" {
+			filePublishingThreads[threadID] = true
+		}
+	}
+	live := &liveSession{
+		telemetry:             telemetry,
+		mcpCatalogRevision:    spec.MCPCatalogRevision,
+		cmd:                   cmd,
+		stdin:                 stdin,
+		stderr:                stderrFile,
+		done:                  make(chan struct{}),
+		spec:                  spec,
+		appClient:             appClient,
+		conversationSessions:  conversationSessions,
+		memoryCheckpointLast:  make(map[string]time.Time),
+		memoryCheckpointBusy:  make(map[string]bool),
+		loadedConversations:   make(map[string]bool),
+		filePublishingThreads: filePublishingThreads,
+		turnWaiters:           make(map[string]*appServerTurnWaiter),
+		turnContexts:          make(map[string]appServerTurnContext),
+		turnThreads:           make(map[string]string),
+		commandOutputs:        make(map[string]*appServerCommandOutputState),
+		replayedExecCommands:  make(map[string]struct{}),
+		replayedAgentMessages: make(map[string]struct{}),
+		streamedAgentMessages: make(map[string]struct{}),
+		streamedAgentThreads:  make(map[string]struct{}),
+		agentMessagePhases:    make(map[string]string),
+		agentMessageStreams:   make(map[string]*assistantStructuredOutputStream),
+	}
+	appClient.onNotification = func(note appServerNotification) {
+		m.handleAppServerNotification(spec.RuntimeID, live, note)
+	}
+	appClient.onServerRequest = func(req appServerServerRequest) (any, error) {
+		return m.handleAppServerServerRequest(spec.RuntimeID, live, req)
+	}
+
+	m.mu.Lock()
+	m.sessions[spec.RuntimeID] = live
+	m.mu.Unlock()
+
+	ownedTelemetry = true
+	go m.readAppServerStdout(spec.RuntimeID, live, stdout)
+	go m.waitAppServerSession(spec.RuntimeID, live)
+
+	if err := m.initializeHandshake(ctx, live); err != nil {
+		_ = m.Stop(context.Background(), SessionHandle{RuntimeID: spec.RuntimeID})
+		return nil, m.wrapStartupError(spec, "initialize codex app-server", err)
+	}
+	if spec.ExecutionMode == ExecutionModeReadOnly {
+		if err := m.disableSystemSkills(ctx, live); err != nil {
+			_ = m.Stop(context.Background(), SessionHandle{RuntimeID: spec.RuntimeID})
+			return nil, m.wrapStartupError(spec, "disable system skills for read-only agent", err)
+		}
+	}
+
+	threadID, _, err := m.startOrResumeThread(ctx, live, m.persistedThreadID(spec), false)
+	if err != nil {
+		_ = m.Stop(context.Background(), SessionHandle{RuntimeID: spec.RuntimeID})
+		return nil, m.wrapStartupError(spec, "initialize codex app-server thread", err)
+	}
+	if strings.TrimSpace(threadID) == "" {
+		_ = m.Stop(context.Background(), SessionHandle{RuntimeID: spec.RuntimeID})
+		return nil, m.wrapStartupError(spec, "initialize codex app-server thread", fmt.Errorf("empty thread id"))
+	}
+
+	now := time.Now().UTC()
+	session := &Session{
+		RuntimeID:                      spec.RuntimeID,
+		AgentID:                        spec.AgentID,
+		AgentName:                      spec.AgentName,
+		SessionID:                      threadID,
+		BinaryPath:                     spec.BinaryPath,
+		RuntimeDir:                     spec.RuntimeDir,
+		WorkspaceDir:                   spec.WorkspaceDir,
+		HomeDir:                        spec.HomeDir,
+		CodexHomeDir:                   spec.CodexHomeDir,
+		StderrPath:                     spec.StderrPath,
+		ProcessID:                      cmd.Process.Pid,
+		CreatedAt:                      now,
+		StartedAt:                      now,
+		ConversationSessions:           cloneConversationSessions(spec.ConversationSessions),
+		ExtensionDigests:               extensionDigests,
+		FilePublishingConversations:    cloneFilePublishingConversations(spec.FilePublishingConversations),
+		ConversationProfileFingerprint: strings.TrimSpace(spec.ConversationProfileFingerprint),
+	}
+	live.mu.Lock()
+	live.session = session
+	live.mu.Unlock()
+
+	cloned := *session
+	cloned.ExtensionDigests = maps.Clone(cloned.ExtensionDigests)
+	return &cloned, nil
+}
+
+func (m *appServerManager) disableSystemSkills(ctx context.Context, live *liveSession) error {
+	if live == nil || live.appClient == nil {
+		return fmt.Errorf("codex app-server session is unavailable")
+	}
+	root := filepath.Join(live.spec.CodexHomeDir, "skills", ".system")
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read system skills: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if _, err := live.appClient.request(ctx, "skills/config/write", map[string]any{"path": path, "enabled": false}); err != nil {
+			return fmt.Errorf("disable system skill %q: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+func (m *appServerManager) Stop(ctx context.Context, handle SessionHandle) error {
+	runtimeID := strings.TrimSpace(handle.RuntimeID)
+	m.mu.RLock()
+	live := m.sessions[runtimeID]
+	m.mu.RUnlock()
+	if live == nil {
+		return os.ErrNotExist
+	}
+	if m.deps.Permission != nil {
+		m.deps.Permission.CancelSession(runtimeID, "")
+	}
+	if m.deps.UserInput != nil {
+		m.deps.UserInput.CancelSession(runtimeID, "")
+	}
+	if live.appClient != nil {
+		live.appClient.closeAllPending(fmt.Errorf("codex app-server stopping"))
+	}
+	if live.stdin != nil {
+		_ = live.stdin.Close()
+	}
+	if live.cmd != nil && live.cmd.Process != nil {
+		if err := stopProcess(live.cmd.Process.Pid); err != nil {
+			return err
+		}
+	}
+
+	timeout := time.NewTimer(appServerStopTimeout)
+	defer timeout.Stop()
+	select {
+	case <-live.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timeout.C:
+		return fmt.Errorf("codex app-server stop timeout after %s: runtime_id=%s", appServerStopTimeout, runtimeID)
+	}
+}
+
+func (m *appServerManager) Session(handle SessionHandle) (*Session, error) {
+	live, err := m.ensureLiveSession(context.Background(), handle)
+	if err != nil {
+		return nil, err
+	}
+	cloned := *live.session
+	cloned.ExtensionDigests = maps.Clone(cloned.ExtensionDigests)
+	return &cloned, nil
+}
+
+func (m *appServerManager) LiveSession(handle SessionHandle) (*Session, error) {
+	runtimeID := strings.TrimSpace(handle.RuntimeID)
+	if runtimeID == "" {
+		return nil, fmt.Errorf("runtime id is required")
+	}
+	live := m.liveSession(runtimeID)
+	if live == nil {
+		return nil, os.ErrNotExist
+	}
+	cloned := *live.session
+	cloned.ExtensionDigests = maps.Clone(cloned.ExtensionDigests)
+	return &cloned, nil
+}
+
+func (m *appServerManager) Prompt(ctx context.Context, handle SessionHandle, req PromptRequest) (PromptResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runtimeID := strings.TrimSpace(handle.RuntimeID)
+	live, err := m.ensureLiveSession(ctx, handle)
+	if err != nil {
+		return PromptResponse{}, err
+	}
+	if m.deps.BeforePrompt != nil {
+		if err := m.deps.BeforePrompt(ctx, handle); err != nil {
+			return PromptResponse{}, err
+		}
+	}
+
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(live.session.SessionID)
+		req.SessionID = sessionID
+	}
+	promptInput, err := appServerPromptInput(req)
+	if err != nil {
+		m.publishAppServerEvent(promptFailedEvent(runtimeID, sessionID, err))
+		return PromptResponse{}, err
+	}
+
+	diagnostics.From(ctx).RuntimeInfo("codex", live.spec.Profile.ModelID)
+	waiter, err := live.registerAppServerTurnWaiter(sessionID)
+	if err != nil {
+		m.publishAppServerEvent(promptFailedEvent(runtimeID, sessionID, err))
+		return PromptResponse{}, err
+	}
+	waiter.mu.Lock()
+	waiter.diagnostic = diagnostics.From(ctx)
+	waiter.mu.Unlock()
+	defer func() { live.removeAppServerTurnWaiter(sessionID, waiter) }()
+	turnCtx, cancelTurn := context.WithCancel(ctx)
+	live.setAppServerTurnContext(sessionID, waiter, turnCtx)
+	defer func() {
+		cancelTurn()
+		live.clearAppServerTurnContext(sessionID, waiter)
+	}()
+
+	m.publishContextUsage(runtimeID, live, sessionID, nil, "snapshot")
+	params := appServerTurnStartParamsWithInput(live.spec, sessionID, promptInput, req.ClientUserMessageID)
+	turnStartAt := time.Now()
+	live.appClient.logDebug("codex app-server turn start request",
+		"runtime_id", runtimeID,
+		"thread_id", sessionID,
+		"prompt_blocks", len(promptInput),
+	)
+	raw, err := live.appClient.request(ctx, "turn/start", params)
+	if err != nil {
+		live.appClient.logDebug("codex app-server turn start failed",
+			"runtime_id", runtimeID,
+			"thread_id", sessionID,
+			"duration", time.Since(turnStartAt),
+			"error", err,
+		)
+		if ctx.Err() != nil {
+			response, stopErr := m.stopCanceledAppServerTurn(ctx, live, waiter, "turn/start context canceled")
+			m.publishAppServerEvent(promptFailedEvent(runtimeID, sessionID, stopErr))
+			return response, stopErr
+		}
+		err = fmt.Errorf("codex turn/start failed: %w", err)
+		m.publishAppServerEvent(promptFailedEvent(runtimeID, sessionID, err))
+		return PromptResponse{}, err
+	}
+	waiter.setTurnID(appServerTurnIDFromResult(raw))
+	live.telemetry.bind(waiter.currentTurnID(), diagnostics.From(ctx))
+	defer live.telemetry.finish(diagnostics.From(ctx))
+	acceptedAt := time.Now()
+	diagnostics.From(ctx).Interval("runtime.accepted", "runtime", acceptedAt, acceptedAt)
+	if req.OnAccepted != nil {
+		req.OnAccepted()
+	}
+	live.trackAppServerTurn(sessionID, waiter.currentTurnID())
+	live.appClient.logDebug("codex app-server turn start accepted",
+		"runtime_id", runtimeID,
+		"thread_id", sessionID,
+		"turn_id", waiter.currentTurnID(),
+		"duration", time.Since(turnStartAt),
+	)
+
+	waitStartAt := time.Now()
+	resp, err := m.waitAppServerTurn(ctx, live, waiter)
+	if isContextWindowError(err) && ctx.Err() == nil {
+		resp, err = m.recoverContext(turnCtx, live, &waiter)
+	}
+	if err != nil {
+		live.appClient.logDebug("codex app-server turn wait failed",
+			"runtime_id", runtimeID,
+			"thread_id", sessionID,
+			"turn_id", waiter.currentTurnID(),
+			"duration", time.Since(waitStartAt),
+			"last_activity", waiter.currentLastActivity(),
+			"error", err,
+		)
+		m.publishAppServerEvent(promptFailedEvent(runtimeID, sessionID, err))
+		return resp, err
+	}
+	live.appClient.logDebug("codex app-server turn wait completed",
+		"runtime_id", runtimeID,
+		"thread_id", sessionID,
+		"turn_id", waiter.currentTurnID(),
+		"duration", time.Since(waitStartAt),
+		"stop_reason", strings.TrimSpace(resp.StopReason),
+	)
+	m.publishAppServerEvent(promptCompletedEvent(runtimeID, sessionID, resp))
+	m.maybeCreateMemoryCheckpoint(live, sessionID)
+	return resp, nil
+}
+
+func (m *appServerManager) EnsureSession(ctx context.Context, handle SessionHandle, conversationKey string) (string, error) {
+	return m.ensureSession(ctx, handle, conversationKey, false)
+}
+
+func (m *appServerManager) EnsureEngineSession(ctx context.Context, handle SessionHandle, conversationKey string) (string, error) {
+	return m.ensureSession(ctx, handle, conversationKey, true)
+}
+
+func (m *appServerManager) ensureSession(ctx context.Context, handle SessionHandle, conversationKey string, publishFiles bool) (string, error) {
+	live, err := m.ensureLiveSession(ctx, handle)
+	if err != nil {
+		return "", err
+	}
+
+	conversationKey = strings.TrimSpace(conversationKey)
+	if conversationKey == "" {
+		return strings.TrimSpace(live.session.SessionID), nil
+	}
+
+	live.mu.Lock()
+	if threadID := strings.TrimSpace(live.conversationSessions[conversationKey]); threadID != "" && live.loadedConversations[conversationKey] {
+		if !publishFiles || live.filePublishingThreads[threadID] {
+			live.mu.Unlock()
+			return threadID, nil
+		}
+	}
+	restoredThreadID := strings.TrimSpace(live.conversationSessions[conversationKey])
+	restoredLoaded := live.loadedConversations[conversationKey]
+	restoredFilePublishing := live.filePublishingThreads[restoredThreadID]
+	live.mu.Unlock()
+	if restoredThreadID != "" && !restoredLoaded && (!publishFiles || restoredFilePublishing) {
+		live.conversationResumeMu.Lock()
+		live.conversationPersistMu.Lock()
+
+		live.mu.Lock()
+		if threadID := strings.TrimSpace(live.conversationSessions[conversationKey]); threadID != "" && live.loadedConversations[conversationKey] {
+			if !publishFiles || live.filePublishingThreads[threadID] {
+				live.mu.Unlock()
+				live.conversationPersistMu.Unlock()
+				live.conversationResumeMu.Unlock()
+				return threadID, nil
+			}
+		}
+		restoredThreadID = strings.TrimSpace(live.conversationSessions[conversationKey])
+		restoredLoaded = live.loadedConversations[conversationKey]
+		restoredFilePublishing = live.filePublishingThreads[restoredThreadID]
+		live.mu.Unlock()
+		if restoredThreadID == "" || restoredLoaded || (publishFiles && !restoredFilePublishing) {
+			live.conversationPersistMu.Unlock()
+			live.conversationResumeMu.Unlock()
+			return m.ensureSession(ctx, handle, conversationKey, publishFiles)
+		}
+
+		threadID, filePublishing, err := m.startOrResumeThread(ctx, live, restoredThreadID, restoredFilePublishing)
+		if err != nil {
+			live.conversationPersistMu.Unlock()
+			live.conversationResumeMu.Unlock()
+			return "", err
+		}
+		live.mu.Lock()
+		previous := live.conversationSessions[conversationKey]
+		previousLoaded := live.loadedConversations[conversationKey]
+		previousFilePublishing := live.filePublishingThreads[previous]
+		live.conversationSessions[conversationKey] = threadID
+		live.loadedConversations[conversationKey] = true
+		live.filePublishingThreads[threadID] = filePublishing
+		conversations := cloneConversationSessions(live.conversationSessions)
+		filePublishingConversations := filePublishingConversationsForThreads(conversations, live.filePublishingThreads)
+		live.mu.Unlock()
+		if err := m.persistConversationSessions(live, conversations, filePublishingConversations); err != nil {
+			live.mu.Lock()
+			live.conversationSessions[conversationKey] = previous
+			live.loadedConversations[conversationKey] = previousLoaded
+			live.filePublishingThreads[previous] = previousFilePublishing
+			delete(live.filePublishingThreads, threadID)
+			live.mu.Unlock()
+			live.conversationPersistMu.Unlock()
+			live.conversationResumeMu.Unlock()
+			return "", err
+		}
+		live.conversationPersistMu.Unlock()
+		live.conversationResumeMu.Unlock()
+		return threadID, nil
+	}
+
+	threadID, err := m.startThread(ctx, live, publishFiles)
+	if err != nil {
+		return "", err
+	}
+
+	live.conversationPersistMu.Lock()
+	defer live.conversationPersistMu.Unlock()
+	live.mu.Lock()
+	existing := strings.TrimSpace(live.conversationSessions[conversationKey])
+	if existing != "" && live.loadedConversations[conversationKey] && (!publishFiles || live.filePublishingThreads[existing]) {
+		live.mu.Unlock()
+		return existing, nil
+	}
+	previousLoaded := live.loadedConversations[conversationKey]
+	previousFilePublishing := live.filePublishingThreads[existing]
+	live.conversationSessions[conversationKey] = threadID
+	live.loadedConversations[conversationKey] = true
+	live.filePublishingThreads[threadID] = publishFiles
+	conversations := cloneConversationSessions(live.conversationSessions)
+	filePublishingConversations := filePublishingConversationsForThreads(conversations, live.filePublishingThreads)
+	live.mu.Unlock()
+	if err := m.persistConversationSessions(live, conversations, filePublishingConversations); err != nil {
+		live.mu.Lock()
+		if live.conversationSessions[conversationKey] == threadID {
+			if existing == "" {
+				delete(live.conversationSessions, conversationKey)
+				delete(live.loadedConversations, conversationKey)
+			} else {
+				live.conversationSessions[conversationKey] = existing
+				live.loadedConversations[conversationKey] = previousLoaded
+				live.filePublishingThreads[existing] = previousFilePublishing
+			}
+			delete(live.filePublishingThreads, threadID)
+		}
+		live.mu.Unlock()
+		return "", err
+	}
+	return threadID, nil
+}
+
+func (m *appServerManager) ExistingEngineSession(ctx context.Context, handle SessionHandle, conversationKey string) (string, bool, error) {
+	live, err := m.ensureLiveSession(ctx, handle)
+	if err != nil {
+		return "", false, err
+	}
+	conversationKey = strings.TrimSpace(conversationKey)
+	live.mu.Lock()
+	threadID := strings.TrimSpace(live.conversationSessions[conversationKey])
+	available := threadID != ""
+	live.mu.Unlock()
+	if !available {
+		return "", false, nil
+	}
+	resolved, err := m.ensureSession(ctx, handle, conversationKey, true)
+	if err != nil {
+		return "", false, err
+	}
+	return resolved, true, nil
+}
+
+func (m *appServerManager) ExistingSession(ctx context.Context, handle SessionHandle, conversationKey string) (string, bool, error) {
+	live, err := m.ensureLiveSession(ctx, handle)
+	if err != nil {
+		return "", false, err
+	}
+	conversationKey = strings.TrimSpace(conversationKey)
+	if conversationKey == "" {
+		return "", false, fmt.Errorf("conversation key is required")
+	}
+	live.mu.Lock()
+	threadID := strings.TrimSpace(live.conversationSessions[conversationKey])
+	live.mu.Unlock()
+	if threadID == "" {
+		return "", false, nil
+	}
+	resolved, err := m.EnsureSession(ctx, handle, conversationKey)
+	if err != nil {
+		return "", false, err
+	}
+	return resolved, true, nil
+}
+
+func (m *appServerManager) ResetConversationHistory(ctx context.Context, handle SessionHandle, conversationKey string) error {
+	runtimeID := strings.TrimSpace(handle.RuntimeID)
+	conversationKey = strings.TrimSpace(conversationKey)
+	if runtimeID == "" {
+		return fmt.Errorf("runtime id is required")
+	}
+	if conversationKey == "" {
+		return fmt.Errorf("conversation key is required")
+	}
+
+	live, err := m.ensureLiveSession(ctx, handle)
+	if err != nil {
+		return err
+	}
+
+	live.conversationPersistMu.Lock()
+	defer live.conversationPersistMu.Unlock()
+	live.mu.Lock()
+	sessionID := strings.TrimSpace(live.conversationSessions[conversationKey])
+	delete(live.conversationSessions, conversationKey)
+	wasLoaded := live.loadedConversations[conversationKey]
+	delete(live.loadedConversations, conversationKey)
+	wasFilePublishing := live.filePublishingThreads[sessionID]
+	delete(live.filePublishingThreads, sessionID)
+	conversations := cloneConversationSessions(live.conversationSessions)
+	filePublishingConversations := filePublishingConversationsForThreads(conversations, live.filePublishingThreads)
+	live.mu.Unlock()
+	if err := m.persistConversationSessions(live, conversations, filePublishingConversations); err != nil {
+		live.mu.Lock()
+		if sessionID != "" {
+			live.conversationSessions[conversationKey] = sessionID
+			live.loadedConversations[conversationKey] = wasLoaded
+			live.filePublishingThreads[sessionID] = wasFilePublishing
+		}
+		live.mu.Unlock()
+		return err
+	}
+
+	if m.deps.Permission != nil && sessionID != "" {
+		m.deps.Permission.CancelSession(runtimeID, sessionID)
+	}
+	if m.deps.UserInput != nil && sessionID != "" {
+		m.deps.UserInput.CancelSession(runtimeID, sessionID)
+	}
+	return nil
+}
+
+func filePublishingConversationsForThreads(conversations map[string]string, filePublishingThreads map[string]bool) map[string]bool {
+	filePublishing := make(map[string]bool)
+	for conversationKey, threadID := range conversations {
+		if filePublishingThreads[strings.TrimSpace(threadID)] {
+			filePublishing[conversationKey] = true
+		}
+	}
+	return cloneFilePublishingConversations(filePublishing)
+}
+
+func (m *appServerManager) persistConversationSessions(
+	live *liveSession,
+	conversations map[string]string,
+	filePublishing map[string]bool,
+) error {
+	if m == nil || live == nil || live.session == nil || m.deps.OnConversationSessionsChange == nil {
+		return nil
+	}
+	return m.deps.OnConversationSessionsChange(live.session, conversations, filePublishing)
+}
+
+func (m *appServerManager) ensureLiveSession(ctx context.Context, handle SessionHandle) (*liveSession, error) {
+	runtimeID := strings.TrimSpace(handle.RuntimeID)
+	if runtimeID == "" {
+		return nil, fmt.Errorf("runtime id is required")
+	}
+	if live := m.liveSession(runtimeID); live != nil {
+		return live, nil
+	}
+	if m.deps.HydrateSession == nil {
+		return nil, os.ErrNotExist
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	m.hydrateMu.Lock()
+	defer m.hydrateMu.Unlock()
+
+	if live := m.liveSession(runtimeID); live != nil {
+		return live, nil
+	}
+	if _, err := m.deps.HydrateSession(ctx, handle); err != nil {
+		return nil, err
+	}
+	if live := m.liveSession(runtimeID); live != nil {
+		return live, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+func (m *appServerManager) liveSession(runtimeID string) *liveSession {
+	runtimeID = strings.TrimSpace(runtimeID)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	live := m.sessions[runtimeID]
+	if live == nil || live.session == nil || live.appClient == nil {
+		return nil
+	}
+	return live
+}
+
+// initializeHandshake performs the JSON-RPC initialize handshake required by
+// the codex app-server before any thread or turn requests can be sent.
+// The protocol is: (1) client sends "initialize" request with clientInfo
+// and capabilities, (2) server responds with its capabilities, (3) client
+// sends "initialized" notification. Without this handshake, the server
+// rejects subsequent requests with "Not initialized (code=-32600)".
+func (m *appServerManager) initializeHandshake(ctx context.Context, live *liveSession) error {
+	_, err := live.appClient.request(ctx, "initialize", map[string]any{
+		"clientInfo": map[string]any{
+			"name":    "csgclaw-agent-sdk",
+			"title":   "CSGClaw Agent SDK",
+			"version": "0.1.0",
+		},
+		"capabilities": map[string]any{
+			"experimentalApi": true,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("codex app-server initialize handshake: %w", err)
+	}
+	live.appClient.notify("initialized")
+	return nil
+}
+
+func (m *appServerManager) startOrResumeThread(ctx context.Context, live *liveSession, threadID string, publishFiles bool) (string, bool, error) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID != "" {
+		resumed, err := m.resumeThread(ctx, live, threadID)
+		if err == nil {
+			if strings.TrimSpace(resumed) != "" {
+				return resumed, publishFiles, nil
+			}
+			return threadID, publishFiles, nil
+		}
+		if live.appClient != nil {
+			live.appClient.logDebug("codex app-server thread resume failed; starting a new thread", "thread_id", threadID, "error", err)
+		}
+	}
+	started, err := m.startThread(ctx, live, publishFiles)
+	return started, publishFiles && err == nil, err
+}
+
+func (m *appServerManager) startThread(ctx context.Context, live *liveSession, publishFiles bool) (string, error) {
+	params := appServerThreadStartParams(live.spec, publishFiles)
+	raw, err := live.appClient.request(ctx, "thread/start", params)
+	if err != nil {
+		return "", err
+	}
+	return appServerThreadIDFromResult(raw)
+}
+
+func (m *appServerManager) resumeThread(ctx context.Context, live *liveSession, threadID string) (string, error) {
+	params := appServerThreadResumeParams(live.spec, threadID)
+	raw, err := live.appClient.request(ctx, "thread/resume", params)
+	if err != nil {
+		return "", err
+	}
+	resumed, err := appServerThreadIDFromResult(raw)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(resumed) == "" {
+		return threadID, nil
+	}
+	return resumed, nil
+}
+
+func appServerThreadStartParams(spec SessionSpec, publishFiles bool) map[string]any {
+	spec.Profile = spec.Profile.Normalized()
+	params := map[string]any{
+		"cwd":                    spec.WorkspaceDir,
+		"persistExtendedHistory": true,
+		"experimentalRawEvents":  false,
+		"developerInstructions":  runtimeinstructions.ImageGenerationPromptPolicy + "\n" + runtimeinstructions.VideoGenerationPromptPolicy,
+	}
+	if publishFiles {
+		tools := []map[string]any{appServerPublishFileToolSpec()}
+		if spec.ExecutionMode != ExecutionModeReadOnly {
+			tools = append(tools, appServerGenerateImageToolSpec(), appServerGenerateVideoToolSpec(), appServerUploadFileToolSpec())
+		}
+		params["dynamicTools"] = tools
+	}
+	if spec.Profile.ModelID != "" {
+		params["model"] = spec.Profile.ModelID
+	}
+	if config := appServerThreadConfig(spec.Profile); len(config) > 0 {
+		params["config"] = config
+	}
+	if spec.ExecutionMode == ExecutionModeReadOnly {
+		params["approvalPolicy"] = "never"
+		params["permissions"] = readOnlyPermissionsProfile
+	}
+	return params
+}
+
+func appServerUploadFileToolSpec() map[string]any {
+	return map[string]any{
+		"name":        appServerUploadFileToolName,
+		"description": "Upload an existing Runtime workspace file to a URI issued by one of this Agent's configured MCP servers. Call the MCP upload-creation tool first, then pass its server name and upload URI here. The destination must be same-origin with that configured MCP server. Do not use curl or expose upload credentials.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":        map[string]any{"type": "string", "description": "Runtime workspace-relative path of the input file."},
+				"server":      map[string]any{"type": "string", "description": "Configured MCP server name that issued the upload URI."},
+				"uploadUri":   map[string]any{"type": "string", "minLength": 1, "description": "Relative or absolute same-origin upload URI returned by the MCP server."},
+				"contentType": map[string]any{"type": "string", "description": "Optional file content type."},
+			},
+			"required": []string{"path", "server", "uploadUri"}, "additionalProperties": false,
+		},
+	}
+}
+
+func appServerPublishFileToolSpec() map[string]any {
+	return map[string]any{
+		"name":        appServerPublishFileToolName,
+		"description": "Publish a generated workspace file through the active channel. When the user asks to generate, send, return, or download a file, call this tool immediately after creating it. Do not search for or use csgclaw-cli, curl, Feishu APIs, or other upload methods. The path must be relative to the workspace; do not pass a URL or an absolute path.",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "Workspace-relative path of the completed file.",
+				},
+				"name": map[string]any{
+					"type":        "string",
+					"description": "Optional UTF-8 delivery filename with at most 255 bytes, no directory components, and no control characters.",
+				},
+				"mimeType": map[string]any{
+					"type":        "string",
+					"description": "Optional expected MIME type. The Runtime Adapter validates or derives it from the file.",
+				},
+			},
+			"required":             []string{"path"},
+			"additionalProperties": false,
+		},
+	}
+}
+
+func appServerThreadResumeParams(spec SessionSpec, threadID string) map[string]any {
+	spec.Profile = spec.Profile.Normalized()
+	params := map[string]any{
+		"threadId":              strings.TrimSpace(threadID),
+		"cwd":                   spec.WorkspaceDir,
+		"developerInstructions": runtimeinstructions.ImageGenerationPromptPolicy + "\n" + runtimeinstructions.VideoGenerationPromptPolicy,
+	}
+	if spec.Profile.ModelID != "" {
+		params["model"] = spec.Profile.ModelID
+	}
+	if config := appServerThreadConfig(spec.Profile); len(config) > 0 {
+		params["config"] = config
+	}
+	if spec.ExecutionMode == ExecutionModeReadOnly {
+		params["approvalPolicy"] = "never"
+		params["permissions"] = readOnlyPermissionsProfile
+	}
+	return params
+}
+
+func appServerTurnStartParams(spec SessionSpec, threadID string, prompt string) map[string]any {
+	return appServerTurnStartParamsWithInput(spec, threadID, []map[string]any{{"type": "text", "text": prompt}}, "")
+}
+
+func appServerTurnStartParamsWithInput(spec SessionSpec, threadID string, input []map[string]any, clientUserMessageID string) map[string]any {
+	spec.Profile = spec.Profile.Normalized()
+	params := map[string]any{
+		"threadId": strings.TrimSpace(threadID),
+		"input":    input,
+	}
+	if clientUserMessageID = strings.TrimSpace(clientUserMessageID); clientUserMessageID != "" {
+		params["clientUserMessageId"] = clientUserMessageID
+	}
+	if effort := config.NormalizeReasoningEffort(spec.Profile.ReasoningEffort); !config.UsesModelReasoningDefault(effort) {
+		params["effort"] = effort
+	}
+	if spec.ExecutionMode == ExecutionModeReadOnly {
+		params["approvalPolicy"] = "never"
+		params["permissions"] = readOnlyPermissionsProfile
+	}
+	return params
+}
+
+func appServerOverrides(spec SessionSpec) []string {
+	if spec.ExecutionMode != ExecutionModeReadOnly {
+		return nil
+	}
+	overrides := []string{
+		"--strict-config",
+		"--disable", "apps",
+		"--disable", "browser_use",
+		"--disable", "browser_use_external",
+		"--disable", "browser_use_full_cdp_access",
+		"--disable", "computer_use",
+		"--disable", "goals",
+		"--disable", "hooks",
+		"--disable", "image_generation",
+		"--disable", "in_app_browser",
+		"--disable", "memories",
+		"--disable", "multi_agent",
+		"--disable", "remote_plugin",
+		"--disable", "shell_tool",
+		"--disable", "skill_mcp_dependency_install",
+		"--disable", "unified_exec",
+		"--disable", "workspace_dependencies",
+		"--config", `approval_policy="never"`,
+		"--config", `default_permissions="csgclaw-read-only"`,
+		"--config", `web_search="disabled"`,
+		"--config", `project_doc_max_bytes=0`,
+		"--config", `shell_environment_policy.inherit="none"`,
+	}
+	if workspaceDir := strings.TrimSpace(spec.WorkspaceDir); workspaceDir != "" {
+		overrides = append(overrides,
+			"--config", fmt.Sprintf(`projects={%s={trust_level="untrusted"}}`, tomlQuotedKey(workspaceDir)),
+		)
+	}
+	return overrides
+}
+
+func (m *appServerManager) handleAppServerServerRequest(runtimeID string, live *liveSession, req appServerServerRequest) (any, error) {
+	var diagnosticParams struct {
+		ThreadID string `json:"threadId"`
+		TurnID   string `json:"turnId"`
+	}
+	if json.Unmarshal(req.Params, &diagnosticParams) == nil && live != nil {
+		if ctx, ok := live.appServerTurnContext(diagnosticParams.ThreadID, diagnosticParams.TurnID); ok {
+			name, owner := "callback.handle", "csgclaw"
+			if strings.Contains(req.Method, "requestUserInput") {
+				name, owner = "user.wait", "user"
+			}
+			finish := diagnostics.Measure(ctx, name, owner)
+			defer finish()
+		}
+	}
+	readOnly := live != nil && live.spec.ExecutionMode == ExecutionModeReadOnly
+	switch strings.TrimSpace(req.Method) {
+	case "item/commandExecution/requestApproval", "execCommandApproval":
+		if readOnly {
+			return map[string]any{"decision": "decline"}, nil
+		}
+		return map[string]any{"decision": "accept"}, nil
+	case "item/fileChange/requestApproval", "applyPatchApproval":
+		if readOnly {
+			return map[string]any{"decision": "decline"}, nil
+		}
+		return map[string]any{"decision": "accept"}, nil
+	case "item/permissions/requestApproval":
+		if readOnly {
+			return map[string]any{"permissions": map[string]any{}, "scope": "turn"}, nil
+		}
+		return nil, fmt.Errorf("permission escalation is not supported")
+	case "mcpServer/elicitation/request":
+		if readOnly {
+			return map[string]any{"action": "decline", "content": nil, "_meta": nil}, nil
+		}
+		return map[string]any{
+			"action":  "accept",
+			"content": nil,
+			"_meta":   nil,
+		}, nil
+	case "item/tool/requestUserInput":
+		return m.handleAppServerUserInputRequest(runtimeID, live, req)
+	case "item/tool/call":
+		return m.handleAppServerDynamicToolCall(runtimeID, live, req)
+	default:
+		return nil, fmt.Errorf("unhandled server request: %s", strings.TrimSpace(req.Method))
+	}
+}
+
+type appServerDynamicToolCallParams struct {
+	ThreadID  string          `json:"threadId"`
+	TurnID    string          `json:"turnId"`
+	CallID    string          `json:"callId"`
+	Tool      string          `json:"tool"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+type appServerUploadFileArgs struct {
+	Path        string `json:"path"`
+	Server      string `json:"server"`
+	UploadURI   string `json:"uploadUri"`
+	ContentType string `json:"contentType"`
+}
+
+type appServerPublishFileArgs struct {
+	Path     string `json:"path"`
+	Name     string `json:"name"`
+	MIMEType string `json:"mimeType"`
+}
+
+func (m *appServerManager) handleAppServerDynamicToolCall(runtimeID string, live *liveSession, req appServerServerRequest) (any, error) {
+	var params appServerDynamicToolCallParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return nil, fmt.Errorf("decode dynamic tool call: %w", err)
+	}
+	params.ThreadID = strings.TrimSpace(params.ThreadID)
+	params.TurnID = strings.TrimSpace(params.TurnID)
+	if waiter := live.appServerTurnWaiter(params.ThreadID); waiter != nil && waiter.matchesTurn(params.TurnID) {
+		waiter.mu.Lock()
+		waiter.visibleActivity = true
+		waiter.mu.Unlock()
+	}
+	params.CallID = strings.TrimSpace(params.CallID)
+	params.Tool = strings.TrimSpace(params.Tool)
+	if params.ThreadID == "" || params.TurnID == "" || params.CallID == "" {
+		return nil, fmt.Errorf("dynamic tool thread ID, turn ID, and call ID are required")
+	}
+	if params.Tool != appServerPublishFileToolName && params.Tool != appServerUploadFileToolName && params.Tool != "csgclaw_generate_image" && params.Tool != "csgclaw_generate_video" {
+		return nil, fmt.Errorf("unsupported dynamic tool %q", params.Tool)
+	}
+	if live == nil || !live.appServerPublishesFilesForThread(params.ThreadID) {
+		return nil, fmt.Errorf("dynamic file tool references unknown or unsupported thread %q", params.ThreadID)
+	}
+	if params.Tool == "csgclaw_generate_image" {
+		if live.spec.ExecutionMode == ExecutionModeReadOnly {
+			return appServerDynamicToolResponse(false, "image generation is unavailable in read-only mode"), nil
+		}
+		var args struct {
+			Prompt string `json:"prompt"`
+		}
+		if json.Unmarshal(params.Arguments, &args) != nil {
+			return appServerDynamicToolResponse(false, "invalid image generation arguments"), nil
+		}
+		ctx, ok := live.appServerTurnContext(params.ThreadID, params.TurnID)
+		if !ok {
+			return appServerDynamicToolResponse(false, "image generation requires an active turn"), nil
+		}
+		if err := contract.GenerateImage(ctx, params.CallID, args.Prompt); err != nil {
+			return appServerDynamicToolResponse(false, err.Error()), nil
+		}
+		return appServerDynamicToolResponse(true, "Image generated and delivered to the current conversation. Do not generate again or publish another copy. Continue responding using the original chat model."), nil
+	}
+	if params.Tool == "csgclaw_generate_video" {
+		if live.spec.ExecutionMode == ExecutionModeReadOnly {
+			return appServerDynamicToolResponse(false, "video generation is unavailable in read-only mode"), nil
+		}
+		var args struct {
+			Prompt  string `json:"prompt"`
+			Size    string `json:"size"`
+			Seconds int    `json:"seconds"`
+		}
+		if json.Unmarshal(params.Arguments, &args) != nil {
+			return appServerDynamicToolResponse(false, "invalid video generation arguments"), nil
+		}
+		ctx, ok := live.appServerTurnContext(params.ThreadID, params.TurnID)
+		if !ok {
+			return appServerDynamicToolResponse(false, "video generation requires an active turn"), nil
+		}
+		if err := contract.GenerateVideo(ctx, params.CallID, args.Prompt, modelprovider.VideoGenerationOptions{Size: args.Size, Seconds: args.Seconds}); err != nil {
+			return appServerDynamicToolResponse(false, err.Error()), nil
+		}
+		return appServerDynamicToolResponse(true, "Video generation was submitted. Briefly acknowledge submission without describing a transient status such as still generating, downloading, completed, or delivered. The attached task card is the source of truth and updates automatically. Do not publish another copy."), nil
+	}
+	if params.Tool == appServerUploadFileToolName {
+		if live.spec.ExecutionMode == ExecutionModeReadOnly {
+			return appServerDynamicToolResponse(false, "file upload is unavailable in read-only mode"), nil
+		}
+		var args appServerUploadFileArgs
+		if err := json.Unmarshal(params.Arguments, &args); err != nil {
+			return appServerDynamicToolResponse(false, "invalid upload arguments"), nil
+		}
+		uploadCtx, ok := live.appServerTurnContext(params.ThreadID, params.TurnID)
+		if !ok {
+			return appServerDynamicToolResponse(false, "file upload is unavailable outside an active turn"), nil
+		}
+		if err := uploadAppServerWorkspaceFile(uploadCtx, live.spec, args); err != nil {
+			return appServerDynamicToolResponse(false, err.Error()), nil
+		}
+		return appServerDynamicToolResponse(true, "File uploaded successfully. Continue by calling the MCP parse tool with its file ID."), nil
+	}
+	var publishArgs appServerPublishFileArgs
+	if err := json.Unmarshal(params.Arguments, &publishArgs); err != nil {
+		return appServerDynamicToolResponse(false, "invalid publish arguments"), nil
+	}
+	file, err := normalizeAppServerPublishFileArgs(publishArgs)
+	if err != nil {
+		return appServerDynamicToolResponse(false, err.Error()), nil
+	}
+	if m == nil || m.deps.EventSink == nil {
+		return appServerDynamicToolResponse(false, "file delivery is unavailable"), nil
+	}
+	m.publishAppServerEvent(SessionEvent{
+		RuntimeID:  runtimeID,
+		SessionID:  params.ThreadID,
+		TurnID:     params.TurnID,
+		Kind:       SessionEventFileOutput,
+		ToolCallID: params.CallID,
+		ToolKind:   appServerPublishFileToolName,
+		ToolTitle:  "Publish file",
+		ToolStatus: "completed",
+		Payload:    file,
+	})
+	return appServerDynamicToolResponse(true, "File publication requested."), nil
+}
+
+func uploadAppServerWorkspaceFile(ctx context.Context, spec SessionSpec, args appServerUploadFileArgs) error {
+	path := strings.TrimSpace(args.Path)
+	cleaned := filepath.Clean(path)
+	if path == "" || cleaned == "." || filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path must stay within the Runtime workspace")
+	}
+	entry, ok := spec.MCPServers[strings.TrimSpace(args.Server)].(map[string]any)
+	if !ok {
+		return fmt.Errorf("MCP server %q is not configured for this Agent", strings.TrimSpace(args.Server))
+	}
+	baseText, _ := entry["url"].(string)
+	base, err := url.Parse(strings.TrimSpace(baseText))
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
+		return fmt.Errorf("configured MCP server does not have a valid HTTP URL")
+	}
+	uploadURI := strings.TrimSpace(args.UploadURI)
+	if uploadURI == "" {
+		return fmt.Errorf("upload URI is required")
+	}
+	target, err := base.Parse(uploadURI)
+	if err != nil || target.Scheme != base.Scheme || !strings.EqualFold(target.Host, base.Host) || target.User != nil {
+		return fmt.Errorf("upload URI must be same-origin with MCP server %q", strings.TrimSpace(args.Server))
+	}
+	return withAppServerUploadFile(spec, cleaned, func(file *os.File, size int64) error {
+		request, err := newAppServerUploadRequest(ctx, target.String(), file, size)
+		if err != nil {
+			return fmt.Errorf("create upload request: %w", err)
+		}
+		if contentType := strings.TrimSpace(args.ContentType); contentType != "" {
+			if _, _, err := mime.ParseMediaType(contentType); err != nil {
+				return fmt.Errorf("contentType is invalid")
+			}
+			request.Header.Set("Content-Type", contentType)
+		}
+		client := &http.Client{
+			Timeout: 90 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return errors.New("upload redirects are not allowed")
+			},
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return fmt.Errorf("upload file: %w", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return fmt.Errorf("upload endpoint returned HTTP %d", response.StatusCode)
+		}
+		return nil
+	})
+}
+
+func newAppServerUploadRequest(ctx context.Context, target string, file *os.File, size int64) (*http.Request, error) {
+	var body io.Reader = http.NoBody
+	if size > 0 {
+		body = io.LimitReader(file, size)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, target, body)
+	if err != nil {
+		return nil, err
+	}
+	request.ContentLength = size
+	return request, nil
+}
+
+func normalizeAppServerPublishFileArgs(args appServerPublishFileArgs) (activity.RuntimeFile, error) {
+	path := strings.TrimSpace(args.Path)
+	cleaned := filepath.Clean(path)
+	if path == "" || cleaned == "." || filepath.IsAbs(cleaned) || filepath.VolumeName(cleaned) != "" || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return activity.RuntimeFile{}, fmt.Errorf("path must stay within the Runtime workspace")
+	}
+	name := strings.TrimSpace(args.Name)
+	if name == "" {
+		name = filepath.Base(cleaned)
+	}
+	if !utf8.ValidString(name) || len([]byte(name)) > appServerMaxPublishedFileNameBytes || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, "/\\\x00") {
+		return activity.RuntimeFile{}, fmt.Errorf("name must be a valid UTF-8 basename with 1 to %d bytes", appServerMaxPublishedFileNameBytes)
+	}
+	for _, character := range name {
+		if unicode.IsControl(character) {
+			return activity.RuntimeFile{}, fmt.Errorf("name must not contain control characters")
+		}
+	}
+	mediaType := strings.TrimSpace(args.MIMEType)
+	if mediaType != "" {
+		parsed, _, err := mime.ParseMediaType(mediaType)
+		if err != nil || strings.TrimSpace(parsed) == "" {
+			return activity.RuntimeFile{}, fmt.Errorf("mimeType is invalid")
+		}
+		mediaType = strings.ToLower(parsed)
+	}
+	return activity.RuntimeFile{Path: cleaned, Name: name, MIMEType: mediaType}, nil
+}
+
+func appServerDynamicToolResponse(success bool, message string) map[string]any {
+	return map[string]any{
+		"contentItems": []map[string]any{{"type": "inputText", "text": strings.TrimSpace(message)}},
+		"success":      success,
+	}
+}
+
+type appServerUserInputParams struct {
+	ThreadID         string                       `json:"threadId"`
+	TurnID           string                       `json:"turnId"`
+	ItemID           string                       `json:"itemId"`
+	Questions        []appServerUserInputQuestion `json:"questions"`
+	AutoResolutionMS *uint64                      `json:"autoResolutionMs"`
+}
+
+type appServerUserInputQuestion struct {
+	ID       string                     `json:"id"`
+	Header   string                     `json:"header"`
+	Question string                     `json:"question"`
+	Options  []appServerUserInputOption `json:"options"`
+	IsOther  bool                       `json:"isOther"`
+	IsSecret bool                       `json:"isSecret"`
+}
+
+type appServerUserInputOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+func (m *appServerManager) handleAppServerUserInputRequest(runtimeID string, live *liveSession, req appServerServerRequest) (any, error) {
+	if m.deps.UserInput == nil {
+		return nil, fmt.Errorf("user input broker is not configured")
+	}
+	var params appServerUserInputParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return nil, fmt.Errorf("decode request_user_input params: %w", err)
+	}
+	params.ThreadID = strings.TrimSpace(params.ThreadID)
+	params.TurnID = strings.TrimSpace(params.TurnID)
+	params.ItemID = strings.TrimSpace(params.ItemID)
+	if params.ThreadID == "" || params.TurnID == "" || params.ItemID == "" {
+		return nil, fmt.Errorf("request_user_input requires threadId, turnId, and itemId")
+	}
+	if live == nil || !live.appServerTracksThread(params.ThreadID) {
+		return nil, fmt.Errorf("request_user_input references unknown thread %q", params.ThreadID)
+	}
+	questions := make([]activity.UserInputQuestionSnapshot, 0, len(params.Questions))
+	for _, question := range params.Questions {
+		options := make([]activity.UserInputOptionSnapshot, 0, len(question.Options))
+		for _, option := range question.Options {
+			options = append(options, activity.UserInputOptionSnapshot{
+				Label:       option.Label,
+				Description: option.Description,
+			})
+		}
+		questions = append(questions, activity.UserInputQuestionSnapshot{
+			ID:       question.ID,
+			Header:   question.Header,
+			Question: question.Question,
+			Options:  options,
+			IsOther:  question.IsOther,
+			IsSecret: question.IsSecret,
+		})
+	}
+	var autoResolve time.Duration
+	if params.AutoResolutionMS != nil {
+		if *params.AutoResolutionMS < 60_000 || *params.AutoResolutionMS > 240_000 {
+			return nil, fmt.Errorf("autoResolutionMs must be between 60000 and 240000")
+		}
+		autoResolve = time.Duration(*params.AutoResolutionMS) * time.Millisecond
+	}
+	live.notifyAppServerTurn(params.ThreadID, appServerTurnResult{
+		activity:       "request_user_input:pending",
+		progress:       true,
+		userInputDelta: 1,
+	})
+	defer live.notifyAppServerTurn(params.ThreadID, appServerTurnResult{
+		activity:       "request_user_input:resolved",
+		userInputDelta: -1,
+	})
+	decision, err := m.deps.UserInput.Request(context.Background(), PendingUserInputRequest{
+		Execution: activity.ExecutionRef{
+			RuntimeKind: agentruntime.KindCodex,
+			RuntimeID:   runtimeID,
+			SessionID:   params.ThreadID,
+			TurnID:      params.TurnID,
+			ToolCallID:  params.ItemID,
+			ToolKind:    "request_user_input",
+		},
+		ServerRequestID: appServerRequestID(req.ID),
+		Questions:       questions,
+		RequestedAt:     time.Now().UTC(),
+		AutoResolve:     autoResolve,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return decision.Response, nil
+}
+
+func appServerRequestID(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var number int64
+	if json.Unmarshal(raw, &number) == nil {
+		return fmt.Sprintf("%d", number)
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func appServerReasoningConfig(effort string) map[string]any {
+	effort = config.NormalizeReasoningEffort(effort)
+	if config.UsesModelReasoningDefault(effort) {
+		return nil
+	}
+	return map[string]any{"model_reasoning_effort": effort}
+}
+
+func appServerTurnIDFromResult(raw json.RawMessage) string {
+	var result struct {
+		TurnID string `json:"turnId"`
+		ID     string `json:"id"`
+		Turn   struct {
+			ID     string `json:"id"`
+			TurnID string `json:"turnId"`
+		} `json:"turn"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &result) != nil {
+		return ""
+	}
+	for _, candidate := range []string{result.TurnID, result.ID, result.Turn.TurnID, result.Turn.ID} {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func appServerThreadIDFromResult(raw json.RawMessage) (string, error) {
+	var result struct {
+		ThreadID string `json:"threadId"`
+		ID       string `json:"id"`
+		Thread   struct {
+			ID       string `json:"id"`
+			ThreadID string `json:"threadId"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", fmt.Errorf("decode thread result: %w", err)
+	}
+	for _, candidate := range []string{result.ThreadID, result.ID, result.Thread.ThreadID, result.Thread.ID} {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("thread result missing thread id")
+}
+
+func appServerPromptText(req PromptRequest) (string, error) {
+	if len(req.Prompt) == 0 {
+		return "", fmt.Errorf("prompt text is required")
+	}
+	parts := make([]string, 0, len(req.Prompt))
+	for _, block := range req.Prompt {
+		switch {
+		case block.Text != nil:
+			parts = append(parts, block.Text.Text)
+		case block.ResourceLink != nil || block.Resource != nil:
+			if text := textFromPromptBlock(block); strings.TrimSpace(text) != "" {
+				parts = append(parts, text)
+			}
+		default:
+			return "", fmt.Errorf("unsupported prompt content block for codex app-server")
+		}
+	}
+	text := strings.TrimSpace(strings.Join(parts, "\n\n"))
+	if text == "" {
+		return "", fmt.Errorf("prompt text is required")
+	}
+	return text, nil
+}
+
+func appServerPromptInput(req PromptRequest) ([]map[string]any, error) {
+	if len(req.Prompt) == 0 {
+		return nil, fmt.Errorf("prompt input is required")
+	}
+	input := make([]map[string]any, 0, len(req.Prompt))
+	for _, block := range req.Prompt {
+		switch {
+		case block.Text != nil:
+			if strings.TrimSpace(block.Text.Text) == "" {
+				return nil, fmt.Errorf("prompt text is required")
+			}
+			input = append(input, map[string]any{"type": "text", "text": block.Text.Text})
+		case block.LocalImage != nil:
+			path := strings.TrimSpace(block.LocalImage.Path)
+			if path == "" {
+				return nil, fmt.Errorf("local image path is required")
+			}
+			input = append(input, map[string]any{"type": "localImage", "path": path})
+		case block.ResourceLink != nil || block.Resource != nil:
+			text := strings.TrimSpace(textFromPromptBlock(block))
+			if text == "" {
+				return nil, fmt.Errorf("prompt resource is empty")
+			}
+			input = append(input, map[string]any{"type": "text", "text": text})
+		default:
+			return nil, fmt.Errorf("unsupported prompt content block for codex app-server")
+		}
+	}
+	return input, nil
+}
+
+func (m *appServerManager) persistedThreadID(spec SessionSpec) string {
+	if m.deps.ReadFile == nil {
+		return ""
+	}
+	path := strings.TrimSpace(spec.RuntimeDir)
+	if path == "" {
+		return ""
+	}
+	data, err := m.deps.ReadFile(path + string(os.PathSeparator) + sessionFileName)
+	if err != nil {
+		return ""
+	}
+	var meta sessionMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(meta.SessionID)
+}
+
+type appServerTurnWaiter struct {
+	diagnostic               *diagnostics.Record
+	diagnosticEnds           map[string]time.Time
+	visibleActivity          bool
+	mu                       sync.RWMutex
+	threadID                 string
+	turnID                   string
+	ch                       chan appServerTurnResult
+	terminalResults          map[string]appServerTurnResult
+	lastActivity             string
+	pendingInputs            int
+	structuredOutputBoundary bool
+}
+
+type appServerTurnResult struct {
+	success               bool
+	stopReason            string
+	err                   error
+	turnID                string
+	activity              string
+	started               bool
+	progress              bool
+	assistantActivity     bool
+	userInputStateChanged bool
+	waitingForUser        bool
+	userInputDelta        int
+}
+
+func (s *liveSession) registerAppServerTurnWaiter(threadID string) (*appServerTurnWaiter, error) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return nil, fmt.Errorf("thread id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnWaiters == nil {
+		s.turnWaiters = make(map[string]*appServerTurnWaiter)
+	}
+	if s.turnWaiters[threadID] != nil {
+		return nil, fmt.Errorf("codex turn already in progress for thread %s", threadID)
+	}
+	waiter := &appServerTurnWaiter{
+		threadID:     threadID,
+		ch:           make(chan appServerTurnResult, 8),
+		lastActivity: "turn/start",
+	}
+	s.turnWaiters[threadID] = waiter
+	return waiter, nil
+}
+
+func (s *liveSession) removeAppServerTurnWaiter(threadID string, waiter *appServerTurnWaiter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnWaiters[strings.TrimSpace(threadID)] == waiter {
+		delete(s.turnWaiters, strings.TrimSpace(threadID))
+	}
+}
+
+type appServerTurnContext struct {
+	waiter *appServerTurnWaiter
+	ctx    context.Context
+}
+
+func (s *liveSession) setAppServerTurnContext(threadID string, waiter *appServerTurnWaiter, ctx context.Context) {
+	threadID = strings.TrimSpace(threadID)
+	if s == nil || threadID == "" || waiter == nil || ctx == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnContexts == nil {
+		s.turnContexts = make(map[string]appServerTurnContext)
+	}
+	s.turnContexts[threadID] = appServerTurnContext{waiter: waiter, ctx: ctx}
+}
+
+func (s *liveSession) clearAppServerTurnContext(threadID string, waiter *appServerTurnWaiter) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	threadID = strings.TrimSpace(threadID)
+	active, ok := s.turnContexts[threadID]
+	if ok && active.waiter == waiter {
+		delete(s.turnContexts, threadID)
+	}
+}
+
+func (s *liveSession) appServerTurnContext(threadID, turnID string) (context.Context, bool) {
+	if s == nil || strings.TrimSpace(threadID) == "" || strings.TrimSpace(turnID) == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active, ok := s.turnContexts[strings.TrimSpace(threadID)]
+	if !ok || active.waiter == nil || active.ctx == nil || active.waiter.currentTurnID() != strings.TrimSpace(turnID) {
+		return nil, false
+	}
+	if _, terminal := active.waiter.terminalResult(); terminal || active.ctx.Err() != nil {
+		return nil, false
+	}
+	return active.ctx, true
+}
+
+func (s *liveSession) trackAppServerTurn(threadID, turnID string) {
+	threadID = strings.TrimSpace(threadID)
+	turnID = strings.TrimSpace(turnID)
+	if s == nil || threadID == "" || turnID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnThreads == nil {
+		s.turnThreads = make(map[string]string)
+	}
+	if _, exists := s.turnThreads[turnID]; !exists {
+		s.turnThreadOrder = append(s.turnThreadOrder, turnID)
+	}
+	s.turnThreads[turnID] = threadID
+	for len(s.turnThreadOrder) > appServerTrackedTurnLimit {
+		oldest := s.turnThreadOrder[0]
+		s.turnThreadOrder = s.turnThreadOrder[1:]
+		delete(s.turnThreads, oldest)
+	}
+}
+
+func (s *liveSession) appServerThreadForTurn(turnID string) string {
+	turnID = strings.TrimSpace(turnID)
+	if s == nil || turnID == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSpace(s.turnThreads[turnID])
+}
+
+func (s *liveSession) notifyAppServerTurn(threadID string, result appServerTurnResult) bool {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return false
+	}
+	s.mu.Lock()
+	waiter := s.turnWaiters[threadID]
+	s.mu.Unlock()
+	if waiter == nil {
+		return false
+	}
+	if !waiter.apply(&result) {
+		return true
+	}
+	if result.userInputStateChanged {
+		select {
+		case waiter.ch <- result:
+		case <-s.done:
+		}
+		return true
+	}
+	select {
+	case waiter.ch <- result:
+	default:
+	}
+	return true
+}
+
+func (s *liveSession) appServerTurnWaiter(threadID string) *appServerTurnWaiter {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnWaiters[strings.TrimSpace(threadID)]
+}
+
+func (w *appServerTurnWaiter) recordDiagnosticCompletion(turnID string, at time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if turnID == "" || (w.turnID != "" && w.turnID != turnID) {
+		return
+	}
+	if w.diagnosticEnds == nil {
+		w.diagnosticEnds = map[string]time.Time{}
+	}
+	if _, ok := w.diagnosticEnds[turnID]; !ok && (len(w.diagnosticEnds) < 8 || w.turnID == turnID) {
+		w.diagnosticEnds[turnID] = at
+	}
+	if w.turnID == turnID {
+		w.diagnostic.RuntimeEndAt(w.diagnosticEnds[turnID])
+	}
+}
+
+func (w *appServerTurnWaiter) setTurnID(turnID string) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.turnID = turnID
+	w.diagnostic.RuntimeRef(w.threadID, turnID, "")
+	if at, ok := w.diagnosticEnds[turnID]; ok {
+		w.diagnostic.RuntimeEndAt(at)
+	}
+	for id := range w.terminalResults {
+		if id != "" && id != turnID {
+			delete(w.terminalResults, id)
+		}
+	}
+}
+
+func (w *appServerTurnWaiter) apply(result *appServerTurnResult) bool {
+	if w == nil || result == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	result.turnID = strings.TrimSpace(result.turnID)
+	if w.turnID != "" && result.turnID != "" && w.turnID != result.turnID {
+		return false
+	}
+	// Only a start notification or the turn/start response establishes identity.
+	// A previous turn can finish while the next start response is still pending.
+	if result.started && result.turnID != "" {
+		w.turnID = result.turnID
+		w.diagnostic.RuntimeRef(w.threadID, result.turnID, "")
+		if at, ok := w.diagnosticEnds[w.turnID]; ok {
+			w.diagnostic.RuntimeEndAt(at)
+		}
+	}
+	if result.success || result.err != nil {
+		// Progress is coalescible, but a terminal outcome must survive a full
+		// notification channel. Retain outcomes by ID until turn/start binds the
+		// waiter, including completions that precede its RPC response.
+		if w.terminalResults == nil {
+			w.terminalResults = make(map[string]appServerTurnResult)
+		}
+		if _, exists := w.terminalResults[result.turnID]; !exists {
+			w.terminalResults[result.turnID] = *result
+		}
+	}
+	if result.activity != "" {
+		w.lastActivity = strings.TrimSpace(result.activity)
+	}
+	if result.userInputDelta != 0 {
+		w.pendingInputs += result.userInputDelta
+		if w.pendingInputs < 0 {
+			w.pendingInputs = 0
+		}
+		result.userInputStateChanged = true
+		result.waitingForUser = w.pendingInputs > 0
+	}
+	return true
+}
+
+func (w *appServerTurnWaiter) terminalResult() (appServerTurnResult, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if result, ok := w.terminalResults[w.turnID]; ok {
+		return result, true
+	}
+	result, ok := w.terminalResults[""]
+	return result, ok
+}
+
+func (w *appServerTurnWaiter) matchesTurn(turnID string) bool {
+	expected := w.currentTurnID()
+	return expected == "" || turnID == "" || expected == strings.TrimSpace(turnID)
+}
+
+func (w *appServerTurnWaiter) currentTurnID() string {
+	if w == nil {
+		return ""
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return strings.TrimSpace(w.turnID)
+}
+
+func (w *appServerTurnWaiter) currentLastActivity() string {
+	if w == nil {
+		return ""
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return strings.TrimSpace(w.lastActivity)
+}
+
+func (w *appServerTurnWaiter) markStructuredOutputBoundary() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.structuredOutputBoundary {
+		return false
+	}
+	w.structuredOutputBoundary = true
+	return true
+}
+
+func (w *appServerTurnWaiter) hasStructuredOutputBoundary() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.structuredOutputBoundary
+}
+
+func (m *appServerManager) waitAppServerTurn(ctx context.Context, live *liveSession, waiter *appServerTurnWaiter) (PromptResponse, error) {
+	semanticTimeout := appServerSemanticInactivityTimeout
+	if semanticTimeout <= 0 {
+		semanticTimeout = 10 * time.Minute
+	}
+	noProgressTimeout := appServerFirstTurnNoProgressTimeout
+	if noProgressTimeout <= 0 {
+		noProgressTimeout = semanticTimeout
+	}
+	semanticTimer := time.NewTimer(semanticTimeout)
+	semanticC := semanticTimer.C
+	defer semanticTimer.Stop()
+	maximumDuration := appServerMaximumTurnDuration
+	var maximumTimer *time.Timer
+	var maximumC <-chan time.Time
+	var maximumRemaining time.Duration
+	var maximumStartedAt time.Time
+	if maximumDuration > 0 {
+		maximumTimer = time.NewTimer(maximumDuration)
+		maximumC = maximumTimer.C
+		maximumRemaining = maximumDuration
+		maximumStartedAt = time.Now()
+		defer maximumTimer.Stop()
+	}
+
+	var noProgressTimer *time.Timer
+	var noProgressC <-chan time.Time
+	waitStartedAt := time.Now()
+	lastActivityAt := waitStartedAt
+	waitingForUser := false
+	stopNoProgress := func() {
+		if noProgressTimer == nil {
+			return
+		}
+		if !noProgressTimer.Stop() {
+			select {
+			case <-noProgressTimer.C:
+			default:
+			}
+		}
+		noProgressC = nil
+	}
+	defer stopNoProgress()
+
+	resetSemantic := func() {
+		if !semanticTimer.Stop() {
+			select {
+			case <-semanticTimer.C:
+			default:
+			}
+		}
+		semanticTimer.Reset(semanticTimeout)
+		semanticC = semanticTimer.C
+	}
+	pauseSemantic := func() {
+		if !semanticTimer.Stop() {
+			select {
+			case <-semanticTimer.C:
+			default:
+			}
+		}
+		semanticC = nil
+	}
+	pauseMaximum := func(now time.Time) {
+		if maximumTimer == nil || maximumC == nil {
+			return
+		}
+		maximumRemaining -= now.Sub(maximumStartedAt)
+		if maximumRemaining < 0 {
+			maximumRemaining = 0
+		}
+		if !maximumTimer.Stop() {
+			select {
+			case <-maximumTimer.C:
+			default:
+			}
+		}
+		maximumC = nil
+	}
+	resumeMaximum := func(now time.Time) {
+		if maximumTimer == nil || maximumC != nil {
+			return
+		}
+		remaining := maximumRemaining
+		if remaining <= 0 {
+			remaining = time.Nanosecond
+		}
+		maximumStartedAt = now
+		maximumTimer.Reset(remaining)
+		maximumC = maximumTimer.C
+	}
+
+	for {
+		if result, ok := waiter.terminalResult(); ok {
+			if result.err != nil {
+				return PromptResponse{}, result.err
+			}
+			stopReason := result.stopReason
+			if stopReason == "" {
+				stopReason = StopReasonEndTurn
+			}
+			return PromptResponse{StopReason: stopReason}, nil
+		}
+		select {
+		case result := <-waiter.ch:
+			if !waiter.matchesTurn(result.turnID) {
+				continue
+			}
+			if result.userInputStateChanged && result.waitingForUser != waitingForUser {
+				now := time.Now()
+				waitingForUser = result.waitingForUser
+				if waitingForUser {
+					pauseSemantic()
+					pauseMaximum(now)
+				} else {
+					resetSemantic()
+					resumeMaximum(now)
+				}
+			}
+			if result.activity != "" {
+				now := time.Now()
+				if live.appClient != nil {
+					live.appClient.logDebug("codex app-server turn activity",
+						"runtime_id", strings.TrimSpace(live.spec.RuntimeID),
+						"thread_id", strings.TrimSpace(waiter.threadID),
+						"turn_id", waiter.currentTurnID(),
+						"activity", strings.TrimSpace(result.activity),
+						"elapsed", now.Sub(waitStartedAt),
+						"since_previous_activity", now.Sub(lastActivityAt),
+						"started", result.started,
+						"progress", result.progress,
+						"success", result.success,
+					)
+				}
+				lastActivityAt = now
+				if !waitingForUser {
+					resetSemantic()
+				}
+			}
+			if result.started && noProgressTimeout > 0 && noProgressTimer == nil {
+				noProgressTimer = time.NewTimer(noProgressTimeout)
+				noProgressC = noProgressTimer.C
+			}
+			if result.progress || result.assistantActivity {
+				stopNoProgress()
+			}
+			if result.userInputStateChanged {
+				stopNoProgress()
+			}
+			if result.err != nil {
+				return PromptResponse{}, result.err
+			}
+			if result.success {
+				stopReason := result.stopReason
+				if stopReason == "" {
+					stopReason = StopReasonEndTurn
+				}
+				return PromptResponse{StopReason: stopReason}, nil
+			}
+		case <-noProgressC:
+			if live.appClient != nil {
+				live.appClient.logDebug("codex app-server turn no progress timeout",
+					"runtime_id", strings.TrimSpace(live.spec.RuntimeID),
+					"thread_id", strings.TrimSpace(waiter.threadID),
+					"turn_id", waiter.currentTurnID(),
+					"timeout", noProgressTimeout,
+					"last_activity", waiter.currentLastActivity(),
+				)
+			}
+			return PromptResponse{}, m.failTimedOutAppServerTurn(live, waiter, "initial assistant activity", noProgressTimeout)
+		case <-semanticC:
+			if live.appClient != nil {
+				live.appClient.logDebug("codex app-server turn semantic inactivity timeout",
+					"runtime_id", strings.TrimSpace(live.spec.RuntimeID),
+					"thread_id", strings.TrimSpace(waiter.threadID),
+					"turn_id", waiter.currentTurnID(),
+					"timeout", semanticTimeout,
+					"last_activity", waiter.currentLastActivity(),
+				)
+			}
+			return PromptResponse{}, m.failTimedOutAppServerTurn(live, waiter, "app-server inactivity", semanticTimeout)
+		case <-maximumC:
+			return PromptResponse{}, m.failTimedOutAppServerTurn(live, waiter, "maximum turn duration", maximumDuration)
+		case <-ctx.Done():
+			return m.stopCanceledAppServerTurn(ctx, live, waiter, "prompt context canceled")
+		}
+	}
+}
+
+func (m *appServerManager) stopCanceledAppServerTurn(
+	ctx context.Context,
+	live *liveSession,
+	waiter *appServerTurnWaiter,
+	reason string,
+) (PromptResponse, error) {
+	if err := m.stopAppServerTurn(live, waiter, reason); err != nil {
+		return PromptResponse{}, fmt.Errorf("stop canceled Codex turn: %w", err)
+	}
+	return PromptResponse{StopReason: StopReasonInterrupted}, ctx.Err()
+}
+
+func (m *appServerManager) failTimedOutAppServerTurn(live *liveSession, waiter *appServerTurnWaiter, reason string, timeout time.Duration) error {
+	_ = m.stopAppServerTurn(live, waiter, reason)
+	return fmt.Errorf("Codex stopped responding after %s. The turn was canceled; try again", timeout)
+}
+
+func (m *appServerManager) stopAppServerTurn(live *liveSession, waiter *appServerTurnWaiter, reason string) error {
+	if m.deps.UserInput != nil {
+		m.deps.UserInput.CancelSession(live.spec.RuntimeID, waiter.threadID)
+	}
+	interruptErr := m.interruptAppServerTurn(live, waiter)
+	stderrTail := m.stderrTail(live.spec, 2048)
+	if live.appClient != nil {
+		live.appClient.logError("codex app-server turn stopped",
+			"runtime_id", strings.TrimSpace(live.spec.RuntimeID),
+			"thread_id", strings.TrimSpace(waiter.threadID),
+			"turn_id", waiter.currentTurnID(),
+			"reason", strings.TrimSpace(reason),
+			"last_activity", waiter.currentLastActivity(),
+			"interrupt_error", interruptErr,
+			"stderr_tail", stderrTail,
+		)
+	}
+	if interruptErr == nil {
+		return nil
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), appServerStopTimeout)
+	defer cancel()
+	stopErr := m.Stop(stopCtx, SessionHandle{RuntimeID: live.spec.RuntimeID})
+	if stopErr == nil || errors.Is(stopErr, os.ErrNotExist) {
+		return nil
+	}
+	if live.appClient != nil {
+		live.appClient.logError(
+			"stop codex app-server after turn interrupt failure",
+			"runtime_id", strings.TrimSpace(live.spec.RuntimeID),
+			"error", stopErr,
+		)
+	}
+	return fmt.Errorf("interrupt turn: %v; stop app-server: %w", interruptErr, stopErr)
+}
+
+func (m *appServerManager) interruptAppServerTurn(live *liveSession, waiter *appServerTurnWaiter) error {
+	if live == nil || live.appClient == nil {
+		return fmt.Errorf("codex app-server client is unavailable")
+	}
+	threadID := strings.TrimSpace(waiter.threadID)
+	turnID := waiter.currentTurnID()
+	if threadID == "" || turnID == "" {
+		return fmt.Errorf("codex app-server turn identity is incomplete")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), appServerTurnInterruptTimeout)
+	defer cancel()
+	if _, err := live.appClient.request(ctx, "turn/interrupt", map[string]any{
+		"threadId": threadID,
+		"turnId":   turnID,
+	}); err != nil {
+		return fmt.Errorf("interrupt codex app-server turn: %w", err)
+	}
+
+	for {
+		if _, ok := waiter.terminalResult(); ok {
+			return nil
+		}
+		select {
+		case result := <-waiter.ch:
+			if waiter.matchesTurn(result.turnID) && (result.err != nil || result.success) {
+				return nil
+			}
+		case <-live.done:
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("wait for interrupted codex app-server turn: %w", ctx.Err())
+		}
+	}
+}
+
+// interruptAppServerStructuredOutputTurn makes an emitted question a
+// runtime-enforced turn boundary. The request runs asynchronously because this
+// method is called while the app-server stdout reader is dispatching the
+// command-completion notification that revealed the control record.
+func (m *appServerManager) interruptAppServerStructuredOutputTurn(live *liveSession, threadID string) {
+	if live == nil || live.appClient == nil {
+		return
+	}
+	waiter := live.appServerTurnWaiter(threadID)
+	if waiter == nil || !waiter.markStructuredOutputBoundary() {
+		return
+	}
+	turnID := waiter.currentTurnID()
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" || turnID == "" {
+		live.appClient.logDebug("cannot interrupt structured-output turn with incomplete identity",
+			"thread_id", threadID,
+			"turn_id", turnID,
+		)
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), appServerTurnInterruptTimeout)
+		defer cancel()
+		if _, err := live.appClient.request(ctx, "turn/interrupt", map[string]any{
+			"threadId": threadID,
+			"turnId":   turnID,
+		}); err != nil {
+			live.appClient.logDebug("structured-output turn interrupt failed",
+				"thread_id", threadID,
+				"turn_id", turnID,
+				"error", err,
+			)
+		}
+	}()
+}
+
+func (m *appServerManager) readAppServerStdout(runtimeID string, live *liveSession, stdout io.Reader) {
+	decoder := json.NewDecoder(stdout)
+	for {
+		var msg appServerWireMessage
+		if err := decoder.Decode(&msg); err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if live.appClient != nil {
+				live.appClient.logDebug("codex app-server stdout decoder stopped", "runtime_id", runtimeID, "error", err)
+			}
+			return
+		}
+		if live.appClient != nil {
+			live.appClient.handleMessage(msg)
+		}
+	}
+}
+
+func (m *appServerManager) waitAppServerSession(runtimeID string, live *liveSession) {
+	err := live.cmd.Wait()
+	live.telemetry.close()
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	if live.appClient != nil {
+		live.appClient.closeAllPending(fmt.Errorf("codex app-server exited with code %d", exitCode))
+	}
+	isCurrent := m.detachSession(runtimeID, live)
+	if live.session != nil {
+		live.session.ProcessID = 0
+		if isCurrent && m.deps.OnExit != nil {
+			m.deps.OnExit(live.session, exitCode)
+		}
+	}
+	if isCurrent && m.deps.Permission != nil {
+		m.deps.Permission.CancelSession(runtimeID, "")
+	}
+	if isCurrent && m.deps.UserInput != nil {
+		m.deps.UserInput.CancelSession(runtimeID, "")
+	}
+	if live.stderr != nil {
+		_ = live.stderr.Close()
+	}
+	close(live.done)
+}
+
+func (m *appServerManager) detachSession(runtimeID string, live *liveSession) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[runtimeID] != live {
+		return false
+	}
+	delete(m.sessions, runtimeID)
+	return true
+}
+
+func (m *appServerManager) wrapStartupError(spec SessionSpec, action string, err error) error {
+	tail := m.stderrTail(spec, 4096)
+	if tail == "" {
+		return fmt.Errorf("%s: %w", action, err)
+	}
+	return fmt.Errorf("%s: %w; stderr tail: %s", action, err, tail)
+}
+
+func (m *appServerManager) stderrTail(spec SessionSpec, limit int) string {
+	if limit <= 0 || m.deps.ReadFile == nil {
+		return ""
+	}
+	data, err := m.deps.ReadFile(spec.StderrPath)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	if len(data) > limit {
+		data = data[len(data)-limit:]
+	}
+	return redactAppServerDiagnostic(bytes.TrimSpace(data), spec)
+}
+
+func redactAppServerDiagnostic(data []byte, spec SessionSpec) string {
+	text := string(data)
+	for _, secret := range []string{spec.Profile.APIKey, os.Getenv("OPENAI_API_KEY")} {
+		secret = strings.TrimSpace(secret)
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "[redacted]")
+		}
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "api_key") ||
+			strings.Contains(lower, "apikey") ||
+			strings.Contains(lower, "token") ||
+			strings.Contains(lower, "secret") ||
+			strings.Contains(lower, "password") {
+			lines[i] = redactSecretishLine(line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func redactSecretishLine(line string) string {
+	for _, sep := range []string{"=", ":"} {
+		if before, _, ok := strings.Cut(line, sep); ok {
+			return strings.TrimRight(before, " \t") + sep + " [redacted]"
+		}
+	}
+	return "[redacted]"
+}
+
+func appServerGenerateImageToolSpec() map[string]any {
+	return map[string]any{
+		"name":        "csgclaw_generate_image",
+		"description": "Generate one image from the user's requested description using this Agent's configured image generation model and deliver it to the current conversation. Use this tool whenever the user asks to create an image. Never switch the chat model or call providers with shell commands. If image_model_not_configured is returned, ask the user to configure the Image generation model in the Agent profile; do not retry automatically.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"prompt": map[string]any{"type": "string", "description": "Faithfully express the user's image request. Resolve references using established conversation context, but do not invent subjects, styles, text exclusions, or other constraints. Expand creatively only when explicitly requested. Preserve a supplied verbatim prompt unchanged."}}, "required": []string{"prompt"}, "additionalProperties": false},
+	}
+}
+
+func appServerGenerateVideoToolSpec() map[string]any {
+	return map[string]any{"name": "csgclaw_generate_video", "description": "Generate one video using this Agent's configured video model and deliver it to the conversation. Omit size or seconds unless the user explicitly supplied them; CSGClaw applies the selected model's advertised defaults and validates explicit values.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"prompt": map[string]any{"type": "string"}, "size": map[string]any{"type": "string", "description": "Optional provider-advertised size value. Do not convert it to width x height or guess a value."}, "seconds": map[string]any{"type": "integer", "minimum": 1, "description": "Optional requested duration. Omit when the user did not specify one."}}, "required": []string{"prompt"}, "additionalProperties": false}}
+}
+
+// Explicit per-thread values override settings retained by cold-resumed threads.
+func appServerThreadConfig(profile agentruntime.Profile) map[string]any {
+	values := appServerReasoningConfig(profile.ReasoningEffort)
+	if values == nil {
+		values = make(map[string]any)
+	}
+	values["model_context_window"] = profile.ModelMetadata.Normalized().ContextWindow
+	values["model_auto_compact_token_limit"] = profile.ModelMetadata.CompactThreshold()
+	return values
+}

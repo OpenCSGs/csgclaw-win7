@@ -1,0 +1,1850 @@
+package llm
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	agent "csgclaw/internal/agentengine/agents"
+	"csgclaw/internal/auth"
+	"csgclaw/internal/cliproxy"
+	"csgclaw/internal/codexmodel"
+	"csgclaw/internal/config"
+	"csgclaw/internal/modelcap"
+	"csgclaw/internal/modelprovider"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+type Service struct {
+	defaults                      config.ModelConfig
+	agents                        AgentProfileReader
+	client                        *http.Client
+	openCSGCredentialRefreshMu    sync.Mutex
+	responsesCapabilityMu         sync.Mutex
+	responsesUnsupported          map[string]struct{}
+	responsesReasoningUnsupported map[string]struct{}
+}
+
+type HTTPError struct {
+	Status   int
+	Message  string
+	Code     string
+	Provider string
+}
+
+type UpstreamResponse struct {
+	StatusCode int
+	Header     http.Header
+	Body       io.ReadCloser
+}
+
+var embeddedCLIProxyProviderBaseURL = func(ctx context.Context, provider string) (string, error) {
+	return cliproxy.Default().ProviderBaseURL(ctx, provider)
+}
+
+var embeddedCLIProxyBaseURL = func(ctx context.Context) (string, error) {
+	return cliproxy.Default().BaseURL(ctx)
+}
+
+var embeddedCLIProxyAuthStatus = func(ctx context.Context, provider string) (cliproxy.AuthStatus, error) {
+	return cliproxy.Default().AuthStatus(ctx, provider)
+}
+
+var responsesWebsocketUpgrader = websocket.Upgrader{
+	CheckOrigin: func(*http.Request) bool { return true },
+}
+
+var responsesWebsocketDialer = websocket.Dialer{
+	Proxy: http.ProxyFromEnvironment,
+}
+
+func (e *HTTPError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+// AgentProfileReader is the model proxy's only Agent dependency.
+type AgentProfileReader interface {
+	ResolvedAgentProfile(string) (agent.AgentProfile, error)
+}
+
+func NewService(defaults config.ModelConfig, agents AgentProfileReader) *Service {
+	return &Service{
+		defaults:                      defaults.Resolved(),
+		agents:                        agents,
+		client:                        &http.Client{},
+		responsesUnsupported:          make(map[string]struct{}),
+		responsesReasoningUnsupported: make(map[string]struct{}),
+	}
+}
+
+func (s *Service) Models(_ context.Context, botID string) ([]byte, int, string, error) {
+	profile, err := s.resolveProfile(botID)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	modelID := strings.TrimSpace(profile.ModelID)
+	payload := map[string]any{
+		"object": "list",
+		"data": []map[string]any{
+			{
+				"id":       modelID,
+				"object":   "model",
+				"created":  0,
+				"owned_by": "csgclaw",
+			},
+		},
+		"models": []map[string]any{bridgeModelMetadata(profile)},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, 0, "", &HTTPError{Status: http.StatusInternalServerError, Message: fmt.Sprintf("encode models response: %v", err)}
+	}
+	return body, http.StatusOK, "application/json", nil
+}
+
+func bridgeModelMetadata(profile agent.AgentProfile) map[string]any {
+	caps := modelcap.ForProviderModel(profile.Provider, profile.ModelID)
+	if len(profile.InputModalities) > 0 {
+		caps.InputModalities = append([]string(nil), profile.InputModalities...)
+	}
+	if caps.UseCodexMetadata {
+		return codexmodel.Metadata(codexmodel.Profile{
+			Metadata:        profile.ModelMetadata,
+			Provider:        profile.Provider,
+			ModelID:         profile.ModelID,
+			ReasoningEffort: profile.ReasoningEffort,
+		})
+	}
+	modelID := strings.TrimSpace(profile.ModelID)
+	if modelID == "" {
+		modelID = "unknown"
+	}
+	return map[string]any{
+		"slug":                         modelID,
+		"display_name":                 modelID,
+		"description":                  "CSGClaw OpenAI-compatible provider model",
+		"default_reasoning_level":      "none",
+		"supported_reasoning_levels":   []map[string]any{},
+		"shell_type":                   "default",
+		"visibility":                   "list",
+		"supported_in_api":             true,
+		"priority":                     1,
+		"availability_nux":             nil,
+		"upgrade":                      nil,
+		"supports_search_tool":         false,
+		"supports_reasoning_summaries": false,
+		"default_reasoning_summary":    nil,
+		"support_verbosity":            false,
+		"default_verbosity":            nil,
+		"apply_patch_tool_type":        nil,
+		"web_search_tool_type":         nil,
+		"truncation_policy": map[string]any{
+			"mode":  "bytes",
+			"limit": 10000,
+		},
+		"supports_parallel_tool_calls":   false,
+		"supports_image_detail_original": false,
+		"experimental_supported_tools":   []any{},
+		"input_modalities":               append([]string(nil), caps.InputModalities...),
+	}
+}
+
+func (s *Service) ChatCompletions(ctx context.Context, botID string, body []byte) ([]byte, int, string, error) {
+	resp, err := s.ChatCompletionsStream(ctx, botID, body)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	if err != nil {
+		return nil, 0, "", &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("read upstream response: %v", err)}
+	}
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	return respBody, resp.StatusCode, contentType, nil
+}
+
+// ChatCompletionsStream returns the upstream response body without buffering it.
+// Callers that proxy streaming chat completions must copy and flush this body as
+// chunks arrive; callers that need a buffered result should use ChatCompletions.
+func (s *Service) ChatCompletionsStream(ctx context.Context, botID string, body []byte) (*UpstreamResponse, error) {
+	profile, err := s.resolveProfile(botID)
+	if err != nil {
+		return nil, err
+	}
+	return s.forwardRemoteChat(ctx, profile, body)
+}
+
+func (s *Service) Responses(ctx context.Context, botID string, body []byte) (*UpstreamResponse, error) {
+	profile, err := s.resolveProfile(botID)
+	if err != nil {
+		return nil, err
+	}
+	return s.forwardRemoteResponses(ctx, profile, body)
+}
+
+func (s *Service) ResponsesWebsocket(w http.ResponseWriter, r *http.Request, botID string) error {
+	if w == nil || r == nil {
+		return &HTTPError{Status: http.StatusBadRequest, Message: "websocket request is required"}
+	}
+	if !websocket.IsWebSocketUpgrade(r) {
+		return &HTTPError{Status: http.StatusBadRequest, Message: "responses websocket upgrade is required"}
+	}
+	profile, err := s.resolveProfile(botID)
+	if err != nil {
+		return err
+	}
+	baseURL, apiKey, err := s.agentProfileWebsocketTarget(r.Context(), profile)
+	if err != nil {
+		return err
+	}
+	if baseURL == "" {
+		return &HTTPError{Status: http.StatusBadRequest, Message: "profile base_url is required"}
+	}
+	upstreamURL, err := responsesWebsocketURL(baseURL)
+	if err != nil {
+		return &HTTPError{Status: http.StatusBadRequest, Message: err.Error()}
+	}
+	downstream, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return &HTTPError{Status: http.StatusBadRequest, Message: fmt.Sprintf("upgrade responses websocket: %v", err)}
+	}
+	defer downstream.Close()
+
+	upstream, _, err := responsesWebsocketDialer.DialContext(r.Context(), upstreamURL, websocketUpstreamHeaders(r.Header, apiKey, profile.Headers))
+	if err != nil {
+		writeResponsesWebsocketClose(downstream, websocket.CloseTryAgainLater, fmt.Sprintf("dial upstream responses websocket: %v", err))
+		return nil
+	}
+	defer upstream.Close()
+
+	return proxyResponsesWebsocket(r.Context(), downstream, upstream, responsesWebsocketClientPayloadRewriter(profile))
+}
+
+func (s *Service) resolveProfile(botID string) (agent.AgentProfile, error) {
+	if s.agents == nil {
+		return agent.AgentProfile{}, &HTTPError{Status: http.StatusServiceUnavailable, Message: "agent service is not configured"}
+	}
+	profile, err := s.agents.ResolvedAgentProfile(botID)
+	if err != nil {
+		status := http.StatusNotFound
+		if strings.Contains(err.Error(), "profile is incomplete") {
+			status = http.StatusConflict
+		}
+		return agent.AgentProfile{}, &HTTPError{Status: status, Message: err.Error()}
+	}
+	return profile, nil
+}
+
+func (s *Service) forwardRemoteChat(ctx context.Context, profile agent.AgentProfile, body []byte) (*UpstreamResponse, error) {
+	return s.forwardRemoteChatWithAuthRefresh(ctx, profile, body, true)
+}
+
+func (s *Service) forwardRemoteChatWithAuthRefresh(ctx context.Context, profile agent.AgentProfile, body []byte, allowAuthRefresh bool) (*UpstreamResponse, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, &HTTPError{Status: http.StatusBadRequest, Message: fmt.Sprintf("decode request: %v", err)}
+	}
+	mergeProfilePayload(payload, profile)
+	normalizeCompletionTokenLimits(payload)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadRequest, Message: fmt.Sprintf("encode request: %v", err)}
+	}
+
+	baseURL, apiKey, err := s.agentProfileTarget(ctx, profile)
+	if err != nil {
+		return nil, err
+	}
+	if baseURL == "" {
+		return nil, &HTTPError{Status: http.StatusBadRequest, Message: "profile base_url is required"}
+	}
+	upstreamURL := strings.TrimRight(baseURL, "/") + "/chat/completions"
+	req, err := newProfileJSONRequest(ctx, upstreamURL, encoded, apiKey, profile.Headers)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusInternalServerError, Message: fmt.Sprintf("build upstream request: %v", err)}
+	}
+
+	resp, err := s.modelRequest(req)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("send upstream request: %v", err)}
+	}
+	if allowAuthRefresh && resp.StatusCode == http.StatusUnauthorized && profile.Provider == agent.ProviderCSGHub {
+		if _, _, refreshed := s.refreshOpenCSGAIGatewayCredentials(ctx, apiKey); refreshed {
+			_ = resp.Body.Close()
+			return s.forwardRemoteChatWithAuthRefresh(ctx, profile, body, false)
+		}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return compactUpstreamErrorStream(resp, OpenCSGBillingURL(profile))
+	}
+	header := resp.Header.Clone()
+	header.Del("Content-Length")
+	if strings.TrimSpace(header.Get("Content-Type")) == "" {
+		if payloadBool(payload["stream"]) {
+			header.Set("Content-Type", "text/event-stream")
+		} else {
+			header.Set("Content-Type", "application/json")
+		}
+	}
+	return &UpstreamResponse{
+		StatusCode: resp.StatusCode,
+		Header:     header,
+		Body:       resp.Body,
+	}, nil
+}
+
+func (s *Service) forwardRemoteResponses(ctx context.Context, profile agent.AgentProfile, body []byte) (*UpstreamResponse, error) {
+	return s.forwardRemoteResponsesWithAuthRefresh(ctx, profile, body, true)
+}
+
+func (s *Service) forwardRemoteResponsesWithAuthRefresh(ctx context.Context, profile agent.AgentProfile, body []byte, allowAuthRefresh bool) (*UpstreamResponse, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, &HTTPError{Status: http.StatusBadRequest, Message: fmt.Sprintf("decode request: %v", err)}
+	}
+	mergeResponsesPayload(payload, profile)
+
+	baseURL, apiKey, err := s.agentProfileTarget(ctx, profile)
+	if err != nil {
+		return nil, err
+	}
+	if baseURL == "" {
+		return nil, &HTTPError{Status: http.StatusBadRequest, Message: "profile base_url is required"}
+	}
+	if s.responsesReasoningInputUnsupportedCached(profile, baseURL) {
+		logResponsesReasoningInputRemoved(profile, stripResponsesInputReasoning(payload), "cached_unsupported")
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadRequest, Message: fmt.Sprintf("encode request: %v", err)}
+	}
+	if profile.Provider != agent.ProviderCodex && s.responsesAPIUnsupportedCached(profile, baseURL) {
+		return s.forwardResponsesViaChat(ctx, profile, payload, baseURL, apiKey, allowAuthRefresh)
+	}
+	upstreamURL := strings.TrimRight(baseURL, "/") + "/responses"
+	sendResponses := func(encoded []byte) (*http.Response, error) {
+		req, err := newProfileJSONRequest(ctx, upstreamURL, encoded, apiKey, profile.Headers)
+		if err != nil {
+			return nil, &HTTPError{Status: http.StatusInternalServerError, Message: fmt.Sprintf("build upstream request: %v", err)}
+		}
+		resp, err := s.modelRequest(req)
+		if err != nil {
+			return nil, &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("send upstream request: %v", err)}
+		}
+		return resp, nil
+	}
+	resp, err := sendResponses(encoded)
+	if err != nil {
+		return nil, err
+	}
+	if allowAuthRefresh && resp.StatusCode == http.StatusUnauthorized && profile.Provider == agent.ProviderCSGHub {
+		if _, _, refreshed := s.refreshOpenCSGAIGatewayCredentials(ctx, apiKey); refreshed {
+			_ = resp.Body.Close()
+			return s.forwardRemoteResponsesWithAuthRefresh(ctx, profile, body, false)
+		}
+	}
+	return s.handleRemoteResponsesResult(ctx, profile, payload, baseURL, apiKey, resp, true, sendResponses)
+}
+
+type responsesRequestSender func([]byte) (*http.Response, error)
+
+func (s *Service) handleRemoteResponsesResult(ctx context.Context, profile agent.AgentProfile, payload map[string]any, baseURL, apiKey string, resp *http.Response, allowReasoningRetry bool, sendResponses responsesRequestSender) (*UpstreamResponse, error) {
+	if profile.Provider != agent.ProviderCodex && responsesAPIUnsupportedStatus(resp.StatusCode) {
+		_ = resp.Body.Close()
+		s.markResponsesAPIUnsupported(profile, baseURL)
+		return s.forwardResponsesViaChat(ctx, profile, payload, baseURL, apiKey, true)
+	}
+	if responsesAPITransientFallbackStatus(profile, resp.StatusCode) && !responsesPayloadHasToolSemantics(payload) {
+		_ = resp.Body.Close()
+		return s.forwardResponsesViaChat(ctx, profile, payload, baseURL, apiKey, true)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, err := readAndCloseUpstreamBody(resp)
+		if err != nil {
+			return nil, &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("read upstream error response: %v", err)}
+		}
+		if allowReasoningRetry && responsesReasoningInputUnsupportedError(resp.StatusCode, body) {
+			removed := stripResponsesInputReasoning(payload)
+			if removed > 0 {
+				s.markResponsesReasoningInputUnsupported(profile, baseURL)
+				logResponsesReasoningInputRemoved(profile, removed, "retry_after_unsupported")
+				encoded, err := json.Marshal(payload)
+				if err != nil {
+					return nil, &HTTPError{Status: http.StatusBadRequest, Message: fmt.Sprintf("encode request: %v", err)}
+				}
+				retryResp, err := sendResponses(encoded)
+				if err != nil {
+					return nil, err
+				}
+				return s.handleRemoteResponsesResult(ctx, profile, payload, baseURL, apiKey, retryResp, false, sendResponses)
+			}
+		}
+		return compactUpstreamErrorStreamFromBody(resp, body, OpenCSGBillingURL(profile))
+	}
+	return &UpstreamResponse{
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header.Clone(),
+		Body:       sanitizeResponsesEventStream(resp.Body, resp.Header.Get("Content-Type")),
+	}, nil
+}
+
+func sanitizeResponsesEventStream(body io.ReadCloser, contentType string) io.ReadCloser {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if mediaType != "text/event-stream" {
+		return body
+	}
+	reader, writer := io.Pipe()
+	go func() {
+		defer body.Close()
+		err := rewriteResponsesEventStream(writer, body)
+		_ = writer.CloseWithError(err)
+	}()
+	return reader
+}
+
+const maxResponsesSSEEventBytes = 8 * 1024 * 1024
+
+func rewriteResponsesEventStream(w io.Writer, r io.Reader) error {
+	reader := bufio.NewReader(r)
+	block := make([]string, 0, 4)
+	blockBytes := 0
+	flush := func() error {
+		if len(block) == 0 {
+			return nil
+		}
+		eventType := ""
+		dataLines := make([]string, 0, len(block))
+		for _, line := range block {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "event:") {
+				eventType = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+			}
+			if strings.HasPrefix(trimmed, "data:") {
+				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(trimmed, "data:")))
+			}
+		}
+		data := strings.Join(dataLines, "\n")
+		if data != "" {
+			var payload map[string]any
+			if json.Unmarshal([]byte(data), &payload) == nil {
+				if payloadType := strings.TrimSpace(stringValue(payload["type"])); payloadType != "" {
+					eventType = payloadType
+				}
+			}
+		}
+		if eventType == "response.failed" || eventType == "error" {
+			code := modelprovider.UpstreamErrorCode([]byte(data))
+			if code == "" {
+				code = "upstream_unavailable"
+			}
+			message := modelprovider.FriendlyUpstreamErrorMessage(modelprovider.UpstreamStatusForErrorCode(code), code)
+			return writeSSE(w, "error", map[string]any{"type": "error", "code": code, "message": message, "param": nil})
+		}
+		for _, line := range block {
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				return err
+			}
+		}
+		_, err := fmt.Fprintln(w)
+		return err
+	}
+	for {
+		rawLine, readErr := readResponsesSSELine(reader, maxResponsesSSEEventBytes)
+		line := rawLine
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if rawLine != "" {
+			if strings.TrimSpace(line) == "" {
+				if err := flush(); err != nil {
+					return err
+				}
+				block = block[:0]
+				blockBytes = 0
+			} else {
+				blockBytes += len(rawLine)
+				if blockBytes > maxResponsesSSEEventBytes {
+					return fmt.Errorf("responses SSE event exceeds %d bytes", maxResponsesSSEEventBytes)
+				}
+				block = append(block, line)
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return readErr
+			}
+			break
+		}
+	}
+	return flush()
+}
+
+func readResponsesSSELine(reader *bufio.Reader, maxBytes int) (string, error) {
+	if maxBytes <= 0 {
+		return "", fmt.Errorf("responses SSE line limit must be positive")
+	}
+	var line strings.Builder
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if line.Len()+len(fragment) > maxBytes {
+			return "", fmt.Errorf("responses SSE line exceeds %d bytes", maxBytes)
+		}
+		_, _ = line.Write(fragment)
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return line.String(), err
+		}
+	}
+}
+
+func (s *Service) forwardResponsesViaChat(ctx context.Context, profile agent.AgentProfile, responsesPayload map[string]any, baseURL, apiKey string, allowAuthRefresh bool) (*UpstreamResponse, error) {
+	chatPayload, err := responsesPayloadToChatPayload(responsesPayload)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadRequest, Message: err.Error()}
+	}
+	mergeProfilePayload(chatPayload, profile)
+	normalizeCompletionTokenLimits(chatPayload)
+	encoded, err := json.Marshal(chatPayload)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadRequest, Message: fmt.Sprintf("encode chat fallback request: %v", err)}
+	}
+
+	upstreamURL := strings.TrimRight(baseURL, "/") + "/chat/completions"
+	req, err := newProfileJSONRequest(ctx, upstreamURL, encoded, apiKey, profile.Headers)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusInternalServerError, Message: fmt.Sprintf("build chat fallback request: %v", err)}
+	}
+	resp, err := s.modelRequest(req)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("send chat fallback request: %v", err)}
+	}
+	if allowAuthRefresh && resp.StatusCode == http.StatusUnauthorized && profile.Provider == agent.ProviderCSGHub {
+		if refreshedBaseURL, refreshedAPIKey, refreshed := s.refreshOpenCSGAIGatewayCredentials(ctx, apiKey); refreshed {
+			_ = resp.Body.Close()
+			return s.forwardResponsesViaChat(ctx, profile, responsesPayload, refreshedBaseURL, refreshedAPIKey, false)
+		}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return compactUpstreamErrorStream(resp, OpenCSGBillingURL(profile))
+	}
+	if payloadBool(chatPayload["stream"]) {
+		return streamChatCompletionAsResponse(resp, strings.TrimSpace(profile.ModelID)), nil
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("read chat fallback response: %v", err)}
+	}
+	converted, err := chatCompletionResponseToResponses(respBody, strings.TrimSpace(profile.ModelID))
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("convert chat fallback response: %v", err)}
+	}
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	return &UpstreamResponse{
+		StatusCode: http.StatusOK,
+		Header:     header,
+		Body:       io.NopCloser(bytes.NewReader(converted)),
+	}, nil
+}
+
+func newProfileJSONRequest(ctx context.Context, url string, body []byte, apiKey string, headers map[string]string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		if key == "" || strings.EqualFold(key, "authorization") || strings.EqualFold(key, "content-type") {
+			continue
+		}
+		req.Header.Set(key, value)
+	}
+	return req, nil
+}
+
+func compactUpstreamErrorStream(resp *http.Response, billingURL string) (*UpstreamResponse, error) {
+	if resp == nil {
+		return nil, &HTTPError{Status: http.StatusBadGateway, Message: "upstream response is nil"}
+	}
+	body, err := readAndCloseUpstreamBody(resp)
+	if err != nil {
+		return nil, &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("read upstream error response: %v", err)}
+	}
+	return compactUpstreamErrorStreamFromBody(resp, body, billingURL)
+}
+
+func readAndCloseUpstreamBody(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	return io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+}
+
+func compactUpstreamErrorStreamFromBody(resp *http.Response, body []byte, billingURL string) (*UpstreamResponse, error) {
+	rawBody := append([]byte(nil), body...)
+	body, contentType := compactUpstreamErrorResponse(resp.StatusCode, body, billingURL)
+	code := modelprovider.UpstreamErrorCodeForResponse(resp.StatusCode, rawBody)
+	slog.Error("model upstream request failed",
+		"status", resp.StatusCode,
+		"code", code,
+		"upstream_request_id", upstreamRequestID(resp.Header),
+		"response_body", upstreamErrorBodyForLog(rawBody),
+	)
+	header := resp.Header.Clone()
+	header.Del("Content-Length")
+	header.Del("Content-Encoding")
+	header.Del("Transfer-Encoding")
+	header.Del("Trailer")
+	header.Set("Content-Type", contentType)
+	return &UpstreamResponse{
+		StatusCode: resp.StatusCode,
+		Header:     header,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}, nil
+}
+
+const maxUpstreamErrorLogBytes = 4096
+
+var (
+	upstreamLogBearerPattern = regexp.MustCompile(`(?i)(bearer\s+)[^\s"']+`)
+	upstreamLogSecretPattern = regexp.MustCompile(`(?i)((?:"?(?:api[_-]?key|token|secret|password|authorization|cookie)"?\s*[=:]\s*))(?:"[^"]*"|'[^']*'|[^\s,;}]+)`)
+)
+
+func upstreamRequestID(header http.Header) string {
+	for _, key := range []string{"X-Request-ID", "X-Correlation-ID", "Request-ID"} {
+		if value := strings.TrimSpace(header.Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func upstreamErrorBodyForLog(body []byte) string {
+	truncated := len(body) > maxUpstreamErrorLogBytes
+	if truncated {
+		body = body[:maxUpstreamErrorLogBytes]
+	}
+	value := strings.ToValidUTF8(string(body), "?")
+	var payload any
+	if !truncated && json.Unmarshal(body, &payload) == nil {
+		if encoded, err := json.Marshal(redactUpstreamLogValue(payload)); err == nil {
+			value = string(encoded)
+		}
+	}
+	value = redactUpstreamLogText(value)
+	value = strings.Join(strings.Fields(value), " ")
+	if truncated {
+		value += " ... [truncated]"
+	}
+	return value
+}
+
+func redactUpstreamLogValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			if isUpstreamLogSecretKey(key) {
+				out[key] = "[redacted]"
+			} else {
+				out[key] = redactUpstreamLogValue(item)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for index, item := range typed {
+			out[index] = redactUpstreamLogValue(item)
+		}
+		return out
+	case string:
+		return redactUpstreamLogText(typed)
+	default:
+		return value
+	}
+}
+
+func redactUpstreamLogText(value string) string {
+	value = upstreamLogBearerPattern.ReplaceAllString(value, "${1}[redacted]")
+	return upstreamLogSecretPattern.ReplaceAllString(value, "${1}[redacted]")
+}
+
+func isUpstreamLogSecretKey(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	for _, fragment := range []string{"api_key", "apikey", "authorization", "cookie", "password", "secret", "token"} {
+		if strings.Contains(normalized, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func compactUpstreamErrorResponse(status int, body []byte, billingURL string) ([]byte, string) {
+	code := modelprovider.UpstreamErrorCodeForResponse(status, body)
+	message := modelprovider.FriendlyUpstreamErrorMessage(status, code)
+	errorPayload := map[string]string{
+		"code":    code,
+		"type":    code,
+		"message": message,
+	}
+	normalizedCode := strings.ToLower(strings.TrimSpace(code))
+	if (normalizedCode == "insufficient_balance" || normalizedCode == "act-err-0") && strings.TrimSpace(billingURL) != "" {
+		billingURL = strings.TrimSpace(billingURL)
+		errorPayload["billing_url"] = billingURL
+		errorPayload["message"] = fmt.Sprintf("%s\n\n👉 [Recharge your account](%s) to continue.", message, billingURL)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"error": errorPayload,
+	})
+	if err != nil {
+		return []byte(message), "text/plain; charset=utf-8"
+	}
+	return payload, "application/json; charset=utf-8"
+}
+
+// OpenCSGBillingURL returns the billing page for an OpenCSG-backed profile and
+// the site used by the authenticated desktop session.
+func OpenCSGBillingURL(profile agent.AgentProfile) string {
+	provider := strings.ToLower(strings.TrimSpace(profile.Provider))
+	modelProviderID := agent.NormalizeModelProviderID(profile.ModelProviderID)
+	if modelProviderID != agent.ModelProviderIDOpenCSG &&
+		(modelProviderID != "" || (provider != agent.ProviderCSGHub && provider != agent.ProviderOpenCSG)) {
+		return ""
+	}
+	store, err := auth.DefaultStore()
+	if err != nil {
+		return ""
+	}
+	status, err := store.Status()
+	if err != nil || !status.Authenticated {
+		return ""
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(status.OpenCSGBaseURL), "/")
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return ""
+	}
+	return baseURL + "/settings/billing"
+}
+
+func responsesAPIUnsupportedStatus(status int) bool {
+	return status == http.StatusNotFound || status == http.StatusMethodNotAllowed
+}
+
+func responsesAPITransientFallbackStatus(profile agent.AgentProfile, status int) bool {
+	if status < http.StatusInternalServerError || status > 599 {
+		return false
+	}
+	switch strings.TrimSpace(profile.Provider) {
+	case agent.ProviderClaudeCode:
+		return true
+	default:
+		return false
+	}
+}
+
+func responsesReasoningInputUnsupportedError(status int, body []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "input.reasoning") &&
+		(strings.Contains(text, "unsupported_feature") || strings.Contains(text, "unsupported feature") || strings.Contains(text, "unsupported"))
+}
+
+func (s *Service) responsesAPIUnsupportedCached(profile agent.AgentProfile, baseURL string) bool {
+	key := responsesCapabilityKey(profile, baseURL)
+	s.responsesCapabilityMu.Lock()
+	defer s.responsesCapabilityMu.Unlock()
+	_, ok := s.responsesUnsupported[key]
+	return ok
+}
+
+func (s *Service) markResponsesAPIUnsupported(profile agent.AgentProfile, baseURL string) {
+	key := responsesCapabilityKey(profile, baseURL)
+	s.responsesCapabilityMu.Lock()
+	defer s.responsesCapabilityMu.Unlock()
+	if s.responsesUnsupported == nil {
+		s.responsesUnsupported = make(map[string]struct{})
+	}
+	s.responsesUnsupported[key] = struct{}{}
+}
+
+func (s *Service) responsesReasoningInputUnsupportedCached(profile agent.AgentProfile, baseURL string) bool {
+	key := responsesCapabilityKey(profile, baseURL)
+	s.responsesCapabilityMu.Lock()
+	defer s.responsesCapabilityMu.Unlock()
+	_, ok := s.responsesReasoningUnsupported[key]
+	return ok
+}
+
+func (s *Service) markResponsesReasoningInputUnsupported(profile agent.AgentProfile, baseURL string) {
+	key := responsesCapabilityKey(profile, baseURL)
+	s.responsesCapabilityMu.Lock()
+	defer s.responsesCapabilityMu.Unlock()
+	if s.responsesReasoningUnsupported == nil {
+		s.responsesReasoningUnsupported = make(map[string]struct{})
+	}
+	s.responsesReasoningUnsupported[key] = struct{}{}
+}
+
+func responsesCapabilityKey(profile agent.AgentProfile, baseURL string) string {
+	return strings.TrimSpace(profile.Provider) + "\x00" + strings.TrimRight(strings.TrimSpace(baseURL), "/") + "\x00" + strings.TrimSpace(profile.ModelID)
+}
+
+func responsesPayloadToChatPayload(payload map[string]any) (map[string]any, error) {
+	if responsesPayloadHasToolSemantics(payload) {
+		return nil, fmt.Errorf("this request contains Responses tool definitions or tool-use history that cannot be preserved by text-only Chat Completions; select a provider/model with native Responses tool support")
+	}
+
+	messages := make([]map[string]any, 0, 4)
+	if instructions := strings.TrimSpace(stringValue(payload["instructions"])); instructions != "" {
+		messages = append(messages, map[string]any{"role": "system", "content": instructions})
+	}
+	switch input := payload["input"].(type) {
+	case string:
+		if strings.TrimSpace(input) != "" {
+			messages = append(messages, map[string]any{"role": "user", "content": input})
+		}
+	case []any:
+		for _, item := range input {
+			message, ok := responseInputItemToChatMessage(item)
+			if ok {
+				messages = append(messages, message)
+			}
+		}
+	case nil:
+	default:
+		text := strings.TrimSpace(stringValue(input))
+		if text != "" {
+			messages = append(messages, map[string]any{"role": "user", "content": text})
+		}
+	}
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("responses input is required for chat fallback")
+	}
+
+	chatPayload := map[string]any{"messages": messages}
+	copyResponsesOptionToChat(payload, chatPayload, "stream", "stream")
+	copyResponsesOptionToChat(payload, chatPayload, "temperature", "temperature")
+	copyResponsesOptionToChat(payload, chatPayload, "top_p", "top_p")
+	copyResponsesOptionToChat(payload, chatPayload, "presence_penalty", "presence_penalty")
+	copyResponsesOptionToChat(payload, chatPayload, "frequency_penalty", "frequency_penalty")
+	copyResponsesOptionToChat(payload, chatPayload, "stop", "stop")
+	copyResponsesOptionToChat(payload, chatPayload, "seed", "seed")
+	copyResponsesOptionToChat(payload, chatPayload, "response_format", "response_format")
+	copyResponsesOptionToChat(payload, chatPayload, "user", "user")
+	copyResponsesOptionToChat(payload, chatPayload, "max_output_tokens", "max_tokens")
+	return chatPayload, nil
+}
+
+func responsesPayloadHasToolSemantics(payload map[string]any) bool {
+	// Advertising tools changes what the model may do even before the first
+	// invocation. A text-only fallback must not silently discard this contract.
+	if payloadValuePresent(payload["tools"]) {
+		return true
+	}
+	if toolChoiceRequestsTools(payload["tool_choice"]) {
+		return true
+	}
+	return responseValueHasToolSemantics(payload["input"])
+}
+
+func toolChoiceRequestsTools(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case string:
+		text := strings.ToLower(strings.TrimSpace(v))
+		return text != "" && text != "none" && text != "auto"
+	case map[string]any:
+		if len(v) == 0 {
+			return false
+		}
+		if len(v) == 1 && strings.EqualFold(strings.TrimSpace(stringValue(v["type"])), "none") {
+			return false
+		}
+		return true
+	default:
+		return payloadValuePresent(v)
+	}
+}
+
+func responseValueHasToolSemantics(value any) bool {
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			if responseValueHasToolSemantics(item) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, item := range v {
+			if responseValueHasToolSemantics(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		itemType := strings.ToLower(strings.TrimSpace(stringValue(v["type"])))
+		switch {
+		case strings.Contains(itemType, "tool"),
+			itemType == "namespace",
+			itemType == "function_call",
+			itemType == "function_call_output",
+			strings.HasSuffix(itemType, "_call"),
+			strings.HasSuffix(itemType, "_call_output"):
+			return true
+		}
+		if strings.EqualFold(strings.TrimSpace(stringValue(v["role"])), "tool") {
+			return true
+		}
+		for _, key := range []string{"tool_calls", "function_call", "tool_call_id"} {
+			if payloadValuePresent(v[key]) {
+				return true
+			}
+		}
+		if payloadValuePresent(v["call_id"]) && payloadValuePresent(v["output"]) {
+			return true
+		}
+		for _, item := range v {
+			if responseValueHasToolSemantics(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func payloadValuePresent(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(v) != ""
+	case bool:
+		return v
+	case []any:
+		return len(v) > 0
+	case []map[string]any:
+		return len(v) > 0
+	case map[string]any:
+		return len(v) > 0
+	default:
+		return true
+	}
+}
+
+func responseInputItemToChatMessage(item any) (map[string]any, bool) {
+	switch value := item.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return nil, false
+		}
+		return map[string]any{"role": "user", "content": value}, true
+	case map[string]any:
+		role := normalizeChatFallbackRole(stringValue(value["role"]))
+		if role == "" {
+			role = "user"
+		}
+		content := responseContentToText(value["content"])
+		if strings.TrimSpace(content) == "" {
+			content = responseContentToText(value["text"])
+		}
+		if strings.TrimSpace(content) == "" {
+			return nil, false
+		}
+		return map[string]any{"role": role, "content": content}, true
+	default:
+		text := responseContentToText(value)
+		if strings.TrimSpace(text) == "" {
+			return nil, false
+		}
+		return map[string]any{"role": "user", "content": text}, true
+	}
+}
+
+func normalizeChatFallbackRole(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "developer", "latest_reminder", "system":
+		return "system"
+	case "user", "assistant", "tool":
+		return strings.ToLower(strings.TrimSpace(role))
+	default:
+		return "user"
+	}
+}
+
+func responseContentToText(content any) string {
+	switch value := content.(type) {
+	case string:
+		return value
+	case []any:
+		var b strings.Builder
+		for _, part := range value {
+			text := responseContentToText(part)
+			if text != "" {
+				b.WriteString(text)
+			}
+		}
+		return b.String()
+	case map[string]any:
+		if text := stringValue(value["text"]); text != "" {
+			return text
+		}
+		if text := stringValue(value["content"]); text != "" {
+			return text
+		}
+		return ""
+	default:
+		return stringValue(value)
+	}
+}
+
+func copyResponsesOptionToChat(src, dst map[string]any, srcKey, dstKey string) {
+	value, ok := src[srcKey]
+	if !ok || value == nil {
+		return
+	}
+	if _, exists := dst[dstKey]; exists {
+		return
+	}
+	dst[dstKey] = value
+}
+
+func chatCompletionResponseToResponses(body []byte, fallbackModel string) ([]byte, error) {
+	var chat struct {
+		ID      string         `json:"id"`
+		Created int64          `json:"created"`
+		Model   string         `json:"model"`
+		Choices []chatChoice   `json:"choices"`
+		Usage   map[string]any `json:"usage,omitempty"`
+	}
+	if err := json.Unmarshal(body, &chat); err != nil {
+		return nil, err
+	}
+	text := ""
+	if len(chat.Choices) > 0 {
+		text = responseContentToText(chat.Choices[0].Message["content"])
+	}
+	model := strings.TrimSpace(chat.Model)
+	if model == "" {
+		model = fallbackModel
+	}
+	response := completedResponsesPayload(responseID(chat.ID), model, chat.Created, text, chat.Usage)
+	return json.Marshal(response)
+}
+
+type chatChoice struct {
+	Message      map[string]any `json:"message"`
+	Delta        map[string]any `json:"delta"`
+	FinishReason any            `json:"finish_reason"`
+}
+
+func completedResponsesPayload(id, model string, created int64, text string, usage map[string]any) map[string]any {
+	if id == "" {
+		id = responseID("")
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	messageID := id + "_msg"
+	item := map[string]any{
+		"id":     messageID,
+		"type":   "message",
+		"status": "completed",
+		"role":   "assistant",
+		"content": []map[string]any{
+			{
+				"type":        "output_text",
+				"text":        text,
+				"annotations": []any{},
+			},
+		},
+	}
+	response := map[string]any{
+		"id":          id,
+		"object":      "response",
+		"created_at":  created,
+		"status":      "completed",
+		"model":       model,
+		"output":      []map[string]any{item},
+		"output_text": text,
+	}
+	if len(usage) > 0 {
+		response["usage"] = usage
+	}
+	return response
+}
+
+func streamChatCompletionAsResponse(resp *http.Response, fallbackModel string) *UpstreamResponse {
+	reader, writer := io.Pipe()
+	go func() {
+		defer resp.Body.Close()
+		err := writeChatCompletionStreamAsResponse(writer, resp.Body, fallbackModel)
+		_ = writer.CloseWithError(err)
+	}()
+	header := make(http.Header)
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	return &UpstreamResponse{
+		StatusCode: http.StatusOK,
+		Header:     header,
+		Body:       reader,
+	}
+}
+
+func writeChatCompletionStreamAsResponse(w io.Writer, r io.Reader, fallbackModel string) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	responseIDValue := responseID("")
+	messageID := responseIDValue + "_msg"
+	model := fallbackModel
+	created := time.Now().Unix()
+	var text strings.Builder
+	started := false
+	completed := false
+
+	ensureStarted := func() error {
+		if started {
+			return nil
+		}
+		started = true
+		if err := writeSSE(w, "response.created", map[string]any{
+			"type":     "response.created",
+			"response": inProgressResponsePayload(responseIDValue, model, created),
+		}); err != nil {
+			return err
+		}
+		if err := writeSSE(w, "response.output_item.added", map[string]any{
+			"type":         "response.output_item.added",
+			"output_index": 0,
+			"item": map[string]any{
+				"id":      messageID,
+				"type":    "message",
+				"status":  "in_progress",
+				"role":    "assistant",
+				"content": []any{},
+			},
+		}); err != nil {
+			return err
+		}
+		return writeSSE(w, "response.content_part.added", map[string]any{
+			"type":          "response.content_part.added",
+			"item_id":       messageID,
+			"output_index":  0,
+			"content_index": 0,
+			"part": map[string]any{
+				"type":        "output_text",
+				"text":        "",
+				"annotations": []any{},
+			},
+		})
+	}
+	complete := func() error {
+		if completed {
+			return nil
+		}
+		completed = true
+		fullText := text.String()
+		if err := ensureStarted(); err != nil {
+			return err
+		}
+		if err := writeSSE(w, "response.output_text.done", map[string]any{
+			"type":          "response.output_text.done",
+			"item_id":       messageID,
+			"output_index":  0,
+			"content_index": 0,
+			"text":          fullText,
+		}); err != nil {
+			return err
+		}
+		item := completedResponseItem(messageID, fullText)
+		if err := writeSSE(w, "response.content_part.done", map[string]any{
+			"type":          "response.content_part.done",
+			"item_id":       messageID,
+			"output_index":  0,
+			"content_index": 0,
+			"part":          item["content"].([]map[string]any)[0],
+		}); err != nil {
+			return err
+		}
+		if err := writeSSE(w, "response.output_item.done", map[string]any{
+			"type":         "response.output_item.done",
+			"output_index": 0,
+			"item":         item,
+		}); err != nil {
+			return err
+		}
+		return writeSSE(w, "response.completed", map[string]any{
+			"type":     "response.completed",
+			"response": completedResponsesPayload(responseIDValue, model, created, fullText, nil),
+		})
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			if err := complete(); err != nil {
+				return err
+			}
+			continue
+		}
+		if code, isUpstreamError := modelprovider.UpstreamError([]byte(data)); isUpstreamError {
+			if code == "" {
+				code = "upstream_unavailable"
+			}
+			message := modelprovider.FriendlyUpstreamErrorMessage(modelprovider.UpstreamStatusForErrorCode(code), code)
+			return writeSSE(w, "error", map[string]any{"type": "error", "code": code, "message": message, "param": nil})
+		}
+		var chunk struct {
+			ID      string       `json:"id"`
+			Created int64        `json:"created"`
+			Model   string       `json:"model"`
+			Choices []chatChoice `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return err
+		}
+		if chunk.ID != "" && strings.HasPrefix(responseIDValue, "resp_csgclaw_") {
+			responseIDValue = responseID(chunk.ID)
+			messageID = responseIDValue + "_msg"
+		}
+		if chunk.Created != 0 {
+			created = chunk.Created
+		}
+		if strings.TrimSpace(chunk.Model) != "" {
+			model = strings.TrimSpace(chunk.Model)
+		}
+		for _, choice := range chunk.Choices {
+			delta := responseContentToText(choice.Delta["content"])
+			if delta != "" {
+				if err := ensureStarted(); err != nil {
+					return err
+				}
+				text.WriteString(delta)
+				if err := writeSSE(w, "response.output_text.delta", map[string]any{
+					"type":          "response.output_text.delta",
+					"item_id":       messageID,
+					"output_index":  0,
+					"content_index": 0,
+					"delta":         delta,
+				}); err != nil {
+					return err
+				}
+			}
+			if choice.FinishReason != nil {
+				if err := complete(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	if !completed {
+		return complete()
+	}
+	return nil
+}
+
+func inProgressResponsePayload(id, model string, created int64) map[string]any {
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	return map[string]any{
+		"id":         id,
+		"object":     "response",
+		"created_at": created,
+		"status":     "in_progress",
+		"model":      model,
+		"output":     []any{},
+	}
+}
+
+func completedResponseItem(messageID, text string) map[string]any {
+	return map[string]any{
+		"id":     messageID,
+		"type":   "message",
+		"status": "completed",
+		"role":   "assistant",
+		"content": []map[string]any{
+			{
+				"type":        "output_text",
+				"text":        text,
+				"annotations": []any{},
+			},
+		},
+	}
+}
+
+func writeSSE(w io.Writer, event string, payload map[string]any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+		return err
+	}
+	if flusher, ok := w.(interface{ Flush() error }); ok {
+		return flusher.Flush()
+	}
+	return nil
+}
+
+func responseID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Sprintf("resp_csgclaw_%d", time.Now().UnixNano())
+	}
+	if strings.HasPrefix(id, "resp_") {
+		return id
+	}
+	return "resp_" + id
+}
+
+func stringValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	default:
+		return ""
+	}
+}
+
+func payloadBool(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
+	}
+}
+
+func applyReasoningEffortDefault(payload map[string]any, defaultEffort string) {
+	defaultEffort = config.NormalizeReasoningEffort(defaultEffort)
+	if config.UsesModelReasoningDefault(defaultEffort) {
+		return
+	}
+	if defaultEffort == config.ReasoningEffortNone {
+		payload["reasoning_effort"] = config.ReasoningEffortNone
+		return
+	}
+	if value, ok := payload["reasoning_effort"]; ok {
+		if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+			return
+		}
+		if value != nil {
+			return
+		}
+	}
+	payload["reasoning_effort"] = defaultEffort
+}
+
+func mergeProfilePayload(payload map[string]any, profile agent.AgentProfile) {
+	payload["model"] = strings.TrimSpace(profile.ModelID)
+	applyReasoningEffortDefault(payload, profile.ReasoningEffort)
+	for key, value := range profile.RequestOptions {
+		key = strings.TrimSpace(key)
+		if key == "" || strings.EqualFold(key, "model") {
+			continue
+		}
+		if _, exists := payload[key]; exists {
+			continue
+		}
+		payload[key] = value
+	}
+	applyProviderPayloadConstraints(payload, profile)
+	if !profile.EnableFastMode {
+		return
+	}
+	switch profile.Provider {
+	case agent.ProviderClaudeCode:
+		if _, exists := payload["speed"]; !exists {
+			payload["speed"] = "fast"
+		}
+	default:
+		if _, exists := payload["service_tier"]; !exists {
+			payload["service_tier"] = "priority"
+		}
+	}
+}
+
+func mergeResponsesPayload(payload map[string]any, profile agent.AgentProfile) {
+	payload["model"] = strings.TrimSpace(profile.ModelID)
+	for key, value := range profile.RequestOptions {
+		key = strings.TrimSpace(key)
+		if key == "" || strings.EqualFold(key, "model") || strings.EqualFold(key, "reasoning_effort") {
+			continue
+		}
+		if _, exists := payload[key]; exists {
+			continue
+		}
+		payload[key] = value
+	}
+	applyResponsesProviderPayloadConstraints(payload, profile)
+	if !profile.EnableFastMode {
+		return
+	}
+	if _, exists := payload["service_tier"]; !exists {
+		payload["service_tier"] = "priority"
+	}
+}
+
+func applyProviderPayloadConstraints(payload map[string]any, profile agent.AgentProfile) {
+	switch profile.Provider {
+	case agent.ProviderCodex:
+		payload["store"] = false
+	}
+}
+
+func applyResponsesProviderPayloadConstraints(payload map[string]any, profile agent.AgentProfile) {
+	applyProviderPayloadConstraints(payload, profile)
+	caps := modelcap.ForProviderModel(profile.Provider, profile.ModelID)
+	if caps.ResponsesReasoningInputKnown && !caps.SupportsResponsesReasoningInput {
+		logResponsesReasoningInputRemoved(profile, stripResponsesInputReasoning(payload), "known_unsupported")
+	}
+}
+
+func stripResponsesInputReasoning(payload map[string]any) int {
+	if payload == nil {
+		return 0
+	}
+	input, ok := payload["input"]
+	if !ok {
+		return 0
+	}
+	filtered, removed := stripResponsesReasoningItems(input)
+	if removed == 0 {
+		return 0
+	}
+	payload["input"] = filtered
+	return removed
+}
+
+func stripResponsesReasoningItems(input any) (any, int) {
+	switch items := input.(type) {
+	case []any:
+		filtered := make([]any, 0, len(items))
+		removed := 0
+		for _, item := range items {
+			if responseInputItemIsReasoning(item) {
+				removed++
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		if removed == 0 {
+			return input, 0
+		}
+		return filtered, removed
+	case []map[string]any:
+		filtered := make([]map[string]any, 0, len(items))
+		removed := 0
+		for _, item := range items {
+			if responseInputItemIsReasoning(item) {
+				removed++
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		if removed == 0 {
+			return input, 0
+		}
+		return filtered, removed
+	default:
+		return input, 0
+	}
+}
+
+func logResponsesReasoningInputRemoved(profile agent.AgentProfile, removed int, reason string) {
+	if removed == 0 {
+		return
+	}
+	slog.Debug("llm bridge removed unsupported responses reasoning input",
+		"provider", strings.TrimSpace(profile.Provider),
+		"model", strings.TrimSpace(profile.ModelID),
+		"removed_items", removed,
+		"reason", reason,
+	)
+}
+
+func responseInputItemIsReasoning(item any) bool {
+	obj, ok := item.(map[string]any)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(stringValue(obj["type"])), "reasoning")
+}
+
+const (
+	gatewayReasoningThinkingBudget = 32768
+	reasoningCompletionHeadroom    = 1024
+	// Some agent runtimes use a provider-level default that is larger than many
+	// selected models accept. Apply a conservative bridge ceiling while keeping
+	// smaller explicit limits unchanged.
+	maxForwardedCompletionTokens = 131072
+)
+
+func normalizeCompletionTokenLimits(payload map[string]any) {
+	if payload == nil {
+		return
+	}
+	thinkingBudget := payloadInt(payload, "thinking_budget")
+	maxCompletion := payloadInt(payload, "max_completion_tokens")
+	maxTokens := payloadInt(payload, "max_tokens")
+	effectiveMax := maxCompletion
+	if effectiveMax <= 0 {
+		effectiveMax = maxTokens
+	}
+	if effectiveMax <= 0 {
+		return
+	}
+	if effectiveMax > maxForwardedCompletionTokens {
+		effectiveMax = maxForwardedCompletionTokens
+		setPayloadInt(payload, "max_completion_tokens", effectiveMax)
+		setPayloadInt(payload, "max_tokens", effectiveMax)
+	}
+
+	thinkingFloor := thinkingBudget
+	if thinkingFloor <= 0 {
+		thinkingFloor = reasoningModelThinkingBudgetFloor(stringValue(payload["model"]))
+	}
+	if thinkingFloor <= 0 && (effectiveMax == gatewayReasoningThinkingBudget || effectiveMax == 16384) {
+		// Picoclaw defaults can collide with gateway-side thinking budgets even when the
+		// client omits thinking_budget from the forwarded payload.
+		thinkingFloor = gatewayReasoningThinkingBudget
+	}
+	if thinkingFloor <= 0 || effectiveMax > thinkingFloor {
+		return
+	}
+	newMax := thinkingFloor + reasoningCompletionHeadroom
+	setPayloadInt(payload, "max_completion_tokens", newMax)
+	setPayloadInt(payload, "max_tokens", newMax)
+}
+
+func reasoningModelThinkingBudgetFloor(model string) int {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return 0
+	}
+	switch {
+	case strings.Contains(model, "glm-5"),
+		strings.Contains(model, "glm-4.5"),
+		strings.Contains(model, "glm-4.6"),
+		strings.Contains(model, "glm-4.7"):
+		return gatewayReasoningThinkingBudget
+	case strings.Contains(model, "qwen3"),
+		strings.Contains(model, "qwen-max"),
+		strings.Contains(model, "qwen-plus"):
+		return gatewayReasoningThinkingBudget
+	default:
+		return 0
+	}
+}
+
+func payloadInt(payload map[string]any, key string) int {
+	value, ok := payload[key]
+	if !ok || value == nil {
+		return 0
+	}
+	switch v := value.(type) {
+	case int:
+		return v
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return 0
+		}
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func setPayloadInt(payload map[string]any, key string, value int) {
+	if value <= 0 {
+		return
+	}
+	payload[key] = value
+}
+
+func (s *Service) agentProfileWebsocketTarget(ctx context.Context, profile agent.AgentProfile) (string, string, error) {
+	switch profile.Provider {
+	case agent.ProviderCodex:
+		if err := ensureCLIProxyAuthenticated(ctx, profile.Provider); err != nil {
+			return "", "", err
+		}
+		if _, err := embeddedCLIProxyProviderBaseURL(ctx, profile.Provider); err != nil {
+			return "", "", &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("embedded cliproxy unavailable: %v", err)}
+		}
+		baseURL, err := embeddedCLIProxyBaseURL(ctx)
+		if err != nil {
+			return "", "", &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("embedded cliproxy unavailable: %v", err)}
+		}
+		return strings.TrimRight(baseURL, "/") + "/v1", cliproxy.LocalAPIKey, nil
+	case agent.ProviderClaudeCode:
+		return s.agentProfileTarget(ctx, profile)
+	case agent.ProviderCSGHub:
+		return csghubAIGatewayTarget(ctx, s.client)
+	default:
+		return agent.ProfileBaseURL(profile), agent.ProfileAPIKey(profile), nil
+	}
+}
+
+func (s *Service) agentProfileTarget(ctx context.Context, profile agent.AgentProfile) (string, string, error) {
+	switch profile.Provider {
+	case agent.ProviderCodex, agent.ProviderClaudeCode:
+		if err := ensureCLIProxyAuthenticated(ctx, profile.Provider); err != nil {
+			return "", "", err
+		}
+		baseURL, err := embeddedCLIProxyProviderBaseURL(ctx, profile.Provider)
+		if err != nil {
+			return "", "", &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("embedded cliproxy unavailable: %v", err)}
+		}
+		return baseURL, cliproxy.LocalAPIKey, nil
+	case agent.ProviderCSGHub:
+		return csghubAIGatewayTarget(ctx, s.client)
+	default:
+		return agent.ProfileBaseURL(profile), agent.ProfileAPIKey(profile), nil
+	}
+}
+
+func csghubAIGatewayTarget(ctx context.Context, client *http.Client) (string, string, error) {
+	store, err := auth.DefaultStore()
+	if err != nil {
+		return "", "", &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("csghub auth unavailable: %v", err)}
+	}
+	baseURL, apiKey, ok, err := store.EnsureAIGatewayCredentials(ctx, client)
+	if err != nil {
+		return "", "", &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("csghub auth unavailable: %v", err)}
+	}
+	if !ok {
+		return "", "", &HTTPError{Status: http.StatusUnauthorized, Message: "csghub login is required"}
+	}
+	return baseURL, apiKey, nil
+}
+
+func (s *Service) refreshOpenCSGAIGatewayCredentials(ctx context.Context, rejectedAPIKey string) (string, string, bool) {
+	s.openCSGCredentialRefreshMu.Lock()
+	defer s.openCSGCredentialRefreshMu.Unlock()
+
+	store, err := auth.DefaultStore()
+	if err != nil {
+		slog.Warn("resolve OpenCSG auth store after unauthorized response", "error", err)
+		return "", "", false
+	}
+	baseURL, apiKey, ok, err := store.AIGatewayCredentials()
+	if err != nil {
+		slog.Warn("read OpenCSG AI Gateway credentials after unauthorized response", "error", err)
+		return "", "", false
+	}
+	if ok && apiKey != "" && apiKey != rejectedAPIKey {
+		return baseURL, apiKey, true
+	}
+	baseURL, apiKey, ok, err = store.RefreshAIGatewayCredentials(ctx, s.client)
+	if err != nil {
+		slog.Warn("refresh OpenCSG AI Gateway credentials after unauthorized response", "error", err)
+		return "", "", false
+	}
+	return baseURL, apiKey, ok && apiKey != rejectedAPIKey
+}
+
+func ensureCLIProxyAuthenticated(ctx context.Context, provider string) error {
+	status, err := embeddedCLIProxyAuthStatus(ctx, provider)
+	if err != nil {
+		return &HTTPError{Status: http.StatusBadGateway, Message: fmt.Sprintf("embedded cliproxy auth unavailable: %v", err)}
+	}
+	if status.Authenticated {
+		return nil
+	}
+	message := strings.TrimSpace(status.Message)
+	if message == "" {
+		message = fmt.Sprintf("%s auth is required. Connect this provider in the CSGClaw UI.", provider)
+	}
+	return &HTTPError{
+		Status:   http.StatusConflict,
+		Code:     "auth_required",
+		Provider: provider,
+		Message:  message,
+	}
+}
+
+func responsesWebsocketURL(baseURL string) (string, error) {
+	u, err := url.Parse(strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/responses")
+	if err != nil {
+		return "", fmt.Errorf("parse upstream responses websocket url: %w", err)
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("upstream responses websocket url must use http, https, ws, or wss")
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("upstream responses websocket url host is required")
+	}
+	return u.String(), nil
+}
+
+func websocketUpstreamHeaders(in http.Header, apiKey string, profileHeaders map[string]string) http.Header {
+	out := make(http.Header)
+	for key, values := range in {
+		if skipWebsocketForwardHeader(key) {
+			continue
+		}
+		for _, value := range values {
+			out.Add(key, value)
+		}
+	}
+	if apiKey != "" {
+		out.Set("Authorization", "Bearer "+apiKey)
+	}
+	for key, value := range profileHeaders {
+		key = strings.TrimSpace(key)
+		if key == "" || skipWebsocketForwardHeader(key) || strings.EqualFold(key, "authorization") {
+			continue
+		}
+		out.Set(key, value)
+	}
+	return out
+}
+
+func skipWebsocketForwardHeader(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "host", "connection", "upgrade", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-protocol", "content-length":
+		return true
+	default:
+		return false
+	}
+}
+
+type responsesWebsocketPayloadRewriter func(int, []byte) []byte
+
+func responsesWebsocketClientPayloadRewriter(profile agent.AgentProfile) responsesWebsocketPayloadRewriter {
+	return func(messageType int, payload []byte) []byte {
+		if messageType != websocket.TextMessage {
+			return payload
+		}
+		return rewriteResponsesWebsocketClientPayload(payload, profile)
+	}
+}
+
+func rewriteResponsesWebsocketClientPayload(payload []byte, profile agent.AgentProfile) []byte {
+	var message map[string]any
+	if err := json.Unmarshal(payload, &message); err != nil {
+		return payload
+	}
+	messageType := strings.TrimSpace(stringValue(message["type"]))
+	if messageType != "" && !strings.EqualFold(messageType, "response.create") {
+		return payload
+	}
+
+	target := message
+	if response, ok := message["response"].(map[string]any); ok {
+		target = response
+	}
+	mergeResponsesPayload(target, profile)
+
+	rewritten, err := json.Marshal(message)
+	if err != nil {
+		return payload
+	}
+	return rewritten
+}
+
+func proxyResponsesWebsocket(ctx context.Context, downstream, upstream *websocket.Conn, rewriteClientPayload responsesWebsocketPayloadRewriter) error {
+	errCh := make(chan error, 2)
+	pump := func(dst, src *websocket.Conn, rewrite responsesWebsocketPayloadRewriter) {
+		for {
+			messageType, payload, err := src.ReadMessage()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if rewrite != nil {
+				payload = rewrite(messageType, payload)
+			}
+			if err := dst.WriteMessage(messageType, payload); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}
+
+	go pump(upstream, downstream, rewriteClientPayload)
+	go pump(downstream, upstream, nil)
+
+	select {
+	case <-ctx.Done():
+		_ = downstream.Close()
+		_ = upstream.Close()
+		return nil
+	case err := <-errCh:
+		_ = downstream.Close()
+		_ = upstream.Close()
+		if websocketCloseIsNormal(err) {
+			return nil
+		}
+		return err
+	}
+}
+
+func writeResponsesWebsocketClose(conn *websocket.Conn, code int, message string) {
+	if conn == nil {
+		return
+	}
+	deadline := time.Now().Add(time.Second)
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, message), deadline)
+}
+
+func websocketCloseIsNormal(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) {
+		return true
+	}
+	return websocket.IsCloseError(err,
+		websocket.CloseNormalClosure,
+		websocket.CloseGoingAway,
+		websocket.CloseNoStatusReceived,
+		websocket.CloseAbnormalClosure,
+	) || strings.Contains(strings.ToLower(err.Error()), "unexpected eof") ||
+		strings.Contains(strings.ToLower(err.Error()), "use of closed network connection")
+}

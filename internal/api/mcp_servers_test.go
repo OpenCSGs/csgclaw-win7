@@ -1,0 +1,533 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	agent "csgclaw/internal/agentengine/agents"
+	"csgclaw/internal/knowledgebase"
+	"csgclaw/internal/mcp"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+type stubMCPServerProber struct {
+	config map[string]any
+	name   string
+}
+
+type failingMCPServerProber struct{}
+
+func (failingMCPServerProber) Probe(context.Context, string, map[string]any) (mcp.ProbeResult, error) {
+	return mcp.ProbeResult{}, errors.New("access denied")
+}
+
+func TestWriteMCPServerErrorMapsRemoteInstallFailure(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeMCPServerError(recorder, fmt.Errorf("%w: permission denied", mcp.ErrRemoteServerInstallFailed))
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":"remote_mcp_install_failed"`) {
+		t.Fatalf("body = %s, want remote_mcp_install_failed", recorder.Body.String())
+	}
+}
+
+func TestHandleMCPServersHidesUnavailableRemoteAndRetainsManualServer(t *testing.T) {
+	store := &memoryMCPServerStoreForAPI{servers: map[string]any{
+		"manual": map[string]any{"url": "https://manual.example.test/mcp"},
+		"denied": mcp.RemoteServer{ID: "remote-denied", Name: "denied", URL: "https://remote.example.test/mcp"}.Config(),
+	}}
+	svc := mcp.NewService(mcp.WithServerStore(store), mcp.WithServerProber(failingMCPServerProber{}))
+
+	recorder := httptest.NewRecorder()
+	(&Handler{mcp: svc}).Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/mcp-servers", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response struct {
+		Servers       map[string]any `json:"mcpServers"`
+		ProbesPending bool           `json:"probes_pending"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, ok := response.Servers["manual"]; !ok {
+		t.Fatalf("available servers = %#v, want manual", response.Servers)
+	}
+	if _, ok := response.Servers["denied"]; ok {
+		t.Fatalf("available servers retained denied remote: %#v", response.Servers)
+	}
+	if response.ProbesPending {
+		t.Fatal("completed failed probe was reported as pending")
+	}
+	stored, err := svc.ListServers(context.Background())
+	if err != nil {
+		t.Fatalf("ListServers() error = %v", err)
+	}
+	if _, ok := stored["denied"]; !ok {
+		t.Fatalf("stored servers removed denied remote: %#v", stored)
+	}
+}
+
+func (p *stubMCPServerProber) Probe(_ context.Context, name string, config map[string]any) (mcp.ProbeResult, error) {
+	p.name = name
+	p.config = config
+	return mcp.ProbeResult{
+		Connected:       true,
+		ProtocolVersion: "2025-11-25",
+		ServerInfo:      &mcp.ProbeServerInfo{Name: "docs", Version: "1.0.0"},
+		ToolsSupported:  true,
+		Tools: []mcp.ProbeTool{{
+			Name:        "search",
+			Description: "Search docs",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+	}, nil
+}
+
+func TestProbeMCPServerUsesDraftConfigWithoutPersisting(t *testing.T) {
+	prober := &stubMCPServerProber{}
+	store := &memoryMCPServerStoreForAPI{}
+	handler := &Handler{mcp: mcp.NewService(mcp.WithServerProber(prober), mcp.WithServerStore(store))}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp-servers:probe", strings.NewReader(`{
+		"name":"docs",
+		"config":{"url":"https://mcp.example.test","type":"streamable_http"}
+	}`))
+
+	handler.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("POST probe status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if prober.name != "docs" || prober.config["url"] != "https://mcp.example.test" {
+		t.Fatalf("probe input = name %q config %#v", prober.name, prober.config)
+	}
+	if store.writes != 0 {
+		t.Fatalf("probe persisted MCP state %d times", store.writes)
+	}
+	var result mcp.ProbeResult
+	if err := json.NewDecoder(recorder.Body).Decode(&result); err != nil {
+		t.Fatalf("decode probe response: %v", err)
+	}
+	if !result.Connected || len(result.Tools) != 1 || result.Tools[0].Name != "search" {
+		t.Fatalf("probe response = %+v", result)
+	}
+}
+
+func TestProbeManagedKnowledgeBaseMCPUsesCurrentUserCredentialWithoutPersisting(t *testing.T) {
+	originalLoader := loadKnowledgeBaseConnection
+	originalTransport := http.DefaultTransport
+	defer func() {
+		loadKnowledgeBaseConnection = originalLoader
+		http.DefaultTransport = originalTransport
+	}()
+	loadKnowledgeBaseConnection = func(context.Context) (knowledgeBaseConnection, error) {
+		return knowledgeBaseConnection{
+			CSGHubBaseURL:     "https://hub.example.test",
+			CSGHubAccessToken: "current-user-token",
+		}, nil
+	}
+	http.DefaultTransport = knowledgeBaseRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got, want := req.URL.Path, "/api/v1/agent/knowledge-bases/42"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		if got, want := req.Header.Get("Authorization"), "Bearer current-user-token"; got != want {
+			t.Fatalf("Authorization = %q, want %q", got, want)
+		}
+		body := `{"data":{"id":42,"name":"Handbook","content_id":"content-42","type":"llmwiki","metadata":{"mcp_endpoint_url":"https://gateway.example.test/current/mcp","resource_state":{"readiness":"ready","mcp_status":"ready"}}}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+
+	prober := &stubMCPServerProber{}
+	store := &memoryMCPServerStoreForAPI{}
+	handler := &Handler{mcp: mcp.NewService(mcp.WithServerProber(prober), mcp.WithServerStore(store))}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp-servers:probe", strings.NewReader(`{
+		"name":"content-42",
+		"config":{
+			"type":"remote",
+			"url":"https://gateway.example.test/v1/gateway/mcp",
+			"transport":"streamable-http",
+			"headers":{"Authorization":"Bearer stale-user-token","X-Local":"probe"},
+			"_meta":{
+				"com.opencsg/mcp":{
+					"type":"llm_wiki",
+					"resource_id":"42",
+					"content_id":"content-42",
+					"auth_type":"csghub_access_token"
+				}
+			}
+		}
+	}`))
+
+	handler.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("POST managed probe status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got, want := prober.config["url"], "https://gateway.example.test/current/mcp"; got != want {
+		t.Fatalf("probe url = %#v, want %q", got, want)
+	}
+	headers, ok := prober.config["headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("probe headers = %#v, want map", prober.config["headers"])
+	}
+	if got, want := headers["Authorization"], "Bearer current-user-token"; got != want {
+		t.Fatalf("probe Authorization = %#v, want %q", got, want)
+	}
+	if got, want := headers["X-Local"], "probe"; got != want {
+		t.Fatalf("probe X-Local = %#v, want %q", got, want)
+	}
+	if _, ok := knowledgebase.ManagedMetadataFromServer(prober.config); !ok {
+		t.Fatalf("probe lost managed metadata: %#v", prober.config)
+	}
+	if store.writes != 0 {
+		t.Fatalf("probe persisted MCP state %d times", store.writes)
+	}
+	if strings.Contains(recorder.Body.String(), "current-user-token") || strings.Contains(recorder.Body.String(), "stale-user-token") {
+		t.Fatalf("probe response leaked CSGHub access token: %s", recorder.Body.String())
+	}
+}
+
+func TestProbeManagedKnowledgeBaseMCPRejectsCurrentUserWithoutAccess(t *testing.T) {
+	originalLoader := loadKnowledgeBaseConnection
+	originalTransport := http.DefaultTransport
+	defer func() {
+		loadKnowledgeBaseConnection = originalLoader
+		http.DefaultTransport = originalTransport
+	}()
+	loadKnowledgeBaseConnection = func(context.Context) (knowledgeBaseConnection, error) {
+		return knowledgeBaseConnection{
+			CSGHubBaseURL:     "https://hub.example.test",
+			CSGHubAccessToken: "current-user-token",
+		}, nil
+	}
+	http.DefaultTransport = knowledgeBaseRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"message":"forbidden"}`)),
+		}, nil
+	})
+
+	prober := &stubMCPServerProber{}
+	handler := &Handler{mcp: mcp.NewService(mcp.WithServerProber(prober), mcp.WithServerStore(&memoryMCPServerStoreForAPI{}))}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp-servers:probe", strings.NewReader(`{
+		"name":"content-42",
+		"config":{
+			"type":"remote",
+			"url":"https://gateway.example.test/snapshot/mcp",
+			"_meta":{"com.opencsg/mcp":{"type":"llm_wiki","resource_id":"42","content_id":"content-42","auth_type":"csghub_access_token"}}
+		}
+	}`))
+
+	handler.Routes().ServeHTTP(recorder, request)
+
+	assertAPIErrorCode(t, recorder, http.StatusForbidden, "knowledge_base_access_forbidden")
+	if prober.config != nil {
+		t.Fatalf("MCP probe ran after permission denial: %#v", prober.config)
+	}
+}
+
+func TestManagedKnowledgeBaseMCPSourceStatusAndManualSync(t *testing.T) {
+	originalLoader := loadKnowledgeBaseConnection
+	originalTransport := http.DefaultTransport
+	defer func() {
+		loadKnowledgeBaseConnection = originalLoader
+		http.DefaultTransport = originalTransport
+	}()
+	loadKnowledgeBaseConnection = func(context.Context) (knowledgeBaseConnection, error) {
+		return knowledgeBaseConnection{CSGHubBaseURL: "https://hub.example.test", CSGHubAccessToken: "current-token"}, nil
+	}
+	responseBody := []byte(`{"data":{"id":42,"name":"Handbook","description":"Current runbooks","content_id":"content-42","type":"llmwiki","metadata":{"mcp_endpoint_url":"https://gateway.example.test/current/mcp","resource_state":{"readiness":"ready","mcp_status":"ready"}}}}`)
+	http.DefaultTransport = knowledgeBaseRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got, want := req.URL.Path, "/api/v1/agent/knowledge-bases/42"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		if got, want := req.Header.Get("Authorization"), "Bearer current-token"; got != want {
+			t.Fatalf("Authorization = %q, want %q", got, want)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(responseBody)),
+		}, nil
+	})
+
+	store := &knowledgeBaseServerStore{servers: map[string]any{
+		"content-42": map[string]any{
+			"type":                "remote",
+			"url":                 "https://gateway.example.test/snapshot/mcp",
+			"transport":           "streamable-http",
+			"headers":             map[string]any{"Authorization": "Bearer snapshot-token", "X-Local": "global"},
+			"startup_timeout_sec": float64(45),
+			"tool_timeout_sec":    float64(90),
+			knowledgebase.ManagedMetaKey: map[string]any{
+				knowledgebase.ManagedMetaNamespace: map[string]any{
+					"type":        knowledgebase.ManagedMCPType,
+					"resource_id": "42",
+					"content_id":  "content-42",
+					"auth_type":   knowledgebase.ManagedAuthType,
+				},
+			},
+		},
+	}}
+	handler := &Handler{mcp: mcp.NewService(mcp.WithServerStore(store))}
+
+	statusRecorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(statusRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/mcp-servers/content-42/source", nil))
+	if got, want := statusRecorder.Code, http.StatusOK; got != want {
+		t.Fatalf("GET source status = %d, want %d; body=%s", got, want, statusRecorder.Body.String())
+	}
+	var status mcpServerSourceStatusResponse
+	if err := json.NewDecoder(statusRecorder.Body).Decode(&status); err != nil {
+		t.Fatalf("decode source status: %v", err)
+	}
+	if !status.SourceAvailable || !status.UpdateAvailable || status.ConfiguredEndpointURL != "https://gateway.example.test/snapshot/mcp" || status.LatestEndpointURL != "https://gateway.example.test/current/mcp" {
+		t.Fatalf("source status = %#v", status)
+	}
+	if got := store.servers["content-42"].(map[string]any)["url"]; got != "https://gateway.example.test/snapshot/mcp" {
+		t.Fatalf("GET source status changed snapshot URL to %#v", got)
+	}
+
+	syncRecorder := httptest.NewRecorder()
+	handler.Routes().ServeHTTP(syncRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/mcp-servers/content-42/source:sync", nil))
+	if got, want := syncRecorder.Code, http.StatusOK; got != want {
+		t.Fatalf("POST source sync = %d, want %d; body=%s", got, want, syncRecorder.Body.String())
+	}
+	var synced mcpServerSourceSyncResponse
+	if err := json.NewDecoder(syncRecorder.Body).Decode(&synced); err != nil {
+		t.Fatalf("decode source sync: %v", err)
+	}
+	if synced.Source.UpdateAvailable {
+		t.Fatalf("synced source update_available = true")
+	}
+	config := store.servers["content-42"].(map[string]any)
+	if got, want := config["url"], "https://gateway.example.test/current/mcp"; got != want {
+		t.Fatalf("synced url = %#v, want %q", got, want)
+	}
+	headers := config["headers"].(map[string]any)
+	if _, exists := headers["Authorization"]; exists {
+		t.Fatalf("synced config persisted current user credentials: %#v", headers)
+	}
+	if got, want := headers["X-Local"], "global"; got != want {
+		t.Fatalf("synced X-Local = %#v, want %q", got, want)
+	}
+	if got, want := config["startup_timeout_sec"], float64(45); got != want {
+		t.Fatalf("synced startup_timeout_sec = %#v, want %#v", got, want)
+	}
+	if got, want := config["tool_timeout_sec"], float64(90); got != want {
+		t.Fatalf("synced tool_timeout_sec = %#v, want %#v", got, want)
+	}
+}
+
+func TestAgentManagedKnowledgeBaseMCPSourceSyncUsesAgentSnapshotWithoutGlobalMCP(t *testing.T) {
+	originalLoader := loadKnowledgeBaseConnection
+	originalTransport := http.DefaultTransport
+	defer func() {
+		loadKnowledgeBaseConnection = originalLoader
+		http.DefaultTransport = originalTransport
+	}()
+	loadKnowledgeBaseConnection = func(context.Context) (knowledgeBaseConnection, error) {
+		return knowledgeBaseConnection{CSGHubBaseURL: "https://hub.example.test", CSGHubAccessToken: "current-token"}, nil
+	}
+	responseBody := []byte(`{"data":{"id":42,"name":"Handbook","description":"Current runbooks","content_id":"content-42","type":"llmwiki","metadata":{"mcp_endpoint_url":"https://gateway.example.test/current/mcp","resource_state":{"readiness":"ready","mcp_status":"ready"}}}}`)
+	http.DefaultTransport = knowledgeBaseRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(responseBody)),
+		}, nil
+	})
+
+	handler, service, created := newAgentMCPManagementTestServer(t)
+	agentConfig := managedKnowledgeBaseMCPConfigForTest("https://gateway.example.test/agent-snapshot/mcp", "agent-snapshot-token")
+	agentConfig["startup_timeout_sec"] = float64(90)
+	agentConfig["tool_timeout_sec"] = float64(180)
+	agentConfig["headers"].(map[string]any)["X-Local"] = "agent"
+	agentSnapshot := map[string]any{"content-42": agentConfig}
+	if _, err := service.UpdateRecord(context.Background(), created.ID, agent.UpdateRequest{
+		MCPServers:    &agentSnapshot,
+		MCPServersSet: true,
+		FieldMask:     []string{"mcpServers"},
+	}); err != nil {
+		t.Fatalf("seed Agent MCP snapshot: %v", err)
+	}
+	// Once installed, the Agent snapshot refreshes directly from AgenticHub and
+	// must not depend on the global MCP catalog still being configured.
+	handler.mcp = nil
+
+	router := handler.Routes()
+	statusRecorder := httptest.NewRecorder()
+	router.ServeHTTP(statusRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+created.ID+"/mcp-servers/content-42/source", nil))
+	if got, want := statusRecorder.Code, http.StatusOK; got != want {
+		t.Fatalf("GET Agent MCP source status = %d, want %d; body=%s", got, want, statusRecorder.Body.String())
+	}
+	var status mcpServerSourceStatusResponse
+	if err := json.NewDecoder(statusRecorder.Body).Decode(&status); err != nil {
+		t.Fatalf("decode Agent MCP source status: %v", err)
+	}
+	if !status.SourceAvailable || !status.UpdateAvailable || !status.AgentUpdateAvailable || status.GlobalServerName != "" {
+		t.Fatalf("Agent MCP source status = %#v", status)
+	}
+
+	syncRecorder := httptest.NewRecorder()
+	router.ServeHTTP(syncRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers/content-42/source:sync", nil))
+	if got, want := syncRecorder.Code, http.StatusOK; got != want {
+		t.Fatalf("POST Agent MCP source sync = %d, want %d; body=%s", got, want, syncRecorder.Body.String())
+	}
+	var synced agentMCPServerSourceSyncResponse
+	if err := json.NewDecoder(syncRecorder.Body).Decode(&synced); err != nil {
+		t.Fatalf("decode Agent MCP source sync: %v", err)
+	}
+	if synced.Source.UpdateAvailable || synced.Source.AgentUpdateAvailable || synced.Source.GlobalServerName != "" {
+		t.Fatalf("synced source status = %#v", synced.Source)
+	}
+	saved, ok := service.Agent(created.ID)
+	if !ok {
+		t.Fatalf("Agent(%q) not found", created.ID)
+	}
+	assertManagedKnowledgeBaseMCPRuntimeSnapshot(t, saved.MCPServers["content-42"], "https://gateway.example.test/current/mcp")
+	refreshedAgent := saved.MCPServers["content-42"].(map[string]any)
+	if got, want := refreshedAgent["startup_timeout_sec"], float64(90); got != want {
+		t.Fatalf("Agent startup_timeout_sec = %#v, want %#v", got, want)
+	}
+	if got, want := refreshedAgent["tool_timeout_sec"], float64(180); got != want {
+		t.Fatalf("Agent tool_timeout_sec = %#v, want %#v", got, want)
+	}
+	if got, want := refreshedAgent["headers"].(map[string]any)["X-Local"], "agent"; got != want {
+		t.Fatalf("Agent X-Local = %#v, want %q", got, want)
+	}
+}
+
+func TestAgentManagedKnowledgeBaseMCPMissingSourceCanStillBeRemoved(t *testing.T) {
+	originalLoader := loadKnowledgeBaseConnection
+	originalTransport := http.DefaultTransport
+	defer func() {
+		loadKnowledgeBaseConnection = originalLoader
+		http.DefaultTransport = originalTransport
+	}()
+	loadKnowledgeBaseConnection = func(context.Context) (knowledgeBaseConnection, error) {
+		return knowledgeBaseConnection{CSGHubBaseURL: "https://hub.example.test", CSGHubAccessToken: "current-token"}, nil
+	}
+	http.DefaultTransport = knowledgeBaseRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"message":"knowledge base not found"}`)),
+		}, nil
+	})
+
+	handler, service, created := newAgentMCPManagementTestServer(t)
+	agentConfig := managedKnowledgeBaseMCPConfigForTest("https://gateway.example.test/deleted/mcp", "snapshot-token")
+	agentSnapshot := map[string]any{"content-42": agentConfig}
+	if _, err := service.UpdateRecord(context.Background(), created.ID, agent.UpdateRequest{
+		MCPServers:    &agentSnapshot,
+		MCPServersSet: true,
+		FieldMask:     []string{"mcpServers"},
+	}); err != nil {
+		t.Fatalf("seed Agent MCP snapshot: %v", err)
+	}
+	handler.mcp = nil
+
+	router := handler.Routes()
+	statusRecorder := httptest.NewRecorder()
+	router.ServeHTTP(statusRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+created.ID+"/mcp-servers/content-42/source", nil))
+	if got, want := statusRecorder.Code, http.StatusOK; got != want {
+		t.Fatalf("GET deleted Agent MCP source status = %d, want %d; body=%s", got, want, statusRecorder.Body.String())
+	}
+	var status mcpServerSourceStatusResponse
+	if err := json.NewDecoder(statusRecorder.Body).Decode(&status); err != nil {
+		t.Fatalf("decode deleted Agent MCP source status: %v", err)
+	}
+	if status.SourceAvailable || status.UpdateAvailable || status.ContentID != "content-42" || status.ResourceID != "42" || status.ConfiguredEndpointURL != "https://gateway.example.test/deleted/mcp" {
+		t.Fatalf("deleted Agent MCP source status = %#v", status)
+	}
+
+	syncRecorder := httptest.NewRecorder()
+	router.ServeHTTP(syncRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers/content-42/source:sync", nil))
+	if got, want := syncRecorder.Code, http.StatusNotFound; got != want {
+		t.Fatalf("POST deleted Agent MCP source sync = %d, want %d; body=%s", got, want, syncRecorder.Body.String())
+	}
+
+	deleteRecorder := httptest.NewRecorder()
+	deleteRequest := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/mcp-servers:batchDelete", strings.NewReader(`{"names":["content-42"]}`))
+	router.ServeHTTP(deleteRecorder, deleteRequest)
+	if got, want := deleteRecorder.Code, http.StatusOK; got != want {
+		t.Fatalf("POST delete stale Agent MCP = %d, want %d; body=%s", got, want, deleteRecorder.Body.String())
+	}
+	var deleted agent.MCPServersView
+	if err := json.NewDecoder(deleteRecorder.Body).Decode(&deleted); err != nil {
+		t.Fatalf("decode deleted Agent MCP view: %v", err)
+	}
+	if _, exists := deleted.Servers["content-42"]; exists {
+		t.Fatalf("deleted Agent MCP view still contains content-42: %#v", deleted.Servers)
+	}
+}
+
+func managedKnowledgeBaseMCPConfigForTest(endpoint, token string) map[string]any {
+	return map[string]any{
+		"type":      "remote",
+		"url":       endpoint,
+		"transport": "streamable-http",
+		"headers":   map[string]any{"Authorization": "Bearer " + token},
+		knowledgebase.ManagedMetaKey: map[string]any{
+			knowledgebase.ManagedMetaNamespace: map[string]any{
+				"type":        knowledgebase.ManagedMCPType,
+				"resource_id": "42",
+				"content_id":  "content-42",
+				"auth_type":   knowledgebase.ManagedAuthType,
+			},
+		},
+	}
+}
+
+func assertManagedKnowledgeBaseMCPRuntimeSnapshot(t *testing.T, raw any, endpoint string) {
+	t.Helper()
+	config, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("MCP config = %#v, want object", raw)
+	}
+	if got := config["url"]; got != endpoint {
+		t.Fatalf("MCP URL = %#v, want %q", got, endpoint)
+	}
+	if headers, ok := config["headers"].(map[string]any); ok {
+		if _, exists := headers["Authorization"]; exists {
+			t.Fatalf("MCP headers persisted current user token: %#v", headers)
+		}
+	}
+	if _, managed := knowledgebase.ManagedMetadataFromServer(config); !managed {
+		t.Fatalf("MCP config lost managed metadata: %#v", config)
+	}
+}
+
+type memoryMCPServerStoreForAPI struct {
+	servers map[string]any
+	writes  int
+}
+
+func (s *memoryMCPServerStoreForAPI) ReadServers(context.Context) (map[string]any, error) {
+	if s.servers == nil {
+		return map[string]any{}, nil
+	}
+	return s.servers, nil
+}
+
+func (s *memoryMCPServerStoreForAPI) WriteServers(_ context.Context, servers map[string]any) error {
+	s.writes++
+	s.servers = servers
+	return nil
+}

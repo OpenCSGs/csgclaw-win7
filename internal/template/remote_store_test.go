@@ -1,0 +1,1063 @@
+package template
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"csgclaw/internal/config"
+)
+
+const remoteTestManifest = `name = "gitlab-assistant"
+role = "manager"
+description = "GitLab assistant"
+runtime_kind = "openclaw"
+version = "2026.6.16.0"
+updated_at = "2026-05-19T07:25:31Z"
+
+[image]
+ref = "registry.example.com/openclaw-glab:2026.6.16.0"
+
+[[image.env]]
+name = "GITLAB_TOKEN"
+required = true
+secret = true
+description = "GitLab personal access token"
+`
+
+func TestRemoteTemplateMetadataPreservesSensitiveCheck(t *testing.T) {
+	t.Parallel()
+
+	got := remoteTemplateMetadata(remoteAgentTemplateMetadata{SensitiveCheck: &remoteTemplateSensitiveCheck{
+		Status: " Exception ",
+		FailureDetails: []remoteTemplateSensitiveCheckFailure{{
+			Path: " secrets.txt ", Status: " Fail ", Message: " checker result ",
+		}},
+	}})
+	if got == nil || got.SensitiveCheck == nil {
+		t.Fatal("sensitive check metadata is nil")
+	}
+	if got.SensitiveCheck.Status != "Exception" {
+		t.Fatalf("status = %q, want Exception", got.SensitiveCheck.Status)
+	}
+	if len(got.SensitiveCheck.FailureDetails) != 1 || got.SensitiveCheck.FailureDetails[0].Message != "checker result" {
+		t.Fatalf("failure details = %#v", got.SensitiveCheck.FailureDetails)
+	}
+}
+
+func TestRemoteStorePostJSONRecognizesSensitiveInformationError(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":"SENSITIVE-ERR-0","msg":"SENSITIVE-ERR-0: The sensitive information is not allowed."}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "token")
+	err := store.postJSON(context.Background(), srv.URL, map[string]string{"description": "blocked"}, nil)
+	if !errors.Is(err, ErrTemplateSensitiveInfo) {
+		t.Fatalf("postJSON() error = %v, want ErrTemplateSensitiveInfo", err)
+	}
+	if got, want := RemoteAPIErrorCode(err), "SENSITIVE-ERR-0"; got != want {
+		t.Fatalf("RemoteAPIErrorCode() = %q, want %q", got, want)
+	}
+}
+
+func TestRemoteStorePostJSONPreservesStructuredErrorCode(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"code":"USER-ERR-18","msg":"User email is empty"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "token")
+	err := store.postJSON(context.Background(), srv.URL, nil, nil)
+	if got, want := RemoteAPIErrorCode(err), "USER-ERR-18"; got != want {
+		t.Fatalf("RemoteAPIErrorCode() = %q, want %q; error=%v", got, want, err)
+	}
+}
+
+func TestRemoteStorePostJSONPreservesNonstandardJSONErrorBody(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"temporary failure"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "token")
+	err := store.postJSON(context.Background(), srv.URL, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), `{"error":"temporary failure"}`) {
+		t.Fatalf("postJSON() error = %v, want preserved JSON diagnostics", err)
+	}
+}
+
+func TestRemoteStorePostJSONPreservesRepositoryPathConflictCode(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":"SYS-ERR-4","msg":"repository path already exists"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "token")
+	err := store.postJSON(context.Background(), srv.URL, nil, nil)
+	if got, want := RemoteAPIErrorCode(err), "SYS-ERR-4"; got != want {
+		t.Fatalf("RemoteAPIErrorCode() = %q, want %q", got, want)
+	}
+}
+
+func TestRemoteStorePostJSONDoesNotInferConflictWithoutCode(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`ERROR: duplicate key value violates unique constraint "idx_repositories_git_path" (SQLSTATE 23505)`))
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "token")
+	err := store.postJSON(context.Background(), srv.URL, nil, nil)
+	if errors.Is(err, ErrTemplateAlreadyExists) {
+		t.Fatalf("postJSON() error = %v, must not infer a name conflict without an upstream code", err)
+	}
+}
+
+func TestRemoteStorePublishUploadsArchiveAndCreatesTemplateCode(t *testing.T) {
+	t.Parallel()
+
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("publish me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	memoryPath := filepath.Join(t.TempDir(), "memory_summary.md")
+	if err := os.WriteFile(memoryPath, []byte("must not upload\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stagedMemoryDir := filepath.Join(workspace, codexTemplateMemoryStagingDir)
+	if err := os.MkdirAll(stagedMemoryDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stagedMemoryDir, "memory_summary.md"), []byte("staged memory must not upload\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, "skills", "custom"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, "skills", ".system", "openai-docs", "references"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "skills", "custom", "SKILL.md"), []byte("custom skill\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "skills", ".system", "openai-docs", "references", "internal.md"), []byte("system skill\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var uploadedArchive []byte
+	var created remoteCreateCodeRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/codes/upload_url":
+			if got, want := r.URL.Query().Get("current_user"), "alice"; got != want {
+				t.Errorf("upload current_user = %q, want %q", got, want)
+			}
+			if got, want := r.Header.Get("Authorization"), "Bearer access-token"; got != want {
+				t.Errorf("upload authorization = %q, want %q", got, want)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"url":      "http://" + r.Host + "/object-storage",
+				"uuid":     "package-uuid",
+				"formData": map[string]string{"key": "codes/package-uuid", "policy": "policy-value"},
+			}})
+		case "/object-storage":
+			if err := r.ParseMultipartForm(4 << 20); err != nil {
+				t.Errorf("ParseMultipartForm() error = %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if got, want := r.FormValue("key"), "codes/package-uuid"; got != want {
+				t.Errorf("upload key = %q, want %q", got, want)
+			}
+			file, _, err := r.FormFile("file")
+			if err != nil {
+				t.Errorf("FormFile() error = %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer file.Close()
+			uploadedArchive, err = io.ReadAll(file)
+			if err != nil {
+				t.Errorf("ReadAll(upload) error = %v", err)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/v1/codes":
+			if got, want := r.URL.Query().Get("current_user"), "alice"; got != want {
+				t.Errorf("create current_user = %q, want %q", got, want)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+				t.Errorf("Decode(create) error = %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"path": "alice/ReviewBot_2",
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "access-token")
+	store.username = "alice"
+	item, err := store.Publish(context.Background(), PublishSpec{
+		ID:             "legacy-internal-id",
+		Name:           "ReviewBot_2",
+		Description:    "Reviews changes",
+		RuntimeKind:    "codex",
+		RuntimeOptions: map[string]any{"execution_mode": "read_only", "memory_mode": "disabled"},
+		WorkspaceRef: WorkspaceRef{
+			Kind:             WorkspaceKindDir,
+			Path:             workspace,
+			MemoryPath:       memoryPath,
+			InstructionsPath: filepath.Join(workspace, "AGENTS.md"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if got, want := item.ID, "alice/ReviewBot_2"; got != want {
+		t.Fatalf("Publish().ID = %q, want %q", got, want)
+	}
+	if got, want := item.RuntimeOptions["execution_mode"], "read_only"; got != want {
+		t.Fatalf("Publish().RuntimeOptions[execution_mode] = %v, want %q", got, want)
+	}
+	if got, want := item.RuntimeOptions["memory_mode"], "disabled"; got != want {
+		t.Fatalf("Publish().RuntimeOptions[memory_mode] = %v, want %q", got, want)
+	}
+	if got, want := created.CodeFile, "package-uuid"; got != want {
+		t.Fatalf("create code_file = %q, want %q", got, want)
+	}
+	if got, want := created.Namespace, "alice"; got != want {
+		t.Fatalf("create namespace = %q, want %q", got, want)
+	}
+	if got, want := created.Type, "template"; got != want {
+		t.Fatalf("create type = %q, want %q", got, want)
+	}
+	if got, want := created.Name, "ReviewBot_2"; got != want {
+		t.Fatalf("create name = %q, want agent.toml name %q", got, want)
+	}
+	if got, want := created.Nickname, "ReviewBot_2"; got != want {
+		t.Fatalf("create nickname = %q, want agent.toml name %q", got, want)
+	}
+	if !created.Private {
+		t.Fatal("create private = false, want true")
+	}
+	if got, want := created.Description, "Reviews changes"; got != want {
+		t.Fatalf("create description = %q, want agent.toml description %q", got, want)
+	}
+
+	archive, err := zip.NewReader(bytes.NewReader(uploadedArchive), int64(len(uploadedArchive)))
+	if err != nil {
+		t.Fatalf("zip.NewReader() error = %v", err)
+	}
+	names := make(map[string]bool, len(archive.File))
+	for _, file := range archive.File {
+		names[file.Name] = true
+		content, err := readZipFile(file)
+		if err != nil {
+			t.Fatalf("readZipFile(%s) error = %v", file.Name, err)
+		}
+		if bytes.Contains(content, []byte("staged memory must not upload")) {
+			t.Errorf("uploaded archive leaked staged memory through %q", file.Name)
+		}
+		if file.Name == "agent.toml" {
+			manifest := content
+			if !strings.Contains(string(manifest), `schema_version = "agentfile/v1"`) {
+				t.Errorf("agent.toml missing schema_version: %s", manifest)
+			}
+			if !strings.Contains(string(manifest), `name = 'ReviewBot_2'`) {
+				t.Errorf("agent.toml missing template name: %s", manifest)
+			}
+			if !strings.Contains(string(manifest), `description = 'Reviews changes'`) {
+				t.Errorf("agent.toml missing template description: %s", manifest)
+			}
+			if !strings.Contains(string(manifest), "[runtime_options]") ||
+				!strings.Contains(string(manifest), "execution_mode = 'read_only'") ||
+				!strings.Contains(string(manifest), "memory_mode = 'disabled'") {
+				t.Errorf("agent.toml missing runtime options: %s", manifest)
+			}
+		}
+	}
+	for _, want := range []string{"agent.toml", "instructions/AGENTS.md"} {
+		if !names[want] {
+			t.Errorf("uploaded archive missing %q; names = %#v", want, names)
+		}
+	}
+	if !names["skills/custom/SKILL.md"] {
+		t.Errorf("uploaded archive missing custom skill; names = %#v", names)
+	}
+	for name := range names {
+		if strings.HasPrefix(name, "skills/.system/") {
+			t.Errorf("uploaded archive contains Codex system skill %q", name)
+		}
+		if name == "memories/memory_summary.md" {
+			t.Errorf("uploaded archive contains disabled Codex memory summary")
+		}
+		if strings.Contains(name, codexTemplateMemoryStagingDir) {
+			t.Errorf("uploaded archive contains reserved memory staging path %q", name)
+		}
+	}
+}
+
+func readZipFile(file *zip.File) ([]byte, error) {
+	reader, err := file.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+func TestBuildRemoteTemplateArchivePreservesDSHWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	instructionsPath := filepath.Join(workspace, "AGENTS.md")
+	if err := os.WriteFile(instructionsPath, []byte("# DSH template\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(AGENTS.md) error = %v", err)
+	}
+	skillsPath := filepath.Join(t.TempDir(), "skills")
+	if err := os.MkdirAll(filepath.Join(skillsPath, "review"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(skills) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsPath, "review", "SKILL.md"), []byte("# Review\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(SKILL.md) error = %v", err)
+	}
+
+	archive, err := buildRemoteTemplateArchive(PublishSpec{
+		Name:        "dsh-reviewer",
+		Description: "DSH review worker",
+		RuntimeKind: "dsh",
+		WorkspaceRef: WorkspaceRef{
+			Kind:             WorkspaceKindDir,
+			Path:             workspace,
+			InstructionsPath: instructionsPath,
+			SkillsPath:       skillsPath,
+		},
+		MCPServers: map[string]any{
+			"docs": map[string]any{"url": "https://mcp.example.test"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildRemoteTemplateArchive() error = %v", err)
+	}
+
+	reader, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatalf("zip.NewReader() error = %v", err)
+	}
+	files := make(map[string]string, len(reader.File))
+	for _, file := range reader.File {
+		content, err := readZipFile(file)
+		if err != nil {
+			t.Fatalf("readZipFile(%s) error = %v", file.Name, err)
+		}
+		files[file.Name] = string(content)
+	}
+	if !strings.Contains(files["agent.toml"], "runtime_kind = 'dsh'") {
+		t.Fatalf("agent.toml = %q, want DSH runtime kind", files["agent.toml"])
+	}
+	if got := files["instructions/AGENTS.md"]; got != "# DSH template\n" {
+		t.Fatalf("instructions/AGENTS.md = %q", got)
+	}
+	if got := files["skills/review/SKILL.md"]; got != "# Review\n" {
+		t.Fatalf("skills/review/SKILL.md = %q", got)
+	}
+	if got := files["mcps/mcp.json"]; !strings.Contains(got, "https://mcp.example.test") {
+		t.Fatalf("mcps/mcp.json = %q", got)
+	}
+}
+
+func TestRemoteStoreListMergesOrganizationAndAgentTemplatesByNamespacePath(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/organization/Agentic/codes":
+			if got, want := r.Header.Get("Authorization"), "Bearer access-token"; got != want {
+				t.Errorf("organization templates authorization = %q, want %q", got, want)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{
+				"name": "official-bot", "path": "Agentic/official-bot", "default_branch": "main",
+			}}})
+		case r.URL.Path == "/api/v1/agent/templates":
+			if got, want := r.URL.Query().Get("type"), "csgclaw"; got != want {
+				t.Errorf("agent template type = %q, want %q", got, want)
+			}
+			if got, want := r.Header.Get("Authorization"), "Bearer access-token"; got != want {
+				t.Errorf("agent templates authorization = %q, want %q", got, want)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+				{
+					"id": 1, "type": "csgclaw", "name": "alice/personal-bot",
+					"metadata": map[string]any{
+						"repo_path":    "alice/personal-bot",
+						"runtime_kind": "codex",
+						"sensitive_check": map[string]any{
+							"status": "Fail",
+							"failure_details": []map[string]any{{
+								"path": "README.md", "status": "Fail", "message": "checker result",
+							}},
+						},
+						"agent_file": map[string]any{
+							"name": "personal-bot", "role": "worker", "runtime_kind": "codex",
+						},
+					},
+				},
+				{"id": 2, "type": "langflow", "name": "Ignored", "metadata": map[string]any{"repo_path": "alice/ignored"}},
+			}})
+		case r.URL.Path == "/api/v1/codes/alice/personal-bot":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"name": "personal-bot", "path": "alice/personal-bot", "default_branch": "main",
+			}})
+		case strings.HasSuffix(r.URL.Path, "/blob/agent.toml"):
+			name := "Official Bot"
+			if strings.Contains(r.URL.Path, "personal-bot") {
+				name = "Personal Bot"
+			}
+			manifest := strings.Replace(remoteTestManifest, `name = "gitlab-assistant"`, `name = "`+name+`"`, 1)
+			writeRemoteBlob(t, w, "agent.toml", []byte(manifest))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	items, err := NewRemoteStore(srv.URL, "access-token").List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got, want := len(items), 2; got != want {
+		t.Fatalf("len(List()) = %d, want %d", got, want)
+	}
+	if got, want := items[0].ID, "Agentic/official-bot"; got != want {
+		t.Fatalf("List()[0].ID = %q, want %q", got, want)
+	}
+	if got, want := items[1].ID, "alice/personal-bot"; got != want {
+		t.Fatalf("List()[1].ID = %q, want %q", got, want)
+	}
+	if got := items[1].Metadata; got == nil || got.SensitiveCheck == nil {
+		t.Fatalf("List()[1].Metadata = %#v, want sensitive check from OpenCSG templates response", got)
+	} else if got.SensitiveCheck.Status != "Fail" || got.SensitiveCheck.FailureDetails[0].Message != "checker result" {
+		t.Fatalf("List()[1].Metadata.SensitiveCheck = %#v", got.SensitiveCheck)
+	}
+}
+
+func TestRemoteStorePublishRejectsRuntimeOutsideCommunityTemplateProtocol(t *testing.T) {
+	store := NewAuthenticatedRemoteStore("http://127.0.0.1", "access-token", "alice")
+	_, err := store.Publish(context.Background(), PublishSpec{
+		Name:        "openclaw-reviewer",
+		Description: "Reviews changes",
+		RuntimeKind: "openclaw",
+		Image:       "openclaw:latest",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot be published to the community") {
+		t.Fatalf("Publish() error = %v, want community runtime rejection", err)
+	}
+}
+
+func TestRemoteStorePublishUsesSharedCodeTemplateProtocolForCommunityRuntimes(t *testing.T) {
+	for _, runtimeKind := range []string{"codex", "dsh"} {
+		t.Run(runtimeKind, func(t *testing.T) {
+			var created remoteCreateCodeRequest
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/codes/upload_url":
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+						"url":      "http://" + r.Host + "/object-storage",
+						"uuid":     "package-uuid",
+						"formData": map[string]string{},
+					}})
+				case "/object-storage":
+					w.WriteHeader(http.StatusNoContent)
+				case "/api/v1/codes":
+					if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+						t.Fatalf("Decode(create) error = %v", err)
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+						"path": "alice/" + runtimeKind + "-reviewer",
+					}})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			item, err := NewAuthenticatedRemoteStore(srv.URL, "access-token", "alice").Publish(context.Background(), PublishSpec{
+				Name:        runtimeKind + "-reviewer",
+				Description: "Reviews changes",
+				RuntimeKind: runtimeKind,
+			})
+			if err != nil {
+				t.Fatalf("Publish() error = %v", err)
+			}
+			if got, want := created.Type, "template"; got != want {
+				t.Fatalf("create type = %q, want %q", got, want)
+			}
+			if got, want := created.Name, runtimeKind+"-reviewer"; got != want {
+				t.Fatalf("create name = %q, want %q", got, want)
+			}
+			if got, want := item.RuntimeKind, runtimeKind; got != want {
+				t.Fatalf("Publish().RuntimeKind = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestAppendRemoteTemplateRepositoriesPreservesMetadataFromDuplicate(t *testing.T) {
+	t.Parallel()
+
+	seen := make(map[string]int)
+	repositories := appendRemoteTemplateRepositories(nil, seen, []remoteCodeRepository{{Path: "alice/review-bot"}})
+	metadata := &TemplateMetadata{SensitiveCheck: &TemplateSensitiveCheck{
+		Status: "Fail",
+		FailureDetails: []TemplateSensitiveCheckFailure{{
+			Path: "README.md", Status: "Fail", Message: "sensitive content",
+		}},
+	}}
+	repositories = appendRemoteTemplateRepositories(repositories, seen, []remoteCodeRepository{{
+		Path: "alice/review-bot", Metadata: metadata,
+	}})
+
+	if got := repositories[0].Metadata; got != metadata {
+		t.Fatalf("duplicate metadata = %#v, want %#v", got, metadata)
+	}
+}
+
+func TestRemoteStoreListPaginatesAgentTemplates(t *testing.T) {
+	t.Parallel()
+
+	const total = remoteAgentTemplatesPerPage + 1
+	requestedPages := make([]string, 0, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/organization/Agentic/codes":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}})
+		case r.URL.Path == "/api/v1/agent/templates":
+			if got, want := r.URL.Query().Get("per"), "20"; got != want {
+				t.Errorf("agent templates per = %q, want %q", got, want)
+			}
+			page := r.URL.Query().Get("page")
+			requestedPages = append(requestedPages, page)
+			start, end := 0, remoteAgentTemplatesPerPage
+			if page == "2" {
+				start, end = remoteAgentTemplatesPerPage, total
+			}
+			data := make([]map[string]any, 0, end-start)
+			for i := start; i < end; i++ {
+				path := fmt.Sprintf("alice/template-%02d", i)
+				data = append(data, map[string]any{
+					"id": i + 1, "type": "csgclaw", "name": path,
+					"metadata": map[string]any{"repo_path": path},
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "total": total})
+		case strings.HasSuffix(r.URL.Path, "/blob/agent.toml"):
+			writeRemoteBlob(t, w, "agent.toml", []byte(remoteTestManifest))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/codes/alice/template-"):
+			path := strings.TrimPrefix(r.URL.Path, "/api/v1/codes/")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"name": path[strings.LastIndex(path, "/")+1:], "path": path, "default_branch": "main",
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	items, err := NewRemoteStore(srv.URL, "access-token").List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got, want := len(items), total; got != want {
+		t.Fatalf("len(List()) = %d, want %d", got, want)
+	}
+	if got, want := strings.Join(requestedPages, ","), "1,2"; got != want {
+		t.Fatalf("agent template pages = %q, want %q", got, want)
+	}
+}
+
+func TestRemoteStoreLargeFilePreview(t *testing.T) {
+	content := bytes.Repeat([]byte("x"), 4*1024*1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/codes/Agentic/large-preview":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"default_branch": "main"}})
+		case "/api/v1/codes/Agentic/large-preview/blob/instructions/AGENTS.md":
+			writeRemoteBlob(t, w, "instructions/AGENTS.md", content)
+		case "/api/v1/codes/Agentic/large-preview/blob/instructions/LARGE.md":
+			writeRemoteBlob(t, w, "instructions/LARGE.md", bytes.Repeat([]byte("x"), (32*1024*1024)+1))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	t.Run("file above former limit is returned in full", func(t *testing.T) {
+		store := NewRemoteStore(srv.URL, "")
+		file, err := store.ReadWorkspaceFile(context.Background(), "large-preview", "instructions/AGENTS.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if file.Size != int64(len(content)) || file.Truncated || file.Binary || file.Content != string(content) {
+			t.Fatalf("size=%d, truncated=%t, binary=%t, preview bytes=%d, want complete 4 MiB file", file.Size, file.Truncated, file.Binary, len(file.Content))
+		}
+	})
+
+	t.Run("large preview returns complete content", func(t *testing.T) {
+		store := NewRemoteStore(srv.URL, "")
+		file, err := store.ReadWorkspaceFile(context.Background(), "large-preview", "instructions/LARGE.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if file.Size != int64((32*1024*1024)+1) || file.Truncated || file.Binary || len(file.Content) != (32*1024*1024)+1 || strings.Trim(file.Content, "x") != "" {
+			t.Fatalf("size=%d, truncated=%t, binary=%t, preview bytes=%d, want complete preview", file.Size, file.Truncated, file.Binary, len(file.Content))
+		}
+	})
+
+	t.Run("preview ignores installation size limit", func(t *testing.T) {
+		store := NewRemoteStore(srv.URL, "")
+		store.maxWorkspace = int64(len(content) - 1)
+		file, err := store.ReadWorkspaceFile(context.Background(), "large-preview", "instructions/AGENTS.md")
+		if err != nil || file.Content != string(content) {
+			t.Fatalf("preview size=%d, error=%v", len(file.Content), err)
+		}
+		if _, err := store.fetchBlob(context.Background(), "Agentic/large-preview", "instructions/AGENTS.md", "main"); err == nil {
+			t.Fatal("installation must still enforce its size limit")
+		}
+
+	})
+}
+
+func TestRemoteStoreListGetAndFetchWorkspace(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/organization/Agentic/codes":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{{
+					"name":           "gitlab-assistant",
+					"nickname":       "gitlab-assistant",
+					"description":    "repository description",
+					"path":           "Agentic/gitlab-assistant",
+					"default_branch": "",
+					"updated_at":     "2026-06-25T02:00:02Z",
+				}},
+				"total": 1,
+			})
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"name":           "gitlab-assistant",
+					"path":           "Agentic/gitlab-assistant",
+					"default_branch": "main",
+				},
+			})
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/blob/agent.toml":
+			assertQueryValue(t, r.URL, "ref", "main")
+			writeRemoteBlob(t, w, "agent.toml", []byte(remoteTestManifest))
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/refs/main/tree/":
+			assertQueryValue(t, r.URL, "limit", "500")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"Files": []map[string]any{
+						{"name": "instructions", "type": "dir", "path": "instructions"},
+						{"name": "skills", "type": "dir", "path": "skills"},
+					},
+					"Cursor": "",
+				},
+			})
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/refs/main/tree/instructions":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"Files": []map[string]any{{"name": "AGENTS.md", "type": "file", "path": "instructions/AGENTS.md"}}, "Cursor": ""}})
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/refs/main/tree/skills":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"Files": []map[string]any{
+						{"name": "review.md", "type": "file", "path": "skills/review.md"},
+					},
+					"Cursor": "",
+				},
+			})
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/refs/main/tree/mcps":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"Files": []map[string]any{{"name": "mcp.json", "type": "file", "path": "mcps/mcp.json"}}, "Cursor": ""}})
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/refs/main/tree/memories":
+			http.NotFound(w, r)
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/blob/instructions/AGENTS.md":
+			writeRemoteBlob(t, w, "instructions/AGENTS.md", []byte("hello"))
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/blob/skills/review.md":
+			writeRemoteBlob(t, w, "skills/review.md", []byte("review"))
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/blob/mcps/mcp.json":
+			writeRemoteBlob(t, w, "mcps/mcp.json", []byte("{}"))
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/download_archive/refs/main":
+			if got, want := r.Header.Get("Accept"), "application/zip"; got != want {
+				t.Fatalf("Accept = %q, want %q", got, want)
+			}
+			writeRemoteArchive(t, w, "gitlab-assistant-main/", map[string]string{
+				"agent.toml":             remoteTestManifest,
+				"instructions/AGENTS.md": "hello",
+				"skills/review.md":       "review",
+				"mcps/mcp.json":          "{}",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "")
+	items, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got, want := len(items), 1; got != want {
+		t.Fatalf("len(List()) = %d, want %d", got, want)
+	}
+	if got, want := items[0].ID, "Agentic/gitlab-assistant"; got != want {
+		t.Fatalf("List()[0].ID = %q, want %q", got, want)
+	}
+	if got, want := items[0].RuntimeKind, "openclaw"; got != want {
+		t.Fatalf("List()[0].RuntimeKind = %q, want %q", got, want)
+	}
+
+	item, err := store.Get(context.Background(), "gitlab-assistant")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got, want := item.Description, "GitLab assistant"; got != want {
+		t.Fatalf("Get().Description = %q, want %q", got, want)
+	}
+	if got, want := item.Role, TemplateRoleWorker; got != want {
+		t.Fatalf("Get().Role = %q, want %q", got, want)
+	}
+	if got, want := item.ImageEnv[0].Name, "GITLAB_TOKEN"; got != want {
+		t.Fatalf("Get().ImageEnv[0].Name = %q, want %q", got, want)
+	}
+
+	listing, err := store.ListWorkspace(context.Background(), "gitlab-assistant", "")
+	if err != nil {
+		t.Fatalf("ListWorkspace() error = %v", err)
+	}
+	if got, want := len(listing.Entries), 2; got != want {
+		t.Fatalf("len(ListWorkspace().Entries) = %d, want %d", got, want)
+	}
+	if got, want := listing.Entries[0].Path, "instructions"; got != want {
+		t.Fatalf("ListWorkspace().Entries[0].Path = %q, want %q", got, want)
+	}
+
+	file, err := store.ReadWorkspaceFile(context.Background(), "gitlab-assistant", "instructions/AGENTS.md")
+	if err != nil {
+		t.Fatalf("ReadWorkspaceFile() error = %v", err)
+	}
+	if got, want := file.Content, "hello"; got != want {
+		t.Fatalf("ReadWorkspaceFile().Content = %q, want %q", got, want)
+	}
+
+	workspace, err := store.FetchWorkspace(context.Background(), "Agentic/gitlab-assistant")
+	if err != nil {
+		t.Fatalf("FetchWorkspace() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(workspace.Path) })
+
+	if got, want := workspace.Kind, WorkspaceKindDir; got != want {
+		t.Fatalf("FetchWorkspace().Kind = %q, want %q", got, want)
+	}
+	for name, want := range map[string]string{
+		"AGENTS.md":        "hello",
+		"skills/review.md": "review",
+	} {
+		data, err := os.ReadFile(filepath.Join(workspace.Path, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("read extracted %s: %v", name, err)
+		}
+		if got := string(data); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestRemoteStoreFetchWorkspaceSupportsLegacyLayoutAndEmptyMissingTree(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/codes/Agentic/feishu-assistant":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"default_branch": "main"}})
+		case "/api/v1/codes/Agentic/feishu-assistant/refs/main/tree/instructions":
+			w.WriteHeader(http.StatusOK)
+		case "/api/v1/codes/Agentic/feishu-assistant/refs/main/tree/workspace":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"Files": []map[string]any{
+					{"name": "skills", "type": "dir", "path": "workspace/skills"},
+					{"name": "AGENTS.md", "type": "file", "path": "workspace/AGENTS.md"},
+					{"name": "USER.md", "type": "file", "path": "workspace/USER.md"},
+				},
+				"Cursor": "",
+			}})
+		case "/api/v1/codes/Agentic/feishu-assistant/refs/main/tree/workspace/skills":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"Files":  []map[string]any{{"name": "feishu", "type": "dir", "path": "workspace/skills/feishu"}},
+				"Cursor": "",
+			}})
+		case "/api/v1/codes/Agentic/feishu-assistant/refs/main/tree/workspace/skills/feishu":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"Files":  []map[string]any{{"name": "SKILL.md", "type": "file", "path": "workspace/skills/feishu/SKILL.md"}},
+				"Cursor": "",
+			}})
+		case "/api/v1/codes/Agentic/feishu-assistant/blob/workspace/AGENTS.md":
+			writeRemoteBlob(t, w, "workspace/AGENTS.md", []byte("legacy instructions\n"))
+		case "/api/v1/codes/Agentic/feishu-assistant/blob/workspace/USER.md":
+			writeRemoteBlob(t, w, "workspace/USER.md", []byte("legacy user\n"))
+		case "/api/v1/codes/Agentic/feishu-assistant/blob/workspace/skills/feishu/SKILL.md":
+			writeRemoteBlob(t, w, "workspace/skills/feishu/SKILL.md", []byte("legacy skill\n"))
+		case "/api/v1/codes/Agentic/feishu-assistant/download_archive/refs/main":
+			writeRemoteArchive(t, w, "", map[string]string{
+				"agent.toml":                       remoteTestManifest,
+				"workspace/AGENTS.md":              "legacy instructions\n",
+				"workspace/USER.md":                "legacy user\n",
+				"workspace/skills/feishu/SKILL.md": "legacy skill\n",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "")
+	file, err := store.ReadWorkspaceFile(context.Background(), "feishu-assistant", "instructions/AGENTS.md")
+	if err != nil {
+		t.Fatalf("ReadWorkspaceFile() error = %v", err)
+	}
+	if got, want := file.Content, "legacy instructions\n"; got != want {
+		t.Fatalf("ReadWorkspaceFile().Content = %q, want %q", got, want)
+	}
+	workspace, err := store.FetchWorkspace(context.Background(), "feishu-assistant")
+	if err != nil {
+		t.Fatalf("FetchWorkspace() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(workspace.Path) })
+	if !workspace.Temporary {
+		t.Fatal("FetchWorkspace().Temporary = false, want true")
+	}
+	for name, want := range map[string]string{
+		"AGENTS.md":              "legacy instructions\n",
+		"USER.md":                "legacy user\n",
+		"skills/feishu/SKILL.md": "legacy skill\n",
+	} {
+		data, err := os.ReadFile(filepath.Join(workspace.Path, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", name, err)
+		}
+		if got := string(data); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestRemoteStoreFetchWorkspaceRestoresCodexMemorySummary(t *testing.T) {
+	t.Parallel()
+	const manifest = "name = 'codex-memory'\nruntime_kind = 'codex'\n[runtime_options]\nmemory_mode = 'enabled'\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/codes/Agentic/codex-memory":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"default_branch": "main"}})
+		case "/api/v1/codes/Agentic/codex-memory/download_archive/refs/main":
+			writeRemoteArchive(t, w, "codex-memory-main/", map[string]string{
+				"agent.toml":                 manifest,
+				"instructions/AGENTS.md":     "# Instructions\n",
+				"memories/memory_summary.md": "# Remote memory\n",
+				"skills/custom/SKILL.md":     "# Custom\n",
+				"mcps/mcp.json":              "{}\n",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	workspace, err := NewRemoteStore(srv.URL, "").FetchWorkspace(context.Background(), "Agentic/codex-memory")
+	if err != nil {
+		t.Fatalf("FetchWorkspace() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(workspace.Path) })
+	data, err := os.ReadFile(workspace.MemoryPath)
+	if err != nil {
+		t.Fatalf("ReadFile(MemoryPath) error = %v", err)
+	}
+	if got, want := string(data), "# Remote memory\n"; got != want {
+		t.Fatalf("memory summary = %q, want %q", got, want)
+	}
+}
+
+func TestRemoteStoreListSkipsInvalidRepositories(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/organization/Agentic/codes":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{
+					{
+						"name":           "gitlab-assistant",
+						"path":           "Agentic/gitlab-assistant",
+						"default_branch": "main",
+					},
+					{
+						"name":           "broken-manifest",
+						"path":           "Agentic/broken-manifest",
+						"default_branch": "main",
+					},
+					{
+						"name":           "other-namespace",
+						"path":           "Other/other-namespace",
+						"default_branch": "main",
+					},
+				},
+				"total": 3,
+			})
+		case r.URL.Path == "/api/v1/codes/Agentic/gitlab-assistant/blob/agent.toml":
+			writeRemoteBlob(t, w, "agent.toml", []byte(remoteTestManifest))
+		case r.URL.Path == "/api/v1/codes/Agentic/broken-manifest/blob/agent.toml":
+			writeRemoteBlob(t, w, "agent.toml", []byte("name = \"broken-manifest\"\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "")
+	items, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got, want := len(items), 1; got != want {
+		t.Fatalf("len(List()) = %d, want %d; items=%#v", got, want, items)
+	}
+	if got, want := items[0].ID, "Agentic/gitlab-assistant"; got != want {
+		t.Fatalf("List()[0].ID = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultStoreFactoryCreatesRemoteStore(t *testing.T) {
+	t.Parallel()
+
+	store, err := DefaultStoreFactory(config.HubRegistryConfig{
+		Kind:  RegistryKindRemote,
+		URL:   "https://hub.opencsg.com",
+		Token: "secret",
+	})
+	if err != nil {
+		t.Fatalf("DefaultStoreFactory() error = %v", err)
+	}
+	remote, ok := store.(*RemoteStore)
+	if !ok {
+		t.Fatalf("store type = %T, want *RemoteStore", store)
+	}
+	if got, want := remote.contentBaseURL, "https://hub.opencsg.com"; got != want {
+		t.Fatalf("content base URL = %q, want %q", got, want)
+	}
+}
+
+func TestRemoteStoreGetJSONRejectsOversizedResponse(t *testing.T) {
+	t.Parallel()
+
+	oversized := make([]byte, defaultRemoteMaxJSONBytes+1)
+	for i := range oversized {
+		oversized[i] = ' '
+	}
+	oversized[0] = '{'
+	oversized[len(oversized)-1] = '}'
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/organization/Agentic/codes" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(oversized)
+	}))
+	t.Cleanup(srv.Close)
+
+	store := NewRemoteStore(srv.URL, "")
+	_, err := store.List(context.Background())
+	if err == nil {
+		t.Fatal("List() error = nil, want oversized response error")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("List() error = %v, want response size limit message", err)
+	}
+}
+
+func TestDefaultStoreFactoryRemoteRequiresURL(t *testing.T) {
+	t.Parallel()
+
+	_, err := DefaultStoreFactory(config.HubRegistryConfig{Kind: RegistryKindRemote})
+	if !errors.Is(err, ErrRegistryURLRequired) {
+		t.Fatalf("DefaultStoreFactory() error = %v, want ErrRegistryURLRequired", err)
+	}
+}
+
+func writeRemoteBlob(t *testing.T, w http.ResponseWriter, name string, data []byte) {
+	t.Helper()
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"data": map[string]any{
+			"path":    name,
+			"content": base64.StdEncoding.EncodeToString(data),
+		},
+	}); err != nil {
+		t.Fatalf("encode blob response: %v", err)
+	}
+}
+
+func writeRemoteArchive(t *testing.T, w http.ResponseWriter, prefix string, files map[string]string) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/zip")
+	archive := zip.NewWriter(w)
+	for name, content := range files {
+		entry, err := archive.Create(prefix + name)
+		if err != nil {
+			t.Fatalf("create archive entry %q: %v", name, err)
+		}
+		if _, err := io.WriteString(entry, content); err != nil {
+			t.Fatalf("write archive entry %q: %v", name, err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatalf("close archive: %v", err)
+	}
+}
+
+func assertQueryValue(t *testing.T, values *url.URL, key, want string) {
+	t.Helper()
+	if got := values.Query().Get(key); got != want {
+		t.Fatalf("query %s = %q, want %q", key, got, want)
+	}
+}

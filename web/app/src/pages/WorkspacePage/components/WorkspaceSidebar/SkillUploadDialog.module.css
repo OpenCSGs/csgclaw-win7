@@ -1,0 +1,265 @@
+.dialog {
+  width: min(720px, calc(100vw - 32px));
+}
+
+.body {
+  display: grid;
+  gap: 16px;
+}
+
+.mode {
+  display: flex;
+  gap: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.modeTab {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  height: 32px;
+  padding: 0 4px 10px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--gray-500);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.modeTab:hover,
+.modeTab[aria-selected="true"] {
+  color: var(--brand-700);
+}
+
+.modeTab[aria-selected="true"] {
+  border-bottom-color: var(--brand-600);
+}
+
+.modeTab:focus-visible {
+  outline: 2px solid var(--brand-300);
+  outline-offset: -2px;
+}
+
+.dropzone {
+  width: 100%;
+  min-height: 154px;
+  padding: 22px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--field);
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  gap: 12px;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.dropzone:hover,
+.dropzone:focus-visible,
+.dragOver {
+  border-color: color-mix(in oklab, var(--primary) 55%, var(--line));
+  background: color-mix(in oklab, var(--primary) 7%, var(--field));
+  color: var(--primary-strong);
+  outline: none;
+}
+
+.dropzoneError {
+  border-color: var(--danger);
+}
+
+.uploadIcon {
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--primary) 10%, transparent);
+  color: var(--primary-strong);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.uploadCopy {
+  display: grid;
+  gap: 4px;
+}
+
+.uploadCopy strong {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 20px;
+}
+
+.uploadCopy small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.fileInput {
+  display: none;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.remotePanel {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.remoteSearch {
+  min-width: 0;
+  display: block;
+}
+
+.remoteList {
+  max-height: min(360px, 46dvh);
+  overflow-y: auto;
+  display: grid;
+  gap: 8px;
+  padding-right: 2px;
+}
+
+.remoteRow {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.remoteLink {
+  min-width: 0;
+  color: inherit;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+}
+
+.remoteLink:hover .remoteTitle,
+.remoteLink:focus-visible .remoteTitle {
+  color: var(--primary-strong);
+}
+
+.remoteLink:focus-visible {
+  outline: none;
+}
+
+.remoteIcon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--gray-50);
+  color: var(--primary-strong);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.remoteMain {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.remoteTitle {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 18px;
+}
+
+.remoteMeta {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.remoteState,
+.remoteListState {
+  min-height: 44px;
+  padding: 12px;
+  border-radius: var(--radius-lg);
+  background: var(--field);
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 18px;
+  text-align: center;
+}
+
+:global(:root[data-theme="dark"]) .dropzone,
+:global(:root[data-theme="dark"]) .remoteIcon,
+:global(:root[data-theme="dark"]) .remoteState,
+:global(:root[data-theme="dark"]) .remoteListState {
+  background: var(--panel-strong);
+}
+
+:global(:root[data-theme="dark"]) .remoteRow {
+  border-color: var(--line);
+  background: var(--surface);
+}
+
+.errorNotice {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 10px 13px;
+  border: 1px solid color-mix(in oklab, var(--warning-700) 30%, var(--line));
+  border-radius: 12px;
+  background: var(--warning-50);
+  color: var(--warning-700);
+  font-size: 13px;
+  font-weight: 680;
+  line-height: 18px;
+}
+
+:global(:root[data-theme="dark"]) .errorNotice {
+  border-color: color-mix(in oklab, var(--warning-700) 38%, var(--line));
+  background: color-mix(in oklab, var(--warning-700) 14%, transparent);
+  color: color-mix(in oklab, var(--warning-700) 78%, var(--text));
+}
+
+:global(:root[data-theme="dark"]) .modeTab {
+  color: #85888e;
+}
+
+:global(:root[data-theme="dark"]) .modeTab:hover,
+:global(:root[data-theme="dark"]) .modeTab[aria-selected="true"] {
+  color: var(--gray-300);
+}
+
+:global(:root[data-theme="dark"]) .modeTab[aria-selected="true"] {
+  border-bottom-color: var(--gray-300);
+}

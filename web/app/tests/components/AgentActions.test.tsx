@@ -1,0 +1,1863 @@
+import { createQueryWrapper } from "../helpers/queryClient";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useState } from "react";
+import { AgentDetailPane, AgentRow, AgentView, NotificationParticipantDetailPane } from "@/pages/AgentPage/components";
+import { agentToDraft, type AgentDraft } from "@/models/agents";
+import { AGENT_PROFILE_ACTIVE_TAB_STORAGE_KEY } from "@/shared/storage/keys";
+
+const labels: Record<string, string> = {
+  agentActivityTab: "Activity",
+  agentDelete: "Delete",
+  agentDeleteBoundChannels: "This agent is bound to {channels}.",
+  agentDeleteCascadeNote: "Deleting the agent will also disconnect it from those channels.",
+  agentDeleteConfirmMessage: 'Delete agent "{name}"?',
+  agentInstructions: "Instructions",
+  agentModel: "Model",
+  cancel: "Cancel",
+  editDescription: "Edit description",
+  editAgentName: "Edit name",
+  agentRecreate: "Recreate",
+  agentStart: "Start",
+  agentStop: "Stop",
+  agentUpgrade: "Upgrade",
+  agentMoreActions: "More",
+  agentSaveLocalTemplate: "Save as local template",
+  agentPublishCommunity: "Publish to community",
+  agentPublishCommunityTemplateOnly: "Publish template only",
+  agentPublishCommunityAndDeploy: "Publish and deploy",
+  agentPublishLoginRequired: "Sign in to OpenCSG before publishing a template.",
+  agentPublishTemplateTitle: "Publish agent template",
+  agentPublishTemplateLocalSubtitle: "Save locally",
+  agentPublishTemplateCommunitySubtitle: "Publish remotely",
+  agentPublishTemplateName: "Template name",
+  agentPublishTemplateNameHint: "Use letters, numbers, and underscores.",
+  agentPublishTemplateNameInvalid: "Invalid template name",
+  agentPublishLocalNameExists: "A local template with this name already exists.",
+  agentPublishTemplateDescription: "Template description",
+  agentPublishIncludeMemory: "Include agent memory",
+  agentPublishIncludeMemoryWarning: "Memory may contain private information.",
+  agentProfileSectionNavLabel: "Profile sections",
+  agentProfileTab: "Profile",
+  agentProfileSkillsTab: "Skills",
+  agentProfileMCPTab: "MCP",
+  agentAppsTab: "Connectors",
+  agentSaved: "Saved",
+  agentSaveChanges: "Save changes",
+  agentUpdateSave: "Save",
+  agentChannelsTitle: "Channels",
+  agentChannelsDescription: "Manage external channels.",
+  agentSkillAdd: "Add skill",
+  agentSkillAddSubtitle: "Candidates come from global skills.",
+  agentSkillAddEmpty: "No skills are available to add.",
+  agentDeleteSkill: "Delete",
+  agentDeleteSkillConfirmMessage: 'Delete skill "alpha" from this agent?',
+  agentMCPAdd: "Add MCP",
+  agentMCPAddSubtitle: "Candidates come from Hub.",
+  agentMCPAddEmpty: "No MCP servers are available to add.",
+  agentMCPEmpty: "No MCP servers installed yet.",
+  agentDeleteMCP: "Delete",
+  agentDeleteMCPConfirmMessage: 'Delete MCP server "{name}" from this agent?',
+  feishuChannelName: "Feishu",
+  feishuConnect: "Connect Feishu",
+  feishuReconnect: "Reconnect Feishu",
+  larkCLIInit: "Configure channel tool",
+  larkCLIInstallRequiredAction: "View installation steps",
+  larkCLIConfiguredAction: "Channel tool configured",
+  larkCLIReinit: "Configure channel tool again",
+  larkCLIInstallNodeTitle: "1. Prepare Node.js and npm",
+  larkCLIInstallNodeDescription: "Install Node.js LTS if npm is not already available.",
+  larkCLIInstallNodeLink: "Download Node.js LTS",
+  larkCLIInstallCommandTitle: "2. Install lark-cli",
+  larkCLIInstallCopyCommand: "Copy command",
+  larkCLIInstallCommandHint: "Run this in a terminal available to CSGClaw.",
+  larkCLIInstallNativeDescription: "Download a native binary instead.",
+  larkCLIInstallReleasesLink: "View native binaries",
+  larkCLIInstallRetryHint: "Detect it again after installation.",
+  larkCLIInstallDocsLink: "Official installation guide",
+  larkCLIRetryConfigure: "Detect and configure",
+  feishuDisconnect: "Disconnect Feishu",
+  feishuCompleteConnection: "Complete connection",
+  feishuPending: "Waiting",
+  feishuPendingDetail: "Waiting for Feishu authorization. CSGClaw will finish automatically.",
+  feishuConnected: "Connected",
+  feishuDisconnected: "Disconnected",
+  feishuOpenConnection: "Open Feishu",
+  openDM: "DM",
+  profileCompleteBadge: "Complete",
+  profileAdvanced: "Advanced",
+  profileFastMode: "Fast mode",
+  profileModel: "Model",
+  profileModelProvider: "Model provider",
+  profileModelSection: "Model",
+  profileProvider: "Provider",
+  profileReasoning: "Reasoning",
+  profileRequestOptions: "Request options",
+  profileRestartRequired: "Recreate required",
+  profileNotifierSection: "Notifications",
+  profileUpgradeRequired: "Upgrade required",
+  profileRuntimeKind: "Runtime",
+  rechargeAccount: "Recharge account",
+  profileRuntimeSection: "Runtime environment",
+  close: "Close",
+  profileMCPServers: "MCP Servers",
+  profileMCPServersHint: 'Enter MCP servers as {"server-name": {...}}.',
+  profileMCPServersHubHint: "Install MCP servers from Hub.",
+  profileMCPServersPlaceholder: '{\n  "context7": {}\n}',
+  profileMCPServersUseExample: "Use example",
+  profileMCPServersClear: "Clear servers",
+  profileMCPServersInvalidJSON: "Enter a valid JSON object.",
+  profileMCPServersObjectRequired: "MCP servers must be a JSON object.",
+  agentName: "Name",
+  agentDescription: "Description",
+  agentImage: "Image",
+};
+
+function t(key: string, params: Record<string, string | number> = {}): string {
+  return (labels[key] ?? key).replace(/\{(\w+)\}/g, (_, name: string) => `${params[name] ?? ""}`);
+}
+
+const worker = {
+  id: "worker-1",
+  name: "Worker",
+  description: "Agent description",
+  role: "worker",
+  runtime_kind: "openclaw_sandbox",
+  status: "running",
+  provider: "api",
+  model_id: "gpt-test",
+};
+
+describe("agent action visibility", () => {
+  beforeEach(() => {
+    window.localStorage.removeItem(AGENT_PROFILE_ACTIVE_TAB_STORAGE_KEY);
+  });
+
+  it("allows OpenClaw agents to save local templates but not publish to the community", async () => {
+    const user = userEvent.setup();
+    const onPublish = vi.fn().mockResolvedValue(true);
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        busyKey=""
+        draft={null}
+        models={[]}
+        onDelete={vi.fn()}
+        onDraftChange={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onPublish={onPublish}
+        onRecreate={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "More" }));
+    const saveLocal = screen.getByRole("menuitem", { name: "Save as local template" });
+    expect(saveLocal).not.toHaveAttribute("aria-disabled", "true");
+    await user.click(saveLocal);
+    expect(screen.getByRole("dialog", { name: "Publish agent template" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Template name" })).toHaveValue("Worker");
+    expect(screen.getByRole("textbox", { name: "Template description" })).toHaveValue("Agent description");
+    expect(screen.getByRole("checkbox", { name: "Include agent memory" })).not.toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Save as local template" }));
+    expect(onPublish).toHaveBeenCalledWith("local", "Worker", "Agent description", false);
+    expect(screen.queryByRole("dialog", { name: "Publish agent template" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "More" }));
+    await user.click(screen.getByRole("menuitem", { name: "Save as local template" }));
+    await user.click(screen.getByRole("checkbox", { name: "Include agent memory" }));
+    await user.click(screen.getByRole("button", { name: "Save as local template" }));
+    expect(onPublish).toHaveBeenLastCalledWith("local", "Worker", "Agent description", true);
+
+    await user.click(screen.getByRole("button", { name: "More" }));
+    expect(screen.queryByRole("menuitem", { name: "Publish to community" })).not.toBeInTheDocument();
+  });
+
+  it.each(["codex", "dsh"] as const)(
+    "allows %s agents to publish locally and to the community",
+    async (runtimeKind) => {
+      const user = userEvent.setup();
+      const onPublish = vi.fn().mockResolvedValue(true);
+      render(
+        <AgentDetailPane
+          item={{ ...worker, runtime_kind: runtimeKind }}
+          t={t}
+          busyKey=""
+          draft={null}
+          models={[]}
+          onDelete={vi.fn()}
+          onDraftChange={vi.fn()}
+          onInvite={vi.fn()}
+          onOpenDM={vi.fn()}
+          onPublish={onPublish}
+          onRecreate={vi.fn()}
+          onStart={vi.fn()}
+          onStop={vi.fn()}
+        />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "More" }));
+      expect(screen.getByRole("menuitem", { name: "Save as local template" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Publish template only" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Publish and deploy" })).not.toBeInTheDocument();
+      await user.click(screen.getByRole("menuitem", { name: "Publish to community" }));
+      expect(screen.getByRole("button", { name: "Publish template only" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Publish and deploy" })).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Publish template only" }));
+
+      expect(onPublish).toHaveBeenCalledWith("official", "Worker", "Agent description", false);
+
+      await user.click(screen.getByRole("button", { name: "More" }));
+      await user.click(screen.getByRole("menuitem", { name: "Publish to community" }));
+      const includeMemory = screen.queryByRole("checkbox", { name: "Include agent memory" });
+      if (runtimeKind === "codex") {
+        expect(includeMemory).toBeInTheDocument();
+        await user.click(includeMemory!);
+      } else {
+        expect(includeMemory).not.toBeInTheDocument();
+      }
+      await user.click(screen.getByRole("button", { name: "Publish and deploy" }));
+      expect(onPublish).toHaveBeenCalledWith("official_deploy", "Worker", "Agent description", runtimeKind === "codex");
+    },
+  );
+
+  it.each([
+    { id: "manager-by-role", role: "manager" },
+    { id: "u-manager", role: "worker" },
+  ])("hides the empty More menu for manager $id", (identity) => {
+    render(
+      <AgentDetailPane
+        item={{ ...worker, ...identity, name: "manager", runtime_kind: "codex" }}
+        t={t}
+        busyKey=""
+        draft={null}
+        models={[]}
+        onDelete={vi.fn()}
+        onDraftChange={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onPublish={vi.fn()}
+        onRecreate={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "More" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Recreate" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Save as local template" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Publish to community" })).not.toBeInTheDocument();
+  });
+
+  it("requires sign-in for Codex community publishing without blocking local templates", async () => {
+    const user = userEvent.setup();
+    render(
+      <AgentDetailPane
+        item={{ ...worker, runtime_kind: "codex" }}
+        t={t}
+        busyKey=""
+        draft={null}
+        models={[]}
+        publishDisabled
+        onDelete={vi.fn()}
+        onDraftChange={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onPublish={vi.fn()}
+        onRecreate={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "More" }));
+    expect(screen.getByRole("menuitem", { name: "Save as local template" })).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    const publishCommunity = screen.getByRole("menuitem", { name: "Publish to community" });
+    expect(publishCommunity).toHaveAttribute("aria-disabled", "true");
+    expect(publishCommunity).toHaveAttribute("title", "Sign in to OpenCSG before publishing a template.");
+  });
+
+  it("rejects an invalid template name before publishing", async () => {
+    const user = userEvent.setup();
+    const onPublish = vi.fn().mockResolvedValue(true);
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        busyKey=""
+        draft={null}
+        models={[]}
+        onDelete={vi.fn()}
+        onDraftChange={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onPublish={onPublish}
+        onRecreate={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "More" }));
+    await user.click(screen.getByRole("menuitem", { name: "Save as local template" }));
+    const nameInput = screen.getByRole("textbox", { name: "Template name" });
+    expect(nameInput).toHaveAttribute("maxlength", "24");
+    await user.clear(nameInput);
+    await user.type(nameInput, "2-invalid");
+    await user.click(screen.getByRole("button", { name: "Save as local template" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Invalid template name");
+    expect(onPublish).not.toHaveBeenCalled();
+
+    await user.clear(nameInput);
+    await user.type(nameInput, "review-bot_2");
+    await user.click(screen.getByRole("button", { name: "Save as local template" }));
+    expect(onPublish).toHaveBeenCalledWith("local", "review-bot_2", "Agent description", false);
+  });
+
+  it("keeps the publish dialog open and shows duplicate local template errors", async () => {
+    const user = userEvent.setup();
+    const onPublish = vi.fn().mockResolvedValue(false);
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        busyKey=""
+        draft={null}
+        models={[]}
+        publishError={t("agentPublishLocalNameExists")}
+        onDelete={vi.fn()}
+        onDraftChange={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onPublish={onPublish}
+        onRecreate={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "More" }));
+    await user.click(screen.getByRole("menuitem", { name: "Save as local template" }));
+    await user.click(screen.getByRole("button", { name: "Save as local template" }));
+
+    expect(screen.getByRole("dialog", { name: "Publish agent template" })).toBeInTheDocument();
+    expect(screen.getByText("A local template with this name already exists.")).toBeInTheDocument();
+  });
+
+  it("shows a recreate warning when backend marks an agent restart required", () => {
+    const onUpgrade = vi.fn();
+    render(
+      <AgentRow
+        item={{ ...worker, env_restart_required: true }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        onEdit={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={onUpgrade}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Recreate required")).toBeInTheDocument();
+    expect(screen.getByText("Complete")).toHaveClass("ready");
+    expect(screen.queryByRole("button", { name: "Upgrade", hidden: true })).not.toBeInTheDocument();
+  });
+
+  it("shows an upgrade warning when only the agent image is outdated", () => {
+    render(
+      <AgentRow
+        item={{ ...worker, image_upgrade_required: true }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        onEdit={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Upgrade required")).toBeInTheDocument();
+    expect(screen.queryByText("Recreate required")).not.toBeInTheDocument();
+  });
+
+  it("shows upgrade and recreate for outdated worker rows even when lifecycle actions are hidden", async () => {
+    const user = userEvent.setup();
+    const onUpgrade = vi.fn();
+    render(
+      <AgentRow
+        item={{ ...worker, image_upgrade_required: true }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        onEdit={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={onUpgrade}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Upgrade", hidden: true }));
+    expect(onUpgrade).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }));
+    expect(screen.getByRole("button", { name: "Recreate", hidden: true })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+  });
+
+  it("详情页保留升级操作", async () => {
+    const user = userEvent.setup();
+    const onUpgrade = vi.fn();
+    render(
+      <AgentDetailPane
+        item={{ ...worker, image_upgrade_required: true }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={null}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={onUpgrade}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Upgrade" }));
+    expect(onUpgrade).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }));
+    await user.click(screen.getByRole("button", { name: "More" }));
+    expect(screen.queryByRole("menuitem", { name: "Recreate" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Upgrade" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+  });
+
+  it("shows the recharge action beside an Agent page save error", () => {
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={null}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError="Insufficient balance"
+        saveBillingURL="https://opencsg-stg.com/settings/billing"
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("link", { name: "Recharge account" })).toHaveAttribute(
+      "href",
+      "https://opencsg-stg.com/settings/billing",
+    );
+    expect(screen.getByRole("link", { name: "Recharge account" })).toHaveAttribute("target", "_blank");
+    expect(screen.getByRole("link", { name: "Recharge account" })).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("keeps the agent name compact until entering edit mode", async () => {
+    const user = userEvent.setup();
+    const savedDraft = agentToDraft(worker);
+    const onDraftChange = vi.fn();
+
+    function TestPane() {
+      const [draft, setDraft] = useState<AgentDraft>(savedDraft);
+      return (
+        <AgentDetailPane
+          item={worker}
+          t={t}
+          activeRoom={null}
+          busyKey=""
+          error=""
+          draft={draft}
+          savedDraft={savedDraft}
+          models={[]}
+          modelBusy={false}
+          saving={false}
+          publishBusy={false}
+          saveError=""
+          authStatuses={{}}
+          authBusyProvider=""
+          notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+          onDraftChange={(nextDraft) => {
+            onDraftChange(nextDraft);
+            setDraft(nextDraft);
+          }}
+          onSave={vi.fn()}
+          onPublish={vi.fn()}
+          onProviderLogin={vi.fn()}
+          onStart={vi.fn()}
+          onStop={vi.fn()}
+          onRecreate={vi.fn()}
+          onUpgrade={vi.fn()}
+          onDelete={vi.fn()}
+          onInvite={vi.fn()}
+          onOpenDM={vi.fn()}
+        />
+      );
+    }
+
+    render(<TestPane />);
+
+    expect(screen.queryByRole("textbox", { name: "Name" })).not.toBeInTheDocument();
+    const nameTrigger = screen.getByRole("button", { name: "Edit name" });
+    expect(nameTrigger).toHaveTextContent("Worker");
+
+    await user.click(nameTrigger);
+
+    const nameInput = screen.getByRole("textbox", { name: "Name" });
+    expect(nameInput).toHaveFocus();
+    expect(nameInput).toHaveValue("Worker");
+
+    await user.clear(nameInput);
+    await user.type(nameInput, "测试工程师");
+
+    expect(onDraftChange).toHaveBeenLastCalledWith(expect.objectContaining({ name: "测试工程师" }));
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeInTheDocument();
+
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Edit name" })).toHaveTextContent("测试工程师");
+  });
+
+  it("keeps the provider dropdown below its trigger", async () => {
+    const user = userEvent.setup();
+    const draft = {
+      ...agentToDraft(worker),
+      model_provider_id: "codex",
+      model_id: "gpt-test",
+    };
+
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        modelOptions={[
+          {
+            value: "codex.gpt-test",
+            label: "Codex / gpt-test",
+            providerID: "codex",
+            providerDisplayName: "Codex",
+            providerAvatar: "model-providers/codex.svg",
+            modelID: "gpt-test",
+          },
+        ]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "Model provider" }));
+
+    expect(screen.getByRole("listbox")).toHaveAttribute("data-side", "bottom");
+  });
+
+  it("renders the builtin manager name as fixed text in edit mode", () => {
+    const manager = {
+      ...worker,
+      id: "agent-manager",
+      name: "manager",
+      role: "manager",
+      runtime_kind: "codex",
+      runtime: {
+        option_schemas: [
+          {
+            key: "local_workspace_dir",
+            path: "local_workspace_dir",
+            label: "Local Workspace Dir",
+            type: "directory",
+          },
+        ],
+      },
+    };
+    const draft = agentToDraft(manager);
+
+    render(
+      <AgentDetailPane
+        item={manager}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "manager" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit name" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Name" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit description" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Local Workspace Dir")).not.toBeInTheDocument();
+  });
+
+  it("shows Feishu connect and reconnect controls in the agent detail channels section", async () => {
+    const user = userEvent.setup();
+    const onStartFeishuConnect = vi.fn();
+    const onDisconnectFeishu = vi.fn();
+    const draft = agentToDraft(worker);
+    const { rerender } = render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onStartFeishuConnect={onStartFeishuConnect}
+        onFinalizeFeishuConnect={vi.fn()}
+        onDisconnectFeishu={onDisconnectFeishu}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Channels" }));
+    expect(screen.getByRole("region", { name: "Channels" })).toBeInTheDocument();
+    expect(screen.getByText("Manage external channels.")).toBeInTheDocument();
+    expect(document.querySelector(".agent-channel-icon img")).toHaveAttribute("src", "icons/feishu.png");
+    expect(screen.getByText("Disconnected")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Configure channel tool" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Disconnect Feishu" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Connect Feishu" }));
+    expect(onStartFeishuConnect).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }));
+
+    rerender(
+      <AgentDetailPane
+        item={{
+          ...worker,
+          lark_cli: {
+            available: true,
+            bound: true,
+            state: "bound",
+          },
+          participants: [
+            {
+              agent_id: worker.id,
+              channel: "feishu",
+              channel_user_kind: "app_id",
+              id: "worker-1",
+              type: "agent",
+            },
+          ],
+        }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onStartFeishuConnect={onStartFeishuConnect}
+        onFinalizeFeishuConnect={vi.fn()}
+        onDisconnectFeishu={onDisconnectFeishu}
+        notice="Feishu connection configured."
+        noticeTone="success"
+      />,
+    );
+
+    expect(screen.getByText("Connected")).toHaveClass("connected");
+    expect(screen.getByText("Feishu connection configured.").closest(".form-warning")).toHaveClass("success");
+    expect(screen.getByRole("button", { name: "Reconnect Feishu" })).toBeInTheDocument();
+    const channelActionButtons = Array.from(document.querySelectorAll(".agent-channel-actions .btn"));
+    expect(channelActionButtons.map((button) => button.textContent?.trim())).toEqual([
+      "Reconnect Feishu",
+      "Channel tool configured",
+      "Disconnect Feishu",
+    ]);
+    const disconnectButton = screen.getByRole("button", { name: "Disconnect Feishu" });
+    expect(disconnectButton).toHaveClass("btn-outline-danger");
+    await user.click(disconnectButton);
+    expect(onDisconnectFeishu).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }));
+  });
+
+  it("shows user-managed lark-cli installation guidance and retries configuration on demand", async () => {
+    const user = userEvent.setup();
+    const onDismissLarkCLIDialog = vi.fn();
+    const onInitLarkCLI = vi.fn();
+    const onShowLarkCLIInstall = vi.fn();
+    const unavailableWorker = {
+      ...worker,
+      lark_cli: {
+        available: false,
+        bound: false,
+        state: "unavailable",
+      },
+      participants: [
+        {
+          agent_id: worker.id,
+          channel: "feishu",
+          channel_user_kind: "app_id",
+          id: "worker-feishu",
+          type: "agent",
+        },
+      ],
+    };
+    const draft = agentToDraft(unavailableWorker);
+    const paneProps = {
+      activeRoom: null,
+      authBusyProvider: "",
+      authStatuses: {},
+      busyKey: "",
+      draft,
+      error: "",
+      item: unavailableWorker,
+      modelBusy: false,
+      models: [],
+      notifierWebhookPublicOrigin: "http://127.0.0.1:18080",
+      onDelete: vi.fn(),
+      onDisconnectFeishu: vi.fn(),
+      onDismissLarkCLIDialog,
+      onDraftChange: vi.fn(),
+      onInitLarkCLI,
+      onInvite: vi.fn(),
+      onOpenDM: vi.fn(),
+      onProviderLogin: vi.fn(),
+      onPublish: vi.fn(),
+      onRecreate: vi.fn(),
+      onSave: vi.fn(),
+      onShowLarkCLIInstall,
+      onStart: vi.fn(),
+      onStartFeishuConnect: vi.fn(),
+      onStop: vi.fn(),
+      onUpgrade: vi.fn(),
+      publishBusy: false,
+      saveError: "",
+      savedDraft: draft,
+      saving: false,
+      t,
+    };
+    const { rerender } = render(<AgentDetailPane {...paneProps} />);
+
+    await user.click(screen.getByRole("button", { name: "Channels" }));
+    await user.click(screen.getByRole("button", { name: "View installation steps" }));
+    expect(onShowLarkCLIInstall).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }));
+    expect(onInitLarkCLI).not.toHaveBeenCalled();
+
+    rerender(
+      <AgentDetailPane
+        {...paneProps}
+        larkCLIDialog={{
+          kind: "install",
+          title: "Install the Feishu channel tool",
+          message: "CSGClaw does not download or upgrade lark-cli automatically.",
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("dialog", { name: "Install the Feishu channel tool" })).toBeInTheDocument();
+    expect(screen.getByText("npm install -g @larksuite/cli@latest")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Download Node.js LTS" })).toHaveAttribute(
+      "href",
+      "https://nodejs.org/en/download",
+    );
+    expect(screen.getByRole("link", { name: "View native binaries" })).toHaveAttribute(
+      "href",
+      "https://github.com/larksuite/cli/releases/latest",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Detect and configure" }));
+    expect(onDismissLarkCLIDialog).toHaveBeenCalledOnce();
+    expect(onInitLarkCLI).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }));
+  });
+
+  it("shows pending Feishu authorization without requiring a manual completion action", async () => {
+    const user = userEvent.setup();
+    const draft = agentToDraft(worker);
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        feishuPendingRegistration={{
+          connect_url: "https://feishu.example/connect",
+          registration_id: "reg-worker",
+          status: "pending",
+        }}
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onStartFeishuConnect={vi.fn()}
+        onFinalizeFeishuConnect={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Channels" }));
+    expect(screen.getByText("Waiting")).toBeInTheDocument();
+    expect(
+      screen.getByText("Waiting for Feishu authorization. CSGClaw will finish automatically."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Feishu" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Complete connection" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Configure channel tool" })).not.toBeInTheDocument();
+  });
+
+  it("shows connected Feishu status while a reconnect authorization is pending", async () => {
+    const user = userEvent.setup();
+    const connectedWorker = {
+      ...worker,
+      participants: [
+        {
+          agent_id: worker.id,
+          channel: "feishu",
+          channel_user_kind: "app_id",
+          id: "worker-feishu",
+          type: "agent",
+        },
+      ],
+    };
+    const draft = agentToDraft(connectedWorker);
+    render(
+      <AgentView
+        item={connectedWorker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        feishuPendingRegistration={{
+          connect_url: "https://feishu.example/connect",
+          registration_id: "reg-worker",
+          status: "pending",
+        }}
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onStartFeishuConnect={vi.fn()}
+        onFinalizeFeishuConnect={vi.fn()}
+        onDisconnectFeishu={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Channels" }));
+    expect(screen.getByText("Connected")).toBeInTheDocument();
+    expect(
+      screen.getByText("Waiting for Feishu authorization. CSGClaw will finish automatically."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Feishu" })).toBeInTheDocument();
+  });
+
+  it("hides upgrade action in worker detail panes when only recreate is required", () => {
+    render(
+      <AgentDetailPane
+        item={{ ...worker, env_restart_required: true }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={null}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Upgrade" })).not.toBeInTheDocument();
+    expect(screen.getByText("Recreate required")).toBeInTheDocument();
+  });
+
+  it("prints a temporary manager setup notice in detail panes", () => {
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        notice="Create manager first"
+        draft={null}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Create manager first");
+  });
+
+  it("shows upgrade required in worker detail panes when only the agent image is outdated", () => {
+    render(
+      <AgentDetailPane
+        item={{ ...worker, image_upgrade_required: true }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={null}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Upgrade required")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Upgrade" })).toBeInTheDocument();
+    expect(screen.queryByText("Recreate required")).not.toBeInTheDocument();
+  });
+
+  it("hides upgrade controls for codex agents without images", () => {
+    render(
+      <AgentDetailPane
+        item={{ ...worker, runtime_kind: "codex", image_upgrade_required: true }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={null}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("Upgrade required")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Upgrade" })).not.toBeInTheDocument();
+  });
+
+  it("通知 Agent 详情页保留删除操作", async () => {
+    const user = userEvent.setup();
+    const notifier = {
+      ...worker,
+      id: "notifier-1",
+      name: "Notifier",
+      runtime_kind: "notifier",
+      profile_complete: true,
+      runtime_options: {},
+    };
+    render(
+      <AgentDetailPane
+        item={notifier}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={agentToDraft(notifier)}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "More" }));
+    expect(screen.getByRole("menuitem", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Recreate" })).not.toBeInTheDocument();
+  });
+
+  it("keeps header description compact until entering edit mode and removes duplicate basics fields", async () => {
+    const user = userEvent.setup();
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={agentToDraft(worker)}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Edit name" })).toHaveTextContent("Worker");
+    expect(screen.queryByDisplayValue("Agent description")).not.toBeInTheDocument();
+    const descriptionTrigger = screen.getByRole("button", { name: "Edit description" });
+    expect(descriptionTrigger).toHaveTextContent("Agent description");
+    expect(screen.queryByText("Description")).not.toBeInTheDocument();
+
+    await user.click(descriptionTrigger);
+    const descriptionInput = screen.getByDisplayValue("Agent description");
+    expect(descriptionInput).toBeInTheDocument();
+    expect(descriptionInput.tagName).toBe("TEXTAREA");
+  });
+
+  it("shows model settings in Profile and instructions in their own tab", async () => {
+    const user = userEvent.setup();
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={{ ...agentToDraft(worker), instructions: "reply in Chinese" }}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    const navigation = screen.getByRole("navigation", { name: "Profile sections" });
+    expect(within(navigation).getByRole("button", { name: "Profile" })).toHaveAttribute("aria-current", "location");
+    expect(screen.getByText("Model provider")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("reply in Chinese")).not.toBeInTheDocument();
+
+    await user.click(within(navigation).getByRole("button", { name: "Instructions" }));
+
+    const instructionsEditor = screen.getByDisplayValue("reply in Chinese");
+    expect(instructionsEditor).toHaveClass("agent-instructions-editor");
+    expect(instructionsEditor.closest(".agent-page-editor")).toHaveClass("agent-page-editor-instructions");
+    expect(instructionsEditor.closest(".agent-profile-scroll-region")).toHaveClass(
+      "agent-profile-scroll-region-instructions",
+    );
+    expect(screen.queryByText("Provider")).not.toBeInTheDocument();
+  });
+
+  it("does not show the image field in the merged agent profile runtime section", () => {
+    const image = "opencsg-registry.cn-beijing.cr.aliyuncs.com/opencsghq/picoclaw:2026.6.8";
+    const { container } = render(
+      <AgentDetailPane
+        item={{
+          ...worker,
+          image,
+        }}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={agentToDraft({
+          ...worker,
+          image,
+        })}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector("#agent-profile-runtime")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Image")).not.toBeInTheDocument();
+  });
+
+  it("installs MCP servers from hub candidates in the detail MCP tab", async () => {
+    const user = userEvent.setup();
+    const onInstallMCPServers = vi.fn(() => true);
+    const onDeleteMCPServer = vi.fn(() => true);
+    const item = {
+      ...worker,
+      runtime_kind: "openclaw_sandbox",
+      runtime_options: {
+        local_workspace_dir: "/tmp/project",
+      },
+      mcpServers: {
+        existing: {
+          command: "node",
+        },
+      },
+    };
+    const existingMCP = {
+      name: "existing",
+      config: {
+        command: "node",
+      },
+      description: "node",
+    };
+    const context7MCP = {
+      name: "context7",
+      config: {
+        command: "npx",
+      },
+      description: "npx",
+    };
+
+    render(
+      <AgentDetailPane
+        item={item}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={agentToDraft(item)}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        workspaceSupported
+        mcpServers={[existingMCP]}
+        mcpCandidates={[context7MCP]}
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onInstallMCPServers={onInstallMCPServers}
+        onDeleteMCPServer={onDeleteMCPServer}
+      />,
+      { wrapper: createQueryWrapper().wrapper },
+    );
+
+    expect(screen.queryByLabelText("MCP Servers")).not.toBeInTheDocument();
+    const navigation = screen.getByRole("navigation", { name: "Profile sections" });
+    expect(
+      within(navigation)
+        .getAllByRole("button")
+        .map((button) => button.textContent),
+    ).toEqual(["Profile", "Instructions", "Skills0", "Connectors", "Channels"]);
+
+    await user.click(within(navigation).getByRole("button", { name: "Connectors" }));
+
+    expect(screen.getByText("existing")).toBeInTheDocument();
+    expect(screen.getByText("node")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Add MCP" }));
+    await user.click(screen.getByLabelText(/context7/));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Add MCP" }));
+
+    expect(onInstallMCPServers).toHaveBeenCalledWith(["context7"]);
+
+    const existingCard = screen.getByText("existing").closest("article");
+    expect(existingCard).not.toBeNull();
+    await user.click(within(existingCard as HTMLElement).getByRole("button", { name: "existingnode" }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Delete" })).getByRole("button", { name: "Delete" }));
+
+    expect(onDeleteMCPServer).toHaveBeenCalledWith(existingMCP);
+  });
+
+  it("keeps agent MCP server management separate from the profile editor", async () => {
+    const user = userEvent.setup();
+    const item = {
+      ...worker,
+      runtime_kind: "openclaw_sandbox",
+      runtime_options: {},
+      mcpServers: {
+        existing: {
+          command: "node",
+        },
+      },
+    };
+    const draft = agentToDraft(item);
+
+    render(
+      <AgentDetailPane
+        item={item}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        workspaceSupported
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    const navigation = screen.getByRole("navigation", { name: "Profile sections" });
+    await user.click(within(navigation).getByRole("button", { name: "Connectors" }));
+
+    expect(screen.queryByLabelText("MCP Servers")).not.toBeInTheDocument();
+    expect(screen.getByText("No MCP servers installed yet.")).toBeInTheDocument();
+    expect(screen.queryByText("Enter a valid JSON object.")).not.toBeInTheDocument();
+
+    await user.click(within(navigation).getByRole("button", { name: "Profile" }));
+    expect(screen.getByText("Saved")).toBeInTheDocument();
+
+    await user.click(within(navigation).getByRole("button", { name: "Connectors" }));
+    expect(screen.queryByLabelText("MCP Servers")).not.toBeInTheDocument();
+  });
+
+  it("shows a saved status instead of a save button when the draft is unchanged", () => {
+    const draft = agentToDraft(worker);
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Saved");
+    expect(screen.queryByRole("button", { name: "Save changes" })).not.toBeInTheDocument();
+  });
+
+  it("opens an add-skill dialog with only skills that are not already installed", async () => {
+    const user = userEvent.setup();
+    const onAddSkills = vi.fn().mockResolvedValue(true);
+    const draft = agentToDraft(worker);
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        workspaceSupported
+        skills={[{ name: "alpha", description: "Alpha installed" }]}
+        skillCandidates={[
+          { name: "beta", description: "Beta candidate" },
+          { name: "gamma", description: "Gamma candidate" },
+        ]}
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onAddSkills={onAddSkills}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /^skills/i }));
+    await user.click(screen.getByRole("button", { name: "Add skill" }));
+    expect(screen.getByText("Candidates come from global skills.")).toBeInTheDocument();
+    expect(screen.getByText("Beta candidate")).toBeInTheDocument();
+    expect(screen.getByText("Gamma candidate")).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /alpha/i })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: /beta/i }));
+    const addButtons = screen.getAllByRole("button", { name: "Add skill" });
+    await user.click(addButtons[addButtons.length - 1]);
+
+    expect(onAddSkills).toHaveBeenCalledWith(["beta"]);
+    expect(screen.queryByText("Candidates come from global skills.")).not.toBeInTheDocument();
+  });
+
+  it("shows a confirmation dialog before deleting an installed skill", async () => {
+    const user = userEvent.setup();
+    const onDeleteSkill = vi.fn().mockResolvedValue(true);
+    const draft = agentToDraft(worker);
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        workspaceSupported
+        skills={[{ name: "alpha", description: "Alpha installed" }]}
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+        onDeleteSkill={onDeleteSkill}
+      />,
+      { wrapper: createQueryWrapper().wrapper },
+    );
+
+    await user.click(screen.getByRole("button", { name: /^skills/i }));
+    await user.click(screen.getByRole("button", { name: /alpha.*Alpha installed/ }));
+    await user.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+    expect(screen.getByText('Delete skill "alpha" from this agent?')).toBeInTheDocument();
+
+    const deleteButtons = screen.getAllByRole("button", { name: "Delete" });
+    await user.click(deleteButtons[deleteButtons.length - 1]);
+    expect(onDeleteSkill).toHaveBeenCalledWith({ name: "alpha", description: "Alpha installed" });
+  });
+
+  it("matches the notification bot profile header interaction and keeps actions on the right", async () => {
+    const user = userEvent.setup();
+    const notifier = {
+      ...worker,
+      id: "notifier-1",
+      name: "Notifier",
+      description: "Notifier description",
+      type: "notification",
+      bot_type: "notification",
+      runtime_kind: "notifier",
+    };
+    const { container } = render(
+      <NotificationParticipantDetailPane
+        item={notifier}
+        t={t}
+        busyKey=""
+        error=""
+        saveError=""
+        draft={{ ...agentToDraft(notifier), notifier_delivery_mode: "webhook" }}
+        saving={false}
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onOpenDM={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("Basics")).not.toBeInTheDocument();
+    expect(screen.queryByText("profileNotifierSection")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Notifier" })).toBeInTheDocument();
+    const descriptionTrigger = screen.getByRole("button", { name: "Edit description" });
+    expect(descriptionTrigger).toHaveTextContent("Notifier description");
+    expect(descriptionTrigger.closest(".entity-heading")).toBeInTheDocument();
+    const toolbar = container.querySelector(".entity-header .entity-toolbar");
+    expect(toolbar).toBeInTheDocument();
+    expect(toolbar?.textContent).toContain("Save");
+    expect(toolbar?.textContent).toContain("DM");
+    expect(toolbar?.textContent).toContain("Delete");
+
+    await user.click(descriptionTrigger);
+    expect(screen.getByDisplayValue("Notifier description")).toBeInTheDocument();
+    expect(screen.getByText("notifierDeliveryMode")).toBeInTheDocument();
+  });
+
+  it("shows save changes when the draft differs from the saved draft", () => {
+    const savedDraft = agentToDraft(worker);
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={{ ...savedDraft, description: "Changed" }}
+        savedDraft={savedDraft}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("opens a styled delete confirmation dialog for a Feishu-connected agent", async () => {
+    const user = userEvent.setup();
+    const onDelete = vi.fn();
+    const connectedWorker = {
+      ...worker,
+      name: "Worker with Feishu",
+      bot_type: "notification",
+      type: "notification",
+      participants: [
+        {
+          channel: "csgclaw",
+          id: "worker-1",
+          type: "agent",
+        },
+        {
+          channel: "feishu",
+          channel_user_kind: "app_id",
+          id: "worker-1",
+          type: "agent",
+        },
+      ],
+    };
+
+    render(
+      <AgentView
+        item={connectedWorker}
+        t={t}
+        activeRoom={null}
+        busyKey=""
+        error=""
+        draft={null}
+        models={[]}
+        modelBusy={false}
+        saving={false}
+        publishBusy={false}
+        saveError=""
+        authStatuses={{}}
+        authBusyProvider=""
+        notifierWebhookPublicOrigin="http://127.0.0.1:18080"
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onPublish={vi.fn()}
+        onProviderLogin={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onUpgrade={vi.fn()}
+        onDelete={onDelete}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent('Delete agent "Worker with Feishu"?');
+    expect(dialog).toHaveTextContent("This agent is bound to Feishu.");
+    expect(dialog).toHaveTextContent("Deleting the agent will also disconnect it from those channels.");
+
+    await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+    expect(onDelete).toHaveBeenCalledWith(expect.objectContaining({ id: connectedWorker.id }));
+  });
+
+  it("shows merged profile sections in the requested order", () => {
+    const draft = agentToDraft(worker);
+    const { container } = render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        authStatuses={{}}
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Profile" })).toHaveAttribute("aria-current", "location");
+    const runtimeSection = container.querySelector("#agent-profile-runtime");
+    const modelSection = container.querySelector("#agent-profile-model");
+    const advancedSection = container.querySelector("#agent-profile-advanced");
+    const instructionsSection = container.querySelector("#agent-profile-instructions");
+
+    expect(runtimeSection).toBeInTheDocument();
+    expect(modelSection).toBeInTheDocument();
+    expect(advancedSection).toBeInTheDocument();
+    expect(instructionsSection).not.toBeInTheDocument();
+    expect(runtimeSection?.compareDocumentPosition(modelSection as HTMLElement)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(modelSection?.compareDocumentPosition(advancedSection as HTMLElement)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(within(advancedSection as HTMLElement).getByText("Advanced")).toBeInTheDocument();
+    expect(within(advancedSection as HTMLElement).getByText("Request options")).toBeInTheDocument();
+  });
+
+  it("omits activity and navigates to profile sections from the horizontal tabs", async () => {
+    const user = userEvent.setup();
+    const draft = agentToDraft(worker);
+    window.localStorage.setItem(AGENT_PROFILE_ACTIVE_TAB_STORAGE_KEY, "activity");
+    render(
+      <AgentDetailPane
+        item={worker}
+        t={t}
+        draft={draft}
+        savedDraft={draft}
+        models={[]}
+        authStatuses={{}}
+        workspaceSupported
+        onDraftChange={vi.fn()}
+        onSave={vi.fn()}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        onRecreate={vi.fn()}
+        onDelete={vi.fn()}
+        onInvite={vi.fn()}
+        onOpenDM={vi.fn()}
+      />,
+    );
+
+    const navigation = screen.getByRole("navigation", { name: "Profile sections" });
+    const tabs = within(navigation).getAllByRole("button");
+    expect(tabs.map((tab) => tab.textContent)).toEqual([
+      "Profile",
+      "Instructions",
+      "Skills0",
+      "Connectors",
+      "Channels",
+    ]);
+    expect(tabs[0]).toHaveAttribute("aria-current", "location");
+    expect(screen.getByText("Request options")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Channels" })).not.toBeInTheDocument();
+
+    await user.click(within(navigation).getByRole("button", { name: "Channels" }));
+
+    expect(within(navigation).getByRole("button", { name: "Channels" })).toHaveAttribute("aria-current", "location");
+    expect(screen.getByRole("region", { name: "Channels" })).toBeInTheDocument();
+    expect(screen.queryByText("Request options")).not.toBeInTheDocument();
+  });
+
+  it("restores the last selected profile tab after remounting", async () => {
+    const user = userEvent.setup();
+    const draft = agentToDraft(worker);
+    const props = {
+      item: worker,
+      t,
+      draft,
+      savedDraft: draft,
+      models: [],
+      authStatuses: {},
+      workspaceSupported: true,
+      onDraftChange: vi.fn(),
+      onSave: vi.fn(),
+      onStart: vi.fn(),
+      onStop: vi.fn(),
+      onRecreate: vi.fn(),
+      onDelete: vi.fn(),
+      onInvite: vi.fn(),
+      onOpenDM: vi.fn(),
+    };
+    const { unmount } = render(<AgentDetailPane {...props} />);
+
+    await user.click(screen.getByRole("button", { name: "Channels" }));
+    expect(window.localStorage.getItem(AGENT_PROFILE_ACTIVE_TAB_STORAGE_KEY)).toBe("channels");
+    unmount();
+
+    render(<AgentDetailPane {...props} />);
+
+    expect(screen.getByRole("button", { name: "Channels" })).toHaveAttribute("aria-current", "location");
+    expect(screen.getByRole("region", { name: "Channels" })).toBeInTheDocument();
+  });
+});

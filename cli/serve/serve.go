@@ -1,0 +1,1582 @@
+package serve
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"csgclaw/cli/command"
+	"csgclaw/internal/agentengine"
+	agent "csgclaw/internal/agentengine/agents"
+	"csgclaw/internal/agentmanager"
+	"csgclaw/internal/agentsession"
+	"csgclaw/internal/agenttask"
+	"csgclaw/internal/api"
+	"csgclaw/internal/apitypes"
+	appbootstrap "csgclaw/internal/app"
+	"csgclaw/internal/app/channelwiring"
+	"csgclaw/internal/app/runtimewiring"
+	csgclawchannel "csgclaw/internal/channel/csgclaw"
+	"csgclaw/internal/channel/csgclaw/binding"
+	"csgclaw/internal/channel/csgclaw/delivery"
+	"csgclaw/internal/channel/csgclaw/execution"
+	"csgclaw/internal/channel/csgclaw/files"
+	csgclawinteraction "csgclaw/internal/channel/csgclaw/interaction"
+	channelrender "csgclaw/internal/channel/csgclaw/render"
+	csgclawsource "csgclaw/internal/channel/csgclaw/source"
+	"csgclaw/internal/channel/feishu"
+	feishubinding "csgclaw/internal/channel/feishu/binding"
+	"csgclaw/internal/channel/feishu/participantprovider"
+	feishutransport "csgclaw/internal/channel/feishu/transport"
+	"csgclaw/internal/cliproxy"
+	"csgclaw/internal/config"
+	"csgclaw/internal/connectors"
+	"csgclaw/internal/im"
+	"csgclaw/internal/llm"
+	"csgclaw/internal/localstore"
+	"csgclaw/internal/mcp"
+	"csgclaw/internal/modelprovider"
+	internalonboard "csgclaw/internal/onboard"
+	"csgclaw/internal/participant"
+	agentruntime "csgclaw/internal/runtime"
+	"csgclaw/internal/runtimecatalog"
+	"csgclaw/internal/sandboxproviders"
+	"csgclaw/internal/scheduledtask"
+	"csgclaw/internal/server"
+	"csgclaw/internal/taskcore"
+	"csgclaw/internal/team"
+	hub "csgclaw/internal/template"
+	"csgclaw/internal/upgrade"
+	appversion "csgclaw/internal/version"
+	"csgclaw/internal/worklease"
+)
+
+var (
+	RunServer                 = server.Run
+	NewAgentService           = newAgentService
+	NewIMService              = newIMService
+	NewFeishuService          = newFeishuService
+	NewLLMService             = newLLMService
+	NewTeamService            = newTeamService
+	NewAgentTaskService       = newAgentTaskService
+	NewScheduledTaskService   = newScheduledTaskService
+	NewAgentRuntimeService    = func() *runtimecatalog.Service { return runtimecatalog.NewService() }
+	CheckModelProvider        = checkModelProvider
+	CheckCatalogModelProvider = agent.CheckModelProvider
+	EnsureCLIProxy            = func(ctx context.Context) error {
+		return cliproxy.Default().EnsureStarted(ctx)
+	}
+	ShutdownCLIProxy = func(ctx context.Context) error {
+		return cliproxy.Default().Shutdown(ctx)
+	}
+	DetectBootstrapState   = internalonboard.DetectState
+	EnsureBootstrapState   = internalonboard.EnsureState
+	EnsureBootstrapManager = func(ctx context.Context, svc *agent.Controller) error {
+		if svc == nil {
+			return nil
+		}
+		return svc.EnsureBootstrapManager(ctx, false)
+	}
+	StartConfiguredAgents = func(ctx context.Context, svc *agent.Controller) error {
+		if svc == nil {
+			return nil
+		}
+		return svc.StartConfiguredAgents(ctx)
+	}
+	StopRunningSandboxAgents = func(ctx context.Context, svc *agent.Controller) error {
+		if svc == nil {
+			return nil
+		}
+		return svc.StopRunningSandboxAgents(ctx)
+	}
+	NewFeishuBindingManager = newFeishuBindingManager
+	NewCSGClawAdapterSource = newCSGClawAdapterSource
+	OpenBrowser             = openBrowser
+	WaitForHealthy          = waitForHealthy
+	stopServerProcessByPID  = stopServerProcess
+)
+
+type serveCmd struct{}
+type stopCmd struct{}
+type internalServeCmd struct{}
+type desktopServeCmd struct{}
+
+type csgclawAdapterSource interface {
+	Start(context.Context) error
+	Reconcile(context.Context) error
+	Close()
+}
+
+const cliproxyAutoLoginEnv = "CSGCLAW_CLIPROXY_AUTO_LOGIN"
+
+func NewServeCmd() command.Command {
+	return serveCmd{}
+}
+
+func NewStopCmd() command.Command {
+	return stopCmd{}
+}
+
+func NewInternalServeCmd() command.Command {
+	return internalServeCmd{}
+}
+
+func NewDesktopServeCmd() command.Command {
+	return desktopServeCmd{}
+}
+
+func (serveCmd) Name() string {
+	return "serve"
+}
+
+func (serveCmd) Summary() string {
+	return "Start the local HTTP server."
+}
+
+func (c serveCmd) Run(ctx context.Context, run *command.Context, args []string, globals command.GlobalOptions) error {
+	fs := run.NewFlagSet("serve", run.Program+" serve [-d|--daemon] [flags]", c.Summary())
+	daemon := fs.Bool("daemon", false, "run server in background")
+	fs.BoolVar(daemon, "d", false, "run server in background")
+	browser := fs.Bool("browser", false, "open the browser after startup")
+	noBrowser := fs.Bool("no-browser", false, "do not open the browser after startup (default)")
+	noAuthDetect := fs.Bool("no-auth-detect", false, "disable automatic auth detection during startup")
+	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
+
+	defaultLogPath, err := defaultServerLogPath()
+	if err != nil {
+		return err
+	}
+	defaultPIDPath, err := defaultServerPIDPath()
+	if err != nil {
+		return err
+	}
+	logPath := fs.String("log", defaultLogPath, "log file path, daemon mode only")
+	pidPath := fs.String("pid", defaultPIDPath, "pid file path, daemon mode only")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := validateServeInstallation(); err != nil {
+		return err
+	}
+	instanceLock, err := appbootstrap.AcquireInstanceLock()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if instanceLock != nil {
+			_ = instanceLock.Release()
+		}
+	}()
+	restoreAuthDetect := applyNoAuthDetectEnv(*noAuthDetect)
+	defer restoreAuthDetect()
+
+	restore, err := configureServeLogger(run.Stderr, *logLevel)
+	if err != nil {
+		return err
+	}
+	defer restore()
+
+	if err := migrateLocalStore(); err != nil {
+		return err
+	}
+	if err := ensureServeBootstrapState(ctx, globals.Config, *noAuthDetect); err != nil {
+		return err
+	}
+
+	configPath := strings.TrimSpace(globals.Config)
+	if configPath == "" {
+		configPath, err = config.DefaultPath()
+		if err != nil {
+			return err
+		}
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if globals.Endpoint != "" {
+		cfg.Server.AdvertiseBaseURL = strings.TrimRight(globals.Endpoint, "/")
+	}
+
+	serveOpts := serveOptions{
+		OpenBrowser:  *browser && !*noBrowser,
+		NoAuthDetect: *noAuthDetect,
+	}
+	if *daemon {
+		if err := instanceLock.Release(); err != nil {
+			return err
+		}
+		instanceLock = nil
+		serveGlobals := globals
+		serveGlobals.Config = configPath
+		return serveBackground(run, cfg, serveGlobals, *logPath, *pidPath, *logLevel, serveOpts)
+	}
+	return serveForegroundWithConfigPath(ctx, run, cfg, configPath, globals.Output, serveOpts)
+}
+
+func (stopCmd) Name() string {
+	return "stop"
+}
+
+func (stopCmd) Summary() string {
+	return "Stop the local HTTP server."
+}
+
+func (c stopCmd) Run(_ context.Context, run *command.Context, args []string, globals command.GlobalOptions) error {
+	fs := run.NewFlagSet("stop", run.Program+" stop [flags]", c.Summary())
+	defaultPIDPath, err := defaultServerPIDPath()
+	if err != nil {
+		return err
+	}
+	pidPath := fs.String("pid", defaultPIDPath, "pid file path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	pid, err := readPIDFile(*pidPath)
+	if err != nil {
+		return err
+	}
+	if err := stopServerProcessByPID(pid); err != nil {
+		if errors.Is(err, os.ErrProcessDone) {
+			removePIDFile(*pidPath)
+			return command.RenderAction(globals.Output, run.Stdout, command.ActionResult{
+				Command: "stop",
+				Action:  "stop",
+				Status:  "stale_pid_removed",
+				PID:     pid,
+				PIDPath: *pidPath,
+				Message: fmt.Sprintf("removed stale pid file %s", *pidPath),
+			})
+		}
+		return fmt.Errorf("stop process %d: %w", pid, err)
+	}
+	return command.RenderAction(globals.Output, run.Stdout, command.ActionResult{
+		Command: "stop",
+		Action:  "stop",
+		Status:  "signaled",
+		PID:     pid,
+		PIDPath: *pidPath,
+		Message: fmt.Sprintf("requested server process %d to stop", pid),
+	})
+}
+
+func (internalServeCmd) Name() string {
+	return "_serve"
+}
+
+func (internalServeCmd) Summary() string {
+	return "Internal server entrypoint."
+}
+
+func (internalServeCmd) Hidden() bool {
+	return true
+}
+
+func (c internalServeCmd) Run(ctx context.Context, run *command.Context, args []string, globals command.GlobalOptions) error {
+	fs := run.NewFlagSet("_serve", run.Program+" _serve [flags]", c.Summary())
+	pidPath := fs.String("pid", "", "pid file path")
+	configPathFlag := fs.String("config", globals.Config, "config file path")
+	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
+	browser := fs.Bool("browser", false, "open the browser after startup")
+	noBrowser := fs.Bool("no-browser", false, "do not open the browser after startup (default)")
+	noAuthDetect := fs.Bool("no-auth-detect", false, "disable automatic auth detection during startup")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := validateServeInstallation(); err != nil {
+		return err
+	}
+	instanceLock, err := appbootstrap.AcquireInstanceLock()
+	if err != nil {
+		return err
+	}
+	defer instanceLock.Release()
+	restoreAuthDetect := applyNoAuthDetectEnv(*noAuthDetect)
+	defer restoreAuthDetect()
+
+	if *pidPath != "" {
+		if err := writePIDFile(*pidPath, os.Getpid()); err != nil {
+			return err
+		}
+		defer removePIDFile(*pidPath)
+	}
+
+	configPath := strings.TrimSpace(*configPathFlag)
+	if configPath == "" {
+		configPath, err = config.DefaultPath()
+		if err != nil {
+			return err
+		}
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if globals.Endpoint != "" {
+		cfg.Server.AdvertiseBaseURL = strings.TrimRight(globals.Endpoint, "/")
+	}
+	restore, err := configureServeLogger(run.Stderr, *logLevel)
+	if err != nil {
+		return err
+	}
+	defer restore()
+	_ = preflightDefaultModelProvider(ctx, cfg)
+	if err := migrateLocalStore(); err != nil {
+		return err
+	}
+
+	printEffectiveConfig(run, cfg, globals.Output)
+	imBus := im.NewBus()
+	feishuProvider, feishuSvc, err := buildFeishuComponents()
+	if err != nil {
+		return err
+	}
+	svc, err := NewAgentService(cfg, feishuProvider)
+	if err != nil {
+		return err
+	}
+	imSvc, err := NewIMService(imBus)
+	if err != nil {
+		return err
+	}
+	return startServerWithConfigPath(ctx, run, cfg, svc, imSvc, imBus, feishuSvc, configPath, globals.Output, serveOptions{
+		OpenBrowser:  *browser && !*noBrowser,
+		NoAuthDetect: *noAuthDetect,
+	})
+}
+
+func serveForeground(ctx context.Context, run *command.Context, cfg config.Config, output string) error {
+	return serveForegroundWithConfigPath(ctx, run, cfg, "", output)
+}
+
+func validateServeInstallation() error {
+	currentVersion := appversion.Current()
+	support := (upgrade.Client{}).AutoUpgradeSupport(currentVersion)
+	if support.Supported || support.Reason == "local_build" {
+		return nil
+	}
+	platform, command := officialInstallGuidance(runtime.GOOS)
+	return fmt.Errorf("refuse to start release %s: %w\nInstall the official bundle on %s with:\n  %s\n拒绝启动正式版本 %s：当前程序并非从官方 CSGClaw bundle 安装。\n请在 %s 上执行：\n  %s", currentVersion, upgrade.ErrNotOfficialBundle, platform, command, currentVersion, platform, command)
+}
+
+func officialInstallGuidance(goos string) (string, string) {
+	if goos == "windows" {
+		return "Windows", "curl.exe -fsSL https://csgclaw.opencsg.com/install.ps1 | powershell -ExecutionPolicy Bypass -Command -"
+	}
+	return "macOS/Linux", "curl -fsSL https://csgclaw.opencsg.com/install.sh | bash"
+}
+
+type serveOptions struct {
+	OpenBrowser     bool
+	NoAuthDetect    bool
+	Quiet           bool
+	Distribution    string
+	Listener        net.Listener
+	SandboxListener net.Listener
+	Desktop         *server.DesktopOptions
+	OnReady         func()
+}
+
+func serveForegroundWithConfigPath(ctx context.Context, run *command.Context, cfg config.Config, configPath string, output string, opts ...serveOptions) error {
+	serveOpts := serveOptions{}
+	if len(opts) > 0 {
+		serveOpts = opts[0]
+	}
+	if err := validateServeInstallation(); err != nil {
+		return err
+	}
+	_ = preflightDefaultModelProvider(ctx, cfg)
+	if err := migrateLocalStore(); err != nil {
+		return err
+	}
+	imBus := im.NewBus()
+	feishuProvider, feishuSvc, err := buildFeishuComponents()
+	if err != nil {
+		return err
+	}
+	svc, err := NewAgentService(cfg, feishuProvider)
+	if err != nil {
+		return err
+	}
+	imSvc, err := NewIMService(imBus)
+	if err != nil {
+		return err
+	}
+	apiURL := serveAPIBaseURL(cfg.Server, serveOpts)
+	imURL := imOpenURL(apiURL)
+
+	if serveOpts.Quiet {
+		// Machine entrypoints own stdout and emit their versioned protocol messages.
+	} else if output == "json" {
+		if err := command.RenderAction(output, run.Stdout, command.ActionResult{
+			Command:         "serve",
+			Action:          "start",
+			Status:          "starting",
+			IMURL:           imURL,
+			APIURL:          apiURL,
+			EffectiveConfig: formatEffectiveConfig(cfg),
+		}); err != nil {
+			return err
+		}
+	} else {
+		printEffectiveConfig(run, cfg, output)
+		fmt.Fprintf(run.Stdout, "CSGClaw IM is available at: %s\n", imURL)
+	}
+
+	return startServerWithConfigPath(ctx, run, cfg, svc, imSvc, imBus, feishuSvc, configPath, output, opts...)
+}
+
+func serveBackground(run *command.Context, cfg config.Config, globals command.GlobalOptions, logPath, pidPath, logLevel string, opts serveOptions) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve executable: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open log file: %w", err)
+	}
+	defer logFile.Close()
+
+	childArgs := backgroundServeArgs(globals.Config, pidPath, logLevel, opts)
+	cmd := exec.Command(exe, childArgs...)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = backgroundServeSysProcAttr()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start daemon: %w", err)
+	}
+	apiURL := apiBaseURL(cfg.Server)
+	if err := waitForHealthy(apiURL, 5*time.Second); err != nil {
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("server process started (pid %d) but health check failed: %w; see %s", cmd.Process.Pid, err, logPath)
+	}
+
+	result := command.ActionResult{
+		Command: "serve",
+		Action:  "start",
+		Status:  "started",
+		PID:     cmd.Process.Pid,
+		IMURL:   imOpenURL(apiURL),
+		APIURL:  apiURL,
+		LogPath: logPath,
+		PIDPath: pidPath,
+		Message: fmt.Sprintf("server started in background (pid %d)", cmd.Process.Pid),
+	}
+	if globals.Output == "json" {
+		return command.RenderAction(globals.Output, run.Stdout, result)
+	}
+
+	fmt.Fprintln(run.Stdout, result.Message)
+	fmt.Fprintf(run.Stdout, "im: %s\n", result.IMURL)
+	fmt.Fprintf(run.Stdout, "api: %s\n", result.APIURL)
+	fmt.Fprintf(run.Stdout, "log: %s\n", result.LogPath)
+	fmt.Fprintf(run.Stdout, "pid: %s\n", result.PIDPath)
+	return nil
+}
+
+func backgroundServeArgs(configPath, pidPath, logLevel string, opts serveOptions) []string {
+	args := []string{"_serve", "--pid", pidPath}
+	if configPath != "" {
+		args = append(args, "--config", configPath)
+	}
+	if strings.TrimSpace(logLevel) != "" {
+		args = append(args, "--log-level", logLevel)
+	}
+	if opts.OpenBrowser {
+		args = append(args, "--browser")
+	}
+	if opts.NoAuthDetect {
+		args = append(args, "--no-auth-detect")
+	}
+	return args
+}
+
+func applyNoAuthDetectEnv(disabled bool) func() {
+	if !disabled {
+		return func() {}
+	}
+	previous, hadPrevious := os.LookupEnv(cliproxyAutoLoginEnv)
+	_ = os.Setenv(cliproxyAutoLoginEnv, "0")
+	return func() {
+		if hadPrevious {
+			_ = os.Setenv(cliproxyAutoLoginEnv, previous)
+			return
+		}
+		_ = os.Unsetenv(cliproxyAutoLoginEnv)
+	}
+}
+
+func ensureServeBootstrapState(ctx context.Context, configPath string, noAuthDetect bool) error {
+	state, err := DetectBootstrapState(internalonboard.DetectStateOptions{ConfigPath: configPath})
+	if err != nil {
+		return err
+	}
+	if state.Complete() {
+		return nil
+	}
+
+	slog.Info("bootstrap state incomplete; auto-initializing local state", "config_path", state.ConfigPath)
+	_, err = EnsureBootstrapState(ctx, internalonboard.EnsureStateOptions{
+		ConfigPath:   configPath,
+		NoAuthDetect: noAuthDetect,
+	})
+	return err
+}
+
+func configureServeLogger(w io.Writer, level string) (func(), error) {
+	parsedLevel, err := parseServeLogLevel(level)
+	if err != nil {
+		return nil, err
+	}
+	if w == nil {
+		w = os.Stderr
+	}
+
+	prev := slog.Default()
+	logger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: parsedLevel}))
+	slog.SetDefault(logger)
+	return func() {
+		slog.SetDefault(prev)
+	}, nil
+}
+
+func parseServeLogLevel(level string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("unsupported log level %q", level)
+	}
+}
+
+func startServer(ctx context.Context, run *command.Context, cfg config.Config, svc *agent.Controller, imSvc *im.Service, imBus *im.Bus, feishuSvc *feishu.Service, output string) error {
+	return startServerWithConfigPath(ctx, run, cfg, svc, imSvc, imBus, feishuSvc, "", output)
+}
+
+func startServerWithConfigPath(ctx context.Context, run *command.Context, cfg config.Config, svc *agent.Controller, imSvc *im.Service, imBus *im.Bus, feishuSvc *feishu.Service, configPath, output string, opts ...serveOptions) error {
+	if imSvc != nil {
+		defer func() {
+			flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = imSvc.Diagnostics().Flush(flushCtx)
+		}()
+	}
+	serveOpts := serveOptions{}
+	if len(opts) > 0 {
+		serveOpts = opts[0]
+	}
+	restoreAuthDetect := applyNoAuthDetectEnv(serveOpts.NoAuthDetect)
+	defer restoreAuthDetect()
+	_ = EnsureCLIProxy(ctx)
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = ShutdownCLIProxy(shutdownCtx)
+	}()
+	if serveOpts.NoAuthDetect && svc != nil {
+		svc.SetStartupProfileDetectionDisabled(true)
+	}
+	refreshConfigPath := configPath
+	if serveOpts.Distribution == "electron" {
+		refreshConfigPath = ""
+	}
+	if refreshed, results, err := refreshStartupModelProviders(ctx, cfg, refreshConfigPath, svc); err != nil {
+		slog.Warn("refresh model provider catalog at startup failed", "error", err)
+	} else {
+		cfg = refreshed
+		logStartupModelProviderRefresh(results)
+	}
+	if err := reconcileInterruptedUserInputMessages(imSvc); err != nil {
+		return err
+	}
+	// One Engine instance owns Agent administration, admission for HTTP
+	// sessions, and direct channel execution.
+	conversationEngine := agentengine.New(svc)
+	participantSvc, err := newParticipantService(conversationEngine, imSvc)
+	if err != nil {
+		return err
+	}
+	participantBridge := im.NewParticipantBridge(cfg.Server.AccessToken)
+	workBus := worklease.NewBus()
+	workControlBus := worklease.NewControlBus()
+	turnControlDispatcher := worklease.NewTurnControlDispatcher(workControlBus)
+	workRegistry := worklease.NewRegistry(
+		participantSvc,
+		imSvc,
+		workBus,
+		worklease.WithControlBus(workControlBus),
+		worklease.WithTurnControlDispatcher(turnControlDispatcher),
+	)
+	janitorCtx, stopJanitor := context.WithCancel(ctx)
+	defer stopJanitor()
+	go workRegistry.Run(janitorCtx)
+	feishuBindingMgr, err := NewFeishuBindingManager(feishuSvc, conversationEngine)
+	if err != nil {
+		return err
+	}
+	interactionCoordinator := csgclawinteraction.NewCoordinator(conversationEngine, participantSvc)
+	imAdapterSource, err := NewCSGClawAdapterSource(conversationEngine, svc, imSvc, imBus, participantSvc, workRegistry, participantBridge, interactionCoordinator)
+	if err != nil {
+		return err
+	}
+	channelBindings := newChannelBindingCoordinator(imAdapterSource, feishuBindingMgr)
+	if imAdapterSource != nil {
+		defer imAdapterSource.Close()
+		if err := imAdapterSource.Start(ctx); err != nil {
+			return err
+		}
+	}
+	if feishuBindingMgr != nil {
+		defer feishuBindingMgr.Close()
+		// Establish the binding-owned lifetime context before the HTTP server
+		// accepts configuration updates. Reconciliation itself runs in the
+		// manager goroutine, so startup is not blocked on Feishu networking.
+		if err := feishuBindingMgr.Start(ctx); err != nil {
+			return err
+		}
+	}
+	llmSvc, err := NewLLMService(cfg, svc)
+	if err != nil {
+		return err
+	}
+	apiURL := serveAPIBaseURL(cfg.Server, serveOpts)
+	imURL := imOpenURL(apiURL)
+	currentVersion := appversion.Current()
+	upgradeChannel := upgrade.InferChannelFromVersion(currentVersion)
+	upgradeClient := &upgrade.Client{
+		HTTPClient: http.DefaultClient,
+		Channel:    upgradeChannel,
+		GOOS:       runtime.GOOS,
+		GOARCH:     runtime.GOARCH,
+	}
+	upgradeSupport := upgradeClient.AutoUpgradeSupport(currentVersion)
+	if serveOpts.Distribution == "electron" {
+		upgradeSupport.Supported = false
+		upgradeSupport.Reason = "desktop_managed"
+	}
+	upgradeManager := upgrade.NewManager(upgradeClient, currentVersion, upgrade.ManagerOptions{
+		AutoUpgradeSupported:         upgradeSupport.Supported,
+		AutoUpgradeUnsupportedReason: upgradeSupport.Reason,
+		OnStatusChange: func(status apitypes.UpgradeStatus) {
+			if imBus == nil {
+				return
+			}
+			snapshot := status
+			if snapshot.LastCheckedAt != nil {
+				t := *snapshot.LastCheckedAt
+				snapshot.LastCheckedAt = &t
+			}
+			imBus.Publish(im.Event{
+				Type:    im.EventTypeUpgradeStatusChanged,
+				Upgrade: &snapshot,
+			})
+		},
+	})
+	configureFeishuService(feishuSvc, svc)
+	if serveOpts.Distribution != "electron" {
+		if outcome, err := upgrade.ConsumeApplyStatus(configPath); err != nil {
+			slog.Warn("load upgrade helper failure", "error", err)
+		} else if outcome.Status == upgrade.ApplyStatusFailed && outcome.Message != "" {
+			upgradeManager.MarkUpgradeFailedWithDetails(errors.New(outcome.Message), outcome.ErrorKind, outcome.LogPath)
+		}
+	}
+	hubSvc, err := newAgentTemplateHubService(cfg.Hub)
+	if err != nil {
+		return err
+	}
+	mcpSvc := mcp.NewService()
+	teamSvc, teamAdapters, err := NewTeamService(imSvc, feishuSvc, participantSvc)
+	if err != nil {
+		return err
+	}
+	agentTaskSvc, err := NewAgentTaskService(conversationEngine, imSvc, participantSvc)
+	if err != nil {
+		return err
+	}
+	scheduledTaskSvc, err := NewScheduledTaskService(agentTaskSvc)
+	if err != nil {
+		return err
+	}
+	ensureBootstrapManager := EnsureBootstrapManager
+	startConfiguredAgents := StartConfiguredAgents
+	connectorStore, err := connectors.DefaultStore()
+	if err != nil {
+		return err
+	}
+	connectorSvc := connectors.NewService(connectorStore)
+	agentManagerSvc, err := newAgentManagerService(svc, ensureBootstrapManager, connectorSvc)
+	if err != nil {
+		return err
+	}
+	if agentManagerSvc != nil {
+		defer agentManagerSvc.Close()
+	}
+	agentRuntimeSvc := NewAgentRuntimeService()
+	sessionBindingsDir, err := config.DefaultAgentSessionBindingsDir()
+	if err != nil {
+		return err
+	}
+	sessionBindings, err := agentsession.NewStore(sessionBindingsDir)
+	if err != nil {
+		return err
+	}
+	legacyStatePath, err := config.DefaultStatePath()
+	if err != nil {
+		return err
+	}
+	if err := agentsession.ImportLegacyState(legacyStatePath, sessionBindings); err != nil {
+		return err
+	}
+	var beforeShutdown func(context.Context) error
+	if serveOpts.Distribution == "electron" {
+		beforeShutdown = func(shutdownCtx context.Context) error {
+			return StopRunningSandboxAgents(shutdownCtx, svc)
+		}
+	}
+	if svc != nil {
+		// RunServer begins accepting requests before OnReady schedules the
+		// background restore pass. Mark that short interval so the roster UI
+		// does not stop its startup refresh after only the manager is running.
+		svc.PrepareConfiguredAgentsStartup()
+	}
+	return RunServer(server.Options{
+		ListenAddr:         cfg.Server.ListenAddr,
+		Listener:           serveOpts.Listener,
+		SandboxListener:    serveOpts.SandboxListener,
+		AgentServices:      api.AgentServices{Records: svc, Workspace: svc.Workspace(), Models: svc.Models(), Runtime: svc},
+		Hub:                hubSvc,
+		MCP:                mcpSvc,
+		Participant:        participantSvc,
+		IM:                 imSvc,
+		IMBus:              imBus,
+		WorkReporter:       workRegistry,
+		WorkBus:            workBus,
+		WorkControlBus:     workControlBus,
+		ParticipantBridge:  participantBridge,
+		Feishu:             feishuSvc,
+		LLM:                llmSvc,
+		Team:               teamSvc,
+		AgentTask:          agentTaskSvc,
+		ScheduledTask:      scheduledTaskSvc,
+		Connectors:         connectorSvc,
+		AgentRuntimes:      agentRuntimeSvc,
+		TeamAdapters:       teamAdapters,
+		Upgrade:            upgradeManager,
+		ActivityDecider:    interactionCoordinator,
+		UserInputResponder: interactionCoordinator,
+		AgentEngine:        conversationEngine,
+		ChannelBindings:    channelBindings,
+		SessionBindings:    sessionBindings,
+		ConfigPath:         configPath,
+		AppsStatePath:      legacyStatePath,
+		AccessToken:        cfg.Server.AccessToken,
+		NoAuth:             cfg.Server.NoAuth,
+		AdvertiseBaseURL:   apiURL,
+		InternalBaseURL:    serveInternalBaseURL(cfg.Server, serveOpts),
+		Desktop:            serveOpts.Desktop,
+		Context:            ctx,
+		BeforeShutdown:     beforeShutdown,
+		OnReady: func(handler *api.Handler, router chi.Router) {
+			deliver := channelwiring.WireNotificationParticipantPull(ctx, participantSvc, imSvc, apiURL, cfg.Server.AccessToken)
+			handler.SetNotificationDeliver(deliver)
+			if serveOpts.OnReady != nil {
+				serveOpts.OnReady()
+			}
+			if serveOpts.OpenBrowser && output != "json" && run != nil {
+				waitForHealthy := WaitForHealthy
+				openBrowser := OpenBrowser
+				go func() {
+					if err := waitForHealthy(apiURL, 5*time.Second); err != nil {
+						fmt.Fprintln(run.Stdout, "Open this URL in your browser after startup.")
+						return
+					}
+					if err := openBrowser(imURL); err != nil {
+						fmt.Fprintln(run.Stdout, "Open this URL in your browser after startup.")
+					} else {
+						fmt.Fprintln(run.Stdout, "Opened this URL in your browser.")
+					}
+				}()
+			}
+			go func() {
+				if agentManagerSvc != nil {
+					if err := agentManagerSvc.Start(ctx); err != nil {
+						slog.Warn("bootstrap manager failed to start", "error", err)
+					}
+				} else if err := ensureBootstrapManager(ctx, svc); err != nil {
+					slog.Warn("bootstrap manager failed to start", "error", err)
+				}
+				if err := startConfiguredAgents(ctx, svc); err != nil {
+					slog.Warn("some configured agents failed to start", "error", err)
+				}
+			}()
+		}, RuntimeCloser: svc,
+	})
+}
+
+func reconcileInterruptedUserInputMessages(imSvc *im.Service) error {
+	if imSvc == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	for _, room := range imSvc.ListRoomsWithOptions(im.ListMessagesOptions{IncludeThreadReplies: true}) {
+		for _, message := range room.Messages {
+			content, metadata, changed := channelrender.InterruptPendingQuestionActivity(message.Content, message.Metadata, now)
+			if !changed {
+				continue
+			}
+			threadRootID := ""
+			if message.RelatesTo != nil && message.RelatesTo.RelType == im.RelationTypeThread {
+				threadRootID = message.RelatesTo.EventID
+			}
+			if _, err := imSvc.DeliverMessage(im.DeliverMessageRequest{
+				RoomID:       room.ID,
+				SenderID:     message.SenderID,
+				Content:      content,
+				MessageID:    message.ID,
+				ThreadRootID: threadRootID,
+				Metadata:     metadata,
+			}); err != nil {
+				return fmt.Errorf("reconcile interrupted user input message %s: %w", message.ID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func refreshStartupModelProviders(ctx context.Context, cfg config.Config, configPath string, svc *agent.Controller) (config.Config, []agent.ModelProviderCheckResult, error) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return cfg, nil, nil
+	}
+	llmCfg := cfg.Models
+	if llmCfg.IsZero() && !cfg.LLM.IsZero() {
+		llmCfg = cfg.LLM
+	}
+	updatedLLM, results, changed := agent.RefreshModelProviderCatalog(ctx, llmCfg, CheckCatalogModelProvider)
+	if !changed {
+		return cfg, results, nil
+	}
+	cfg.Models = updatedLLM
+	cfg.LLM = updatedLLM
+	if err := cfg.Save(configPath); err != nil {
+		return cfg, results, err
+	}
+	if svc != nil {
+		svc.Models().SetLLMConfig(updatedLLM)
+	}
+	return cfg, results, nil
+}
+
+func logStartupModelProviderRefresh(results []agent.ModelProviderCheckResult) {
+	for _, result := range results {
+		if result.Status != agent.ModelProviderStatusConnected || len(result.Models) == 0 {
+			continue
+		}
+		slog.Info("refreshed model provider catalog", "provider", result.ID, "models", len(result.Models))
+	}
+}
+
+func configureFeishuService(feishuSvc *feishu.Service, svc *agent.Controller) {
+	if feishuSvc == nil {
+		return
+	}
+	provider := feishuSvc.ConfigProvider()
+	if provider == nil {
+		slog.Warn("skip feishu runtime wiring: provider is not configured")
+		return
+	}
+	runtimewiring.UpdatePicoClawFeishuProvider(svc, provider)
+	runtimewiring.UpdateOpenClawFeishuProvider(svc, provider)
+}
+
+func preflightDefaultModelProvider(ctx context.Context, cfg config.Config) error {
+	if effectiveLLMConfig(cfg).IsZero() {
+		return nil
+	}
+	llmCfg := effectiveLLMConfig(cfg)
+	providerName := llmCfg.EffectiveDefaultProvider()
+	_, modelCfg, err := llmCfg.Resolve("")
+	if err != nil {
+		return nil
+	}
+	if !requiresCSGHubLitePreflight(providerName, modelCfg.BaseURL) {
+		return nil
+	}
+	if err := CheckModelProvider(ctx, modelCfg); err != nil {
+		return fmt.Errorf("csghub-lite provider is not reachable at %s (%w); start it with `csghub-lite run <model>` or `csghub-lite serve`, then retry", strings.TrimRight(modelCfg.BaseURL, "/"), err)
+	}
+	return nil
+}
+
+func checkModelProvider(ctx context.Context, modelCfg config.ModelConfig) error {
+	_, err := modelprovider.ListOpenAIModels(ctx, modelCfg.BaseURL, modelCfg.APIKey)
+	return err
+}
+
+func requiresCSGHubLitePreflight(providerName, baseURL string) bool {
+	if strings.TrimSpace(providerName) == modelprovider.CSGHubLiteProviderName {
+		return true
+	}
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	port := parsed.Port()
+	return port == "11435" && (host == "127.0.0.1" || host == "localhost")
+}
+
+func defaultServerLogPath() (string, error) {
+	dir, err := config.DefaultDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "server.log"), nil
+}
+
+func defaultServerPIDPath() (string, error) {
+	dir, err := config.DefaultDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "server.pid"), nil
+}
+
+func writePIDFile(path string, pid int) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create pid dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write pid file: %w", err)
+	}
+	return nil
+}
+
+func readPIDFile(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read pid file: %w", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("parse pid file: %w", err)
+	}
+	if pid <= 0 {
+		return 0, fmt.Errorf("parse pid file: invalid pid %d", pid)
+	}
+	return pid, nil
+}
+
+func removePIDFile(path string) {
+	_ = os.Remove(path)
+}
+
+func waitForHealthy(apiBaseURL string, timeout time.Duration) error {
+	client := &http.Client{Timeout: 1 * time.Second}
+	deadline := time.Now().Add(timeout)
+	url := strings.TrimRight(apiBaseURL, "/") + "/healthz"
+
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			_ = resp.Body.Close()
+			return nil
+		}
+		if err == nil {
+			lastErr = fmt.Errorf("status %s", resp.Status)
+			_ = resp.Body.Close()
+		} else {
+			lastErr = err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("timed out")
+	}
+	return lastErr
+}
+
+func imOpenURL(apiBaseURL string) string {
+	return strings.TrimRight(apiBaseURL, "/") + "/"
+}
+
+func openBrowser(rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return fmt.Errorf("open browser: empty URL")
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", rawURL)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
+	default:
+		cmd = exec.Command("xdg-open", rawURL)
+	}
+	return cmd.Start()
+}
+
+func apiBaseURL(server config.ServerConfig) string {
+	return config.ResolveAdvertiseBaseURL(server)
+}
+
+func serveAPIBaseURL(serverConfig config.ServerConfig, opts serveOptions) string {
+	if opts.Desktop != nil {
+		if baseURL := strings.TrimRight(strings.TrimSpace(opts.Desktop.BaseURL), "/"); baseURL != "" {
+			return baseURL
+		}
+	}
+	return apiBaseURL(serverConfig)
+}
+
+func serveInternalBaseURL(serverConfig config.ServerConfig, opts serveOptions) string {
+	if opts.Desktop != nil {
+		if baseURL := strings.TrimRight(strings.TrimSpace(opts.Desktop.BaseURL), "/"); baseURL != "" {
+			return baseURL
+		}
+	}
+	if opts.Listener != nil {
+		serverConfig.ListenAddr = opts.Listener.Addr().String()
+	}
+	return config.ResolveLocalBaseURL(serverConfig)
+}
+
+func printEffectiveConfig(run *command.Context, cfg config.Config, output string) {
+	if output == "json" {
+		_ = command.RenderAction(output, run.Stdout, command.ActionResult{
+			Command:         "_serve",
+			Action:          "start",
+			Status:          "starting",
+			EffectiveConfig: formatEffectiveConfig(cfg),
+		})
+		return
+	}
+	fmt.Fprintf(run.Stdout, "effective config:\n%s", formatEffectiveConfig(cfg))
+}
+
+func formatEffectiveConfig(cfg config.Config) string {
+	resolvedHub := cfg.Hub.Resolved()
+	content := fmt.Sprintf(`[server]
+listen_addr = %q
+advertise_base_url = %q
+access_token = %q
+no_auth = %t
+show_upgrade = %t
+
+[bootstrap]
+default_manager_template = %q
+default_worker_template = %q
+
+[sandbox]
+provider = %q
+`, cfg.Server.ListenAddr, cfg.Server.AdvertiseBaseURL, partiallyMaskSecret(cfg.Server.AccessToken), cfg.Server.NoAuth, cfg.Server.ShowUpgrade, cfg.Bootstrap.ResolvedDefaultManagerTemplate(), cfg.Bootstrap.ResolvedDefaultWorkerTemplate(), cfg.Sandbox.Resolved().Provider)
+	if len(cfg.Sandbox.Resolved().DebianRegistriesOverride) > 0 {
+		content += fmt.Sprintf("debian_registries_override = %s\n", formatModelList(cfg.Sandbox.Resolved().DebianRegistriesOverride))
+	} else {
+		content += fmt.Sprintf("# using default debian registries: %s\ndebian_registries_override = []\n", formatModelList(config.DefaultDebianRegistries))
+	}
+	content += fmt.Sprintf(`
+[hub]
+default_registry = %q
+default_publish_registry = %q
+`, resolvedHub.DefaultRegistry, resolvedHub.DefaultPublishRegistry)
+	for _, registry := range resolvedHub.Registries {
+		if strings.EqualFold(strings.TrimSpace(registry.Kind), config.HubRegistryKindRemote) {
+			continue
+		}
+		content += fmt.Sprintf(`
+[[hub.registries]]
+name = %q
+kind = %q
+`, registry.Name, registry.Kind)
+		if registry.Path != "" {
+			content += fmt.Sprintf("path = %q\n", registry.Path)
+		}
+		if registry.URL != "" {
+			content += fmt.Sprintf("url = %q\n", registry.URL)
+		}
+		if registry.Token != "" {
+			content += fmt.Sprintf("token = %q\n", partiallyMaskSecret(registry.Token))
+		}
+		content += fmt.Sprintf("enabled = %t\n", registry.Enabled)
+	}
+
+	return content
+}
+
+func partiallyMaskSecret(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 4 {
+		return strings.Repeat("*", len(value))
+	}
+	return value[:2] + strings.Repeat("*", len(value)-4) + value[len(value)-2:]
+}
+
+func loadConfig(path string) (config.Config, error) {
+	if path == "" {
+		defaultPath, err := config.DefaultPath()
+		if err != nil {
+			return config.Config{}, err
+		}
+		path = defaultPath
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return config.Config{}, err
+	}
+	if cfg.NeedsMigrationRewrite() {
+		root := filepath.Dir(path)
+		if filepath.Base(root) == config.AppDirName {
+			if _, err := localstore.CreateSiblingBackup(root, time.Now()); err != nil {
+				return config.Config{}, fmt.Errorf("backup config dir: %w", err)
+			}
+		}
+		if err := cfg.Save(path); err != nil {
+			return config.Config{}, err
+		}
+	}
+	return cfg, nil
+}
+
+func validateModelConfig(cfg config.Config) error {
+	if err := cfg.Bootstrap.Validate(); err != nil {
+		return err
+	}
+	if effectiveLLMConfig(cfg).IsZero() {
+		return nil
+	}
+	if err := effectiveLLMConfig(cfg).Validate(); err != nil {
+		var validationErr *config.ModelValidationError
+		if errors.As(err, &validationErr) && len(validationErr.MissingFields) > 0 {
+			_ = validationErr
+			return nil
+		}
+		return nil
+	}
+	return nil
+}
+
+func missingModelFlags(fields []string) []string {
+	flags := make([]string, 0, len(fields))
+	for _, field := range fields {
+		switch field {
+		case "base_url":
+			flags = append(flags, "--base-url")
+		case "api_key":
+			flags = append(flags, "--api-key")
+		case "model_id":
+			flags = append(flags, "--models")
+		case "default", "default_profile":
+			flags = append(flags, "--models")
+		default:
+			flags = append(flags, field)
+		}
+	}
+	return flags
+}
+
+func newAgentService(cfg config.Config, feishuProvider feishu.AgentCredentialProvider) (*agent.Controller, error) {
+	agentsPath, err := config.DefaultAgentsPath()
+	if err != nil {
+		return nil, err
+	}
+	hubSvc, err := newAgentTemplateHubService(cfg.Hub)
+	if err != nil {
+		return nil, err
+	}
+	bootstrapDefaults, err := hub.ResolveBootstrapDefaults(context.Background(), cfg.Bootstrap, hubSvc)
+	if err != nil {
+		return nil, err
+	}
+	opts, err := sandboxServiceOptions(cfg.Sandbox)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts,
+		runtimewiring.WithPicoClawSandboxRuntime(feishuProvider),
+		runtimewiring.WithOpenClawSandboxRuntime(feishuProvider),
+		runtimewiring.WithCodexRuntime(),
+		runtimewiring.WithDSHRuntime(),
+		agent.WithBootstrapDefaultTemplates(cfg.Bootstrap),
+	)
+	switch bootstrapDefaults.ManagerRuntimeKind {
+	case agent.RuntimeKindPicoClawSandbox, agent.RuntimeKindOpenClawSandbox:
+		opts = append(opts, agent.WithGatewayRuntime(bootstrapDefaults.ManagerRuntimeKind))
+	}
+	if hubSvc != nil {
+		opts = append(opts, agent.WithHubService(hubSvc))
+	}
+	return agent.NewControllerWithLLM(effectiveLLMConfig(cfg), cfg.Server, bootstrapDefaults.ManagerImage, agentsPath, opts...)
+}
+
+type bootstrapManagerAgentService struct {
+	svc    *agent.Controller
+	ensure func(context.Context, *agent.Controller) error
+}
+
+func (s bootstrapManagerAgentService) EnsureManager(ctx context.Context, _ bool) (agent.Agent, error) {
+	if s.svc == nil {
+		return agent.Agent{}, nil
+	}
+	ensure := s.ensure
+	if ensure == nil {
+		ensure = EnsureBootstrapManager
+	}
+	if err := ensure(ctx, s.svc); err != nil {
+		return agent.Agent{}, err
+	}
+	manager, ok := s.svc.Agent(agent.ManagerUserID)
+	if !ok {
+		return agent.Agent{}, nil
+	}
+	return manager, nil
+}
+
+func newAgentManagerService(svc *agent.Controller, ensure func(context.Context, *agent.Controller) error, connectorSvc *connectors.Service) (*agentmanager.Service, error) {
+	if svc == nil {
+		return nil, nil
+	}
+	credentialProvider := agentmanager.NewConnectorServiceCredentialProvider(connectorSvc, agentmanager.DefaultConnectorGrantPolicy{})
+	return agentmanager.NewService(bootstrapManagerAgentService{svc: svc, ensure: ensure}, credentialProvider), nil
+}
+
+func newAgentTemplateHubService(cfg config.HubConfig) (*hub.Service, error) {
+	return hub.NewService(cfg.Resolved(), hub.DefaultStoreFactory)
+}
+
+type feishuBindingManager interface {
+	Start(context.Context) error
+	Reconcile(context.Context) error
+	Close()
+}
+
+type channelBindingReconciler interface {
+	Reconcile(context.Context) error
+}
+
+// channelBindingCoordinator keeps binding configuration changes on their owning
+// channel manager. Both built-in IM and Feishu bindings are deliberately
+// independent from Agent runtime lifecycle.
+type channelBindingCoordinator struct {
+	csgclaw channelBindingReconciler
+	feishu  channelBindingReconciler
+}
+
+func newChannelBindingCoordinator(csgclaw, feishu channelBindingReconciler) api.ChannelBindingReconciler {
+	if csgclaw == nil && feishu == nil {
+		return nil
+	}
+	return &channelBindingCoordinator{csgclaw: csgclaw, feishu: feishu}
+}
+
+func (a *channelBindingCoordinator) RefreshAgentChannel(ctx context.Context, _ agent.Agent, channel string) error {
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	switch channel {
+	case csgclawchannel.ChannelID:
+		if a.csgclaw == nil {
+			return fmt.Errorf("channel %q binding activator is not configured", channel)
+		}
+		return a.csgclaw.Reconcile(ctx)
+	case feishu.ChannelID:
+		if a.feishu == nil {
+			return fmt.Errorf("channel %q binding activator is not configured", channel)
+		}
+		return a.feishu.Reconcile(ctx)
+	default:
+		return fmt.Errorf("unsupported agent channel %q", channel)
+	}
+}
+
+func newFeishuBindingManager(feishuSvc *feishu.Service, engine agentengine.Interface) (feishuBindingManager, error) {
+	if feishuSvc == nil || engine == nil {
+		return nil, nil
+	}
+	provider := feishuSvc.ConfigProvider()
+	if provider == nil {
+		return nil, nil
+	}
+	root, err := config.DefaultChannelDir(feishu.ChannelID)
+	if err != nil {
+		return nil, err
+	}
+	workers, err := feishubinding.NewPipelineFactory(feishubinding.PipelineFactoryOptions{
+		Engine:    engine,
+		Transport: feishutransport.NewFactory(),
+		MediaRoot: filepath.Join(root, "media"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	manager, err := feishubinding.NewManager(feishubinding.ManagerOptions{
+		Agents:   engine.Agents(),
+		Provider: provider,
+		Workers:  workers,
+		Messages: feishuSvc.MessageBus(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return manager, nil
+}
+
+func newCSGClawAdapterSource(
+	engine *agentengine.Engine,
+	agentSvc *agent.Controller, imSvc *im.Service,
+	imBus *im.Bus,
+	participantSvc *participant.Service,
+	workReporter worklease.ParticipantWorkReporter,
+	participantBridge *im.ParticipantBridge,
+	interactionCoordinator *csgclawinteraction.Coordinator,
+) (csgclawAdapterSource, error) {
+	if engine == nil || agentSvc == nil || imSvc == nil || participantSvc == nil || participantBridge == nil {
+		return nil, nil
+	}
+	store, err := delivery.NewIMTranscriptStore(imSvc, participantSvc, engine)
+	if err != nil {
+		return nil, err
+	}
+	attachmentResolver, err := files.NewLocalResolver(imSvc, agentSvc, engine)
+	if err != nil {
+		return nil, err
+	}
+	rendererOptions := []delivery.RendererOption{delivery.WithInteractionProjector(interactionCoordinator)}
+	adapterOptions := []execution.Option{
+		execution.WithDiagnostics(imSvc.Diagnostics()),
+		execution.WithRoomContextProvider(participantBridge.RoomContext),
+		execution.WithAttachmentResolver(attachmentResolver),
+		execution.WithParticipantWorkReporter(workReporter),
+	}
+	if registrar, ok := workReporter.(agentruntime.TurnControllerRegistrar); ok {
+		adapterOptions = append(adapterOptions, execution.WithTurnControllerRegistrar(registrar))
+	}
+	adapter, err := execution.New(engine, delivery.NewTranscriptRenderer(store, rendererOptions...), adapterOptions...)
+	if err != nil {
+		return nil, err
+	}
+	manager, err := binding.NewManager(adapter)
+	if err != nil {
+		return nil, err
+	}
+	if interactionCoordinator != nil {
+		interactionCoordinator.SetSubmitter(manager)
+	}
+	source, err := csgclawsource.New(participantBridge, imBus, participantSvc, engine.Agents(), manager)
+	if err != nil {
+		manager.Close()
+		return nil, err
+	}
+	return source, nil
+}
+
+func sandboxServiceOptions(cfg config.SandboxConfig) ([]agent.ControllerOption, error) {
+	return sandboxproviders.ServiceOptions(cfg)
+}
+
+func migrateLocalStore() error {
+	root, err := config.DefaultDir()
+	if err != nil {
+		return err
+	}
+	if localstore.NeedsTypedIDMigration(root) {
+		if _, err := localstore.MigrateTypedIDs(localstore.MigrateOptions{Root: root}); err != nil {
+			return fmt.Errorf("migrate local store: %w", err)
+		}
+	}
+	if err := localstore.ReconcileTypedAgentDirs(root); err != nil {
+		return fmt.Errorf("reconcile local store agent dirs: %w", err)
+	}
+	if err := localstore.MigrateMCPIdentities(filepath.Join(root, localstore.RootStateFileName)); err != nil {
+		return fmt.Errorf("migrate MCP identities: %w", err)
+	}
+	return nil
+}
+
+func newIMService(bus *im.Bus) (*im.Service, error) {
+	imStatePath, err := config.DefaultIMStatePath()
+	if err != nil {
+		return nil, err
+	}
+	return im.NewServiceFromPathWithBus(imStatePath, bus)
+}
+
+func newParticipantService(engine agentengine.Interface, imSvc *im.Service) (*participant.Service, error) {
+	participantsPath, err := defaultParticipantsPath()
+	if err != nil {
+		return nil, err
+	}
+	store, err := participant.NewStore(participantsPath)
+	if err != nil {
+		return nil, err
+	}
+	participantSvc := participant.NewService(
+		store,
+		participant.WithAgentEngine(engine),
+		participant.WithIMService(imSvc),
+	)
+	if deleted, err := participantSvc.RepairDanglingCSGClawAgentParticipants(); err != nil {
+		return nil, err
+	} else if len(deleted) > 0 {
+		slog.Info("removed dangling CSGClaw agent participants", "count", len(deleted))
+	}
+	return participantSvc, nil
+}
+
+func newTeamService(imSvc *im.Service, feishuSvc *feishu.Service, participantSvc *participant.Service) (*team.Service, *team.AdapterRegistry, error) {
+	teamsPath, err := config.DefaultTeamsPath()
+	if err != nil {
+		return nil, nil, err
+	}
+	store, err := team.NewStore(teamsPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	adapter := team.NewCSGClawAdapter(imSvc, participantSvc)
+	registry := team.NewAdapterRegistry(adapter, team.NewFeishuAdapter(feishuSvc, participantSvc))
+	projector := team.NewProjectorWithRegistry(registry, nil)
+	return team.NewService(team.WithStore(store), team.WithProjector(projector)), registry, nil
+}
+
+func newAgentTaskService(engine agentengine.Interface, imSvc *im.Service, participantSvc *participant.Service) (*agenttask.Service, error) {
+	tasksDir, err := config.DefaultTasksDir()
+	if err != nil {
+		return nil, err
+	}
+	store, err := taskcore.NewStore(tasksDir)
+	if err != nil {
+		return nil, err
+	}
+	core := taskcore.NewService(taskcore.WithStore(store))
+	return agenttask.NewService(core, imSvc, engine, participantSvc), nil
+}
+
+func newScheduledTaskService(agentTaskSvc *agenttask.Service) (*scheduledtask.Service, error) {
+	dir, err := config.DefaultScheduledTasksDir()
+	if err != nil {
+		return nil, err
+	}
+	store, err := scheduledtask.NewStore(dir)
+	if err != nil {
+		return nil, err
+	}
+	return scheduledtask.NewService(store, agentTaskSvc)
+}
+
+func buildFeishuComponents() (feishu.AgentCredentialProvider, *feishu.Service, error) {
+	participantsPath, err := defaultParticipantsPath()
+	if err != nil {
+		return nil, nil, err
+	}
+	provider := participantprovider.New(participantsPath)
+	svc, err := NewFeishuService(provider)
+	if err != nil {
+		return nil, nil, err
+	}
+	return provider, svc, nil
+}
+
+func newFeishuService(provider feishu.Provider) (*feishu.Service, error) {
+	return feishu.NewServiceWithProvider(provider), nil
+}
+
+func defaultParticipantsPath() (string, error) {
+	return config.DefaultStatePath()
+}
+
+func newLLMService(cfg config.Config, svc *agent.Controller) (*llm.Service, error) {
+	if svc == nil {
+		return nil, nil
+	}
+	_, modelCfg, err := effectiveLLMConfig(cfg).Resolve("")
+	if err != nil {
+		modelCfg = config.ModelConfig{}
+	}
+	return llm.NewService(modelCfg, svc), nil
+}
+
+func effectiveLLMConfig(cfg config.Config) config.LLMConfig {
+	if !cfg.Models.IsZero() {
+		return cfg.Models.Normalized()
+	}
+	if !cfg.LLM.IsZero() {
+		return cfg.LLM.Normalized()
+	}
+	return config.SingleProfileLLM(cfg.Model)
+}
+
+func formatEffectiveProviders(llmCfg config.LLMConfig) string {
+	llmCfg = llmCfg.Normalized()
+	var b strings.Builder
+	for _, name := range sortedProviderNames(llmCfg.Providers) {
+		provider := llmCfg.Providers[name].Resolved()
+		fmt.Fprintf(&b, `
+[models.providers.%s]
+base_url = %q
+api_key = %q
+models = %s
+`, name, provider.BaseURL, partiallyMaskSecret(provider.APIKey), formatModelList(provider.Models))
+		if provider.ReasoningEffort != "" {
+			fmt.Fprintf(&b, "reasoning_effort = %q\n", provider.ReasoningEffort)
+		}
+	}
+	return b.String()
+}
+
+func sortedProviderNames(providers map[string]config.ProviderConfig) []string {
+	names := make([]string, 0, len(providers))
+	for name := range providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func formatModelList(models []string) string {
+	if len(models) == 0 {
+		return "[]"
+	}
+	quoted := make([]string, 0, len(models))
+	for _, modelID := range models {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			continue
+		}
+		quoted = append(quoted, strconv.Quote(modelID))
+	}
+	if len(quoted) == 0 {
+		return "[]"
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}

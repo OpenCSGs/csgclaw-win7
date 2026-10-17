@@ -1,0 +1,367 @@
+package server
+
+import (
+	"bufio"
+	"bytes"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestAccessLogCapturesImplicitOK(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	handler := accessLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/channels/csgclaw/users?ready=1", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("User-Agent", "test-agent")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	logLine := buf.String()
+	if !strings.Contains(logLine, "level=INFO") {
+		t.Fatalf("expected info log, got %q", logLine)
+	}
+	if !strings.Contains(logLine, "method=GET") {
+		t.Fatalf("expected method in log, got %q", logLine)
+	}
+	if !strings.Contains(logLine, "uri=\"/api/v1/channels/csgclaw/users?ready=1\"") {
+		t.Fatalf("expected uri in log, got %q", logLine)
+	}
+	if !strings.Contains(logLine, "status=200") {
+		t.Fatalf("expected status in log, got %q", logLine)
+	}
+	if !strings.Contains(logLine, "bytes=2") {
+		t.Fatalf("expected bytes in log, got %q", logLine)
+	}
+}
+
+func TestAccessLogCapturesExplicitStatus(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	handler := accessLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/channels/csgclaw/users/u-1", nil))
+
+	logLine := buf.String()
+	if !strings.Contains(logLine, "status=204") {
+		t.Fatalf("expected explicit status in log, got %q", logLine)
+	}
+	if !strings.Contains(logLine, "bytes=0") {
+		t.Fatalf("expected zero bytes in log, got %q", logLine)
+	}
+}
+
+func TestAccessLogWarnsAndCapturesErrorDiagnostics(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	handler := accessLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "local callback url is required", http.StatusBadRequest)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/connectors/github/oauth/start", strings.NewReader(`{}`))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Referer", "http://127.0.0.1:18080/settings")
+	req.Header.Set("User-Agent", "test-agent")
+	req.Header.Set("X-Request-ID", "req-123")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	logLine := buf.String()
+	for _, want := range []string{
+		"level=WARN",
+		"status=400",
+		"error=\"local callback url is required\"",
+		"remote_addr=127.0.0.1:1234",
+		"user_agent=test-agent",
+		"referer=http://127.0.0.1:18080/settings",
+		"content_type=application/json",
+		"content_length=2",
+		"request_id=req-123",
+	} {
+		if !strings.Contains(logLine, want) {
+			t.Fatalf("expected %s in log, got %q", want, logLine)
+		}
+	}
+}
+
+func TestAccessLogRedactsSensitiveQueryValues(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	handler := accessLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/callback?jwt_token=secret-token&return_url=%2Fsettings", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	logLine := buf.String()
+	if strings.Contains(logLine, "secret-token") {
+		t.Fatalf("access log leaked sensitive query value: %q", logLine)
+	}
+	if !strings.Contains(logLine, "jwt_token=%5BREDACTED%5D") {
+		t.Fatalf("access log did not redact sensitive query value: %q", logLine)
+	}
+	if !strings.Contains(logLine, "return_url=%2Fsettings") {
+		t.Fatalf("access log should preserve non-sensitive query value: %q", logLine)
+	}
+}
+
+func TestAccessLogRedactsResponseErrorSecrets(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	handler := accessLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `upstream failed: api_key="sk-secret" Authorization: Bearer token-secret`, http.StatusBadGateway)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/model-providers/default/check", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	logLine := buf.String()
+	if strings.Contains(logLine, "sk-secret") || strings.Contains(logLine, "token-secret") {
+		t.Fatalf("access log leaked response error secret: %q", logLine)
+	}
+	for _, want := range []string{
+		"level=ERROR",
+		"api_key=\\\"[REDACTED]\\\"",
+		"Authorization: Bearer [REDACTED]",
+	} {
+		if !strings.Contains(logLine, want) {
+			t.Fatalf("expected redacted value %s in log, got %q", want, logLine)
+		}
+	}
+}
+
+func TestAccessLogSkipsAgentPolling(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	handler := accessLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("[]"))
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/agents?poll=1", nil))
+
+	if rec.Code != http.StatusOK || rec.Body.String() != "[]" {
+		t.Fatalf("response = %d %q, want 200 []", rec.Code, rec.Body.String())
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("polling request was logged: %q", got)
+	}
+}
+
+func TestAccessLogSkipsHealthzPolling(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	handler := accessLog(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
+		buf.Reset()
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(method, "/healthz?ready=1", nil))
+
+		if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+			t.Fatalf("%s response = %d %q, want 200 ok", method, rec.Code, rec.Body.String())
+		}
+		if got := buf.String(); got != "" {
+			t.Fatalf("%s healthz request was logged: %q", method, got)
+		}
+	}
+}
+
+func TestAccessLogPreservesFlusher(t *testing.T) {
+	handler := accessLog(slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := w.(http.Flusher); !ok {
+			t.Fatal("expected flusher")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(": connected\n\n"))
+		w.(http.Flusher).Flush()
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/events", nil))
+
+	if body := rec.Body.String(); body != ": connected\n\n" {
+		t.Fatalf("unexpected body %q", body)
+	}
+}
+
+func TestAccessLogFlushBeforeWriteDoesNotWriteHeaderTwice(t *testing.T) {
+	handler := accessLog(slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	rec := &headerCountFlusher{header: make(http.Header)}
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/agents/u-manager/logs", nil))
+
+	if rec.writeHeaderCalls != 1 {
+		t.Fatalf("WriteHeader calls = %d, want 1", rec.writeHeaderCalls)
+	}
+	if rec.status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.status, http.StatusOK)
+	}
+	if rec.body.String() != "ok" {
+		t.Fatalf("body = %q, want ok", rec.body.String())
+	}
+}
+
+func TestAccessLogPreservesHijacker(t *testing.T) {
+	var buf bytes.Buffer
+	handler := accessLog(slog.New(slog.NewTextHandler(&buf, nil)), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("expected hijacker")
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatalf("Hijack() error = %v", err)
+		}
+		_ = conn.Close()
+	}))
+
+	rec := &hijackResponseWriter{header: make(http.Header)}
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/bots/u-ux/llm/responses", nil))
+
+	if !rec.hijacked {
+		t.Fatal("response writer was not hijacked")
+	}
+	if logLine := buf.String(); !strings.Contains(logLine, "status=101") {
+		t.Fatalf("log line = %q, want switching-protocols status", logLine)
+	}
+}
+
+type headerCountFlusher struct {
+	header           http.Header
+	body             bytes.Buffer
+	status           int
+	writeHeaderCalls int
+}
+
+func (w *headerCountFlusher) Header() http.Header {
+	return w.header
+}
+
+func (w *headerCountFlusher) WriteHeader(status int) {
+	w.status = status
+	w.writeHeaderCalls++
+}
+
+func (w *headerCountFlusher) Write(p []byte) (int, error) {
+	return w.body.Write(p)
+}
+
+func (w *headerCountFlusher) Flush() {}
+
+type hijackResponseWriter struct {
+	header   http.Header
+	hijacked bool
+}
+
+func (w *hijackResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *hijackResponseWriter) Write([]byte) (int, error) {
+	return 0, http.ErrHijacked
+}
+
+func (w *hijackResponseWriter) WriteHeader(int) {}
+
+func (w *hijackResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	client, server := net.Pipe()
+	_ = client.Close()
+	w.hijacked = true
+	return server, bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server)), nil
+}
+
+func TestAccessLogTerminalSuccessOutputIsConcise(t *testing.T) {
+	origStderr := accessLogStderr
+	origWriter := accessLogWriter
+	origIsTerminalFD := accessLogIsTerminalFD
+	accessLogStderr = os.Stderr
+	var buf bytes.Buffer
+	accessLogWriter = &buf
+	accessLogIsTerminalFD = func(int) bool { return true }
+	defer func() {
+		accessLogStderr = origStderr
+		accessLogWriter = origWriter
+		accessLogIsTerminalFD = origIsTerminalFD
+	}()
+
+	handler := accessLog(slog.New(slog.NewTextHandler(&buf, nil)), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/icons/github.svg", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("User-Agent", "test-agent")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	logLine := buf.String()
+	if !strings.Contains(logLine, "\x1b[36mGET\x1b[0m /icons/github.svg \x1b[32m200\x1b[0m") {
+		t.Fatalf("expected concise colored success log, got %q", logLine)
+	}
+	if strings.Contains(logLine, "remote") || strings.Contains(logLine, "ua") || strings.Contains(logLine, "test-agent") {
+		t.Fatalf("success terminal log should not include verbose request metadata: %q", logLine)
+	}
+}
+
+func TestAccessLogColorsTerminalOutput(t *testing.T) {
+	origStderr := accessLogStderr
+	origWriter := accessLogWriter
+	origIsTerminalFD := accessLogIsTerminalFD
+	accessLogStderr = os.Stderr
+	var buf bytes.Buffer
+	accessLogWriter = &buf
+	accessLogIsTerminalFD = func(int) bool { return true }
+	defer func() {
+		accessLogStderr = origStderr
+		accessLogWriter = origWriter
+		accessLogIsTerminalFD = origIsTerminalFD
+	}()
+
+	handler := accessLog(slog.New(slog.NewTextHandler(&buf, nil)), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/missing", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("User-Agent", "demo-agent")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	logLine := buf.String()
+	if !strings.Contains(logLine, "\x1b[36mGET\x1b[0m /missing \x1b[33m404\x1b[0m") {
+		t.Fatalf("expected colored method in log, got %q", logLine)
+	}
+	if !strings.Contains(logLine, "\x1b[90mbytes\x1b[0m=0") {
+		t.Fatalf("expected colored bytes label in log, got %q", logLine)
+	}
+	if !strings.Contains(logLine, "\x1b[90mremote\x1b[0m=127.0.0.1:1234") {
+		t.Fatalf("expected remote address in log, got %q", logLine)
+	}
+}

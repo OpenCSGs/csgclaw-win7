@@ -1,0 +1,1296 @@
+import {
+  advanceAgentProgress,
+  agentCreateTemplateLocked,
+  agentToDraft,
+  applyTemplateToDraft,
+  availableManagerRebuildRuntimeOptions,
+  availableManagerRuntimeOptions,
+  collectManagerTemplateVariants,
+  defaultManagerRebuildImageForRuntime,
+  defaultWorkerImageForRuntime,
+  agentDraftWithRuntimeFieldsFromAgent,
+  agentDeleteConfirmationMessage,
+  agentAvailabilityStatusLabel,
+  agentGatewayUnavailableLabel,
+  agentRuntimePollSettled,
+  agentRuntimeStatusDetailLabel,
+  isAgentGatewayDegraded,
+  isAgentGatewayAvailabilityUnknown,
+  isAgentRuntimeStartupPending,
+  agentStatusLabel,
+  agentDraftMissingRequiredEnv,
+  agentSandboxEnabled,
+  agentRuntimeName,
+  agentConnectedChannels,
+  draftNotifierRuntimeOptionsForSave,
+  draftRuntimeOptionsForSave,
+  draftToProfile,
+  draftToProfileComparePayload,
+  ensureNotifierPullSubscriptionDraft,
+  envRowsToMap,
+  formatProviderLabel,
+  hasConnectedAgentChannel,
+  isAgentIncomplete,
+  isAgentAvailable,
+  isAgentLifecycleRunning,
+  agentPageLLMProfileChanged,
+  agentProfilePageSaveDisabled,
+  isAgentProfileDraftComplete,
+  isBuiltinOpenClawWorkerTemplate,
+  isAgentRunning,
+  mergeAgentIntoList,
+  isNotificationBotAgent,
+  mapToEnvRows,
+  mcpServersText,
+  partitionWorkspaceAgentItems,
+  notifierComputedPullRoutes,
+  notifierFormIsComplete,
+  notifierThirdPartyRelayWebhookURL,
+  normalizeAuthProviderName,
+  normalizeRuntimeKind,
+  canPublishCommunityTemplateRuntime,
+  parseMCPServersText,
+  notificationPushWebhookPathForBot,
+  parseJSONMap,
+  pickDefaultAgentTemplate,
+  createAgentSelectableTemplates,
+  providerNeedsAuth,
+  resolvedNotifierWebhookOrigin,
+  resolveRuntimeSelection,
+  runtimeConfigFromSelection,
+  resolveAgentChannelUserID,
+  resolveAgentAvatarSource,
+  runtimeImageForKind,
+  runtimeOptionSchemasForAgent,
+  setMCPServers,
+  localizedRuntimeOptionLabel,
+  localizedRuntimeOptionDescription,
+  isAgentUpgradeNeeded,
+  draftMCPServersForSave,
+  supportsMCPServers,
+  shouldWaitForManagerRuntimeAfterProfileSave,
+  workerSelectableTemplates,
+} from "@/models/agents";
+import { AGENT_AVATAR_OPTIONS, selectUnusedAgentAvatar } from "@/shared/avatarOptions";
+
+describe("agent model helpers", () => {
+  it("normalizes agent profiles into editable drafts", () => {
+    const draft = agentToDraft({
+      model_config: {
+        api_key_preview: "sk-...",
+        api_key_set: true,
+        env: { ZED: 1, alpha: "two" },
+        headers: { "X-Trace": "1" },
+        model_id: "qwen3",
+        provider: "api",
+        reasoning_effort: "",
+        request_options: { temperature: 0.2 },
+      },
+      id: "worker-1",
+      image: "worker:latest",
+      instructions: "keep answers short",
+      name: "Worker",
+      role: "worker",
+      runtime_kind: "openclaw_sandbox",
+    });
+
+    expect(draft).toMatchObject({
+      agent_id: "worker-1",
+      api_key_preview: "sk-...",
+      api_key_set: true,
+      image: "worker:latest",
+      instructions: "keep answers short",
+      model_id: "qwen3",
+      name: "Worker",
+      provider: "api",
+      reasoning_effort: "auto",
+      runtime_kind: "openclaw_sandbox",
+    });
+    expect(draft.envRows).toEqual([
+      { key: "alpha", value: "two" },
+      { key: "ZED", value: "1" },
+    ]);
+    expect(JSON.parse(draft.headersText)).toEqual({ "X-Trace": "1" });
+    expect(JSON.parse(draft.requestOptionsText)).toEqual({ temperature: 0.2 });
+  });
+
+  it("preserves an already-resolved avatar as a draft-only value", () => {
+    expect(
+      agentToDraft({
+        avatar: "avatar/cartoon-1.png",
+        id: "worker-1",
+        name: "Worker",
+        role: "worker",
+      }).avatar,
+    ).toBe("avatar/cartoon-1.png");
+  });
+
+  it("converts env rows to maps while rejecting missing and duplicate keys", () => {
+    expect(
+      envRowsToMap([
+        { key: " FOO ", value: "one" },
+        { key: "", value: "" },
+        { key: "BAR", value: "" },
+      ]),
+    ).toEqual({ FOO: "one" });
+
+    expect(() => envRowsToMap([{ key: "", value: "set" }])).toThrow("Environment variable key is required");
+    expect(() =>
+      envRowsToMap([
+        { key: "Path", value: "one" },
+        { key: "PATH", value: "two" },
+      ]),
+    ).toThrow("Duplicate environment variable: PATH");
+  });
+
+  it("keeps draft comparison tolerant while env rows are still being edited", () => {
+    const savedDraft = agentToDraft({
+      agent_profile: {
+        env: { GITLAB_BASE_URL: "https://git-devops.opencsg.com" },
+        model_id: "gpt-test",
+        model_provider_id: "openai",
+      },
+      id: "worker-1",
+      name: "Worker",
+      role: "worker",
+    });
+    const editingDraft = {
+      ...savedDraft,
+      envRows: [...savedDraft.envRows, { key: "", value: "pending" }],
+    };
+
+    expect(() => draftToProfileComparePayload(editingDraft)).not.toThrow();
+    expect(agentPageLLMProfileChanged(editingDraft, savedDraft)).toBe(true);
+    expect(agentProfilePageSaveDisabled(editingDraft, { id: "worker-1" }, { savedDraft })).toBe(false);
+    expect(() => envRowsToMap(editingDraft.envRows)).toThrow("Environment variable key is required");
+  });
+
+  it("merges a fresh action response into the existing agent list", () => {
+    expect(
+      mergeAgentIntoList(
+        [
+          {
+            id: "u-manager",
+            image: "registry.example/opencsghq/picoclaw:2026.05.22",
+            agent_profile: {
+              image_upgrade_required: true,
+              model_id: "gpt-5.5",
+            },
+            status: "running",
+          },
+          { id: "u-alice", image: "registry.example/worker:2026.06.03" },
+        ],
+        {
+          id: "u-manager",
+          image: "registry.example/opencsghq/picoclaw:2026.06.03",
+          agent_profile: {
+            image_upgrade_required: false,
+          },
+        },
+      ),
+    ).toEqual([
+      {
+        id: "u-manager",
+        image: "registry.example/opencsghq/picoclaw:2026.06.03",
+        agent_profile: {
+          image_upgrade_required: false,
+          model_id: "gpt-5.5",
+        },
+        status: "running",
+      },
+      { id: "u-alice", image: "registry.example/worker:2026.06.03" },
+    ]);
+  });
+
+  it("does not mark codex agents as upgradeable even when an image flag is present", () => {
+    expect(
+      isAgentUpgradeNeeded({
+        id: "worker-codex",
+        runtime_kind: "codex",
+        image_upgrade_required: true,
+        agent_profile: {
+          image_upgrade_required: true,
+        },
+      }),
+    ).toBe(false);
+    expect(
+      isAgentUpgradeNeeded({
+        id: "worker-picoclaw",
+        runtime_kind: "picoclaw_sandbox",
+        image_upgrade_required: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("syncs readonly runtime fields from a fresh action response into the agent page draft", () => {
+    const draft = agentToDraft({
+      id: "u-manager",
+      image: "registry.example/opencsghq/picoclaw:2026.05.22",
+      name: "manager",
+      runtime_kind: "picoclaw_sandbox",
+      agent_profile: {
+        model_id: "gpt-5.5",
+        provider: "codex",
+      },
+    });
+
+    expect(
+      agentDraftWithRuntimeFieldsFromAgent(draft, {
+        id: "u-manager",
+        image: "registry.example/opencsghq/picoclaw:2026.06.03",
+        runtime_kind: "picoclaw_sandbox",
+      }),
+    ).toMatchObject({
+      agent_id: "u-manager",
+      image: "registry.example/opencsghq/picoclaw:2026.06.03",
+      default_image: "registry.example/opencsghq/picoclaw:2026.06.03",
+      model_id: "gpt-5.5",
+      provider: "codex",
+      runtime_kind: "picoclaw_sandbox",
+    });
+  });
+
+  it("resolves split runtime fields from legacy runtime kind", () => {
+    expect(runtimeConfigFromSelection({ runtime_kind: "openclaw_sandbox" })).toEqual({
+      name: "openclaw",
+      sandboxed: true,
+    });
+    expect(resolveRuntimeSelection({ runtime_kind: "openclaw_sandbox" })).toEqual({
+      runtime_kind: "openclaw_sandbox",
+      runtime_name: "openclaw",
+      sandbox_enabled: true,
+    });
+    expect(agentRuntimeName({ runtime_kind: "codex" })).toBe("codex");
+    expect(agentSandboxEnabled({ runtime_kind: "codex" })).toBe(false);
+  });
+
+  it("keeps runtime fields in sync when applying a worker template", () => {
+    const draft = applyTemplateToDraft(
+      {
+        ...agentToDraft({
+          runtime_kind: "picoclaw_sandbox",
+          runtime_name: "picoclaw",
+          sandbox_enabled: true,
+          role: "worker",
+        }),
+        default_image: "worker:default",
+      },
+      {
+        id: "builtin.openclaw-worker",
+        runtime_kind: "openclaw_sandbox",
+        role: "worker",
+      },
+      null,
+      "worker:default",
+    );
+
+    expect(draft).toMatchObject({
+      runtime_kind: "openclaw_sandbox",
+      runtime_name: "openclaw",
+      sandbox_enabled: true,
+    });
+  });
+
+  it("inherits template execution mode while preserving explicit local runtime options", () => {
+    const draft = applyTemplateToDraft(
+      {
+        ...agentToDraft({
+          runtime_kind: "codex",
+          role: "worker",
+          runtime_options: { local_workspace_dir: "/tmp/project" },
+        }),
+      },
+      {
+        id: "custom/read-only-worker",
+        runtime_kind: "codex",
+        role: "worker",
+        runtime_options: { execution_mode: "read_only" },
+      },
+      null,
+    );
+
+    expect(draft?.runtime_options).toEqual({
+      execution_mode: "read_only",
+      local_workspace_dir: "/tmp/project",
+    });
+  });
+
+  it("resolves CSGClaw DM identity from participant channel user before runtime agent id", () => {
+    expect(
+      resolveAgentChannelUserID({
+        id: "u-manager",
+        name: "manager",
+        role: "manager",
+        participants: [
+          {
+            agent_id: "u-manager",
+            channel: "csgclaw",
+            channel_user_ref: "manager",
+            id: "manager",
+          },
+        ],
+      }),
+    ).toBe("manager");
+
+    expect(
+      resolveAgentChannelUserID({
+        id: "u-worker",
+        participants: [
+          {
+            agent_id: "u-worker",
+            channel: "csgclaw",
+            id: "worker",
+          },
+        ],
+      }),
+    ).toBe("worker");
+
+    expect(resolveAgentChannelUserID({ id: "u-manager", role: "manager" })).toBe("manager");
+    expect(resolveAgentChannelUserID({ id: "u-worker" })).toBe("u-worker");
+  });
+
+  it("detects app-backed Feishu agent channel connections from participants", () => {
+    const item = {
+      id: "u-dev",
+      participants: [
+        {
+          agent_id: "u-dev",
+          channel: "csgclaw",
+          id: "dev",
+          type: "agent",
+        },
+        {
+          agent_id: "u-dev",
+          channel: "feishu",
+          channel_user_kind: "app_id",
+          id: "dev",
+          type: "agent",
+        },
+      ],
+    };
+
+    expect(agentConnectedChannels(item).map((channel) => channel.id)).toEqual(["feishu"]);
+    expect(hasConnectedAgentChannel(item, "feishu")).toBe(true);
+    expect(
+      hasConnectedAgentChannel(
+        { id: "u-dev", participants: [{ channel: "feishu", id: "admin", type: "human" }] },
+        "feishu",
+      ),
+    ).toBe(false);
+  });
+
+  it("describes agent delete confirmation with bound channels", () => {
+    const message = agentDeleteConfirmationMessage(
+      {
+        id: "u-dev",
+        name: "Demo Agent",
+        participants: [
+          {
+            channel: "csgclaw",
+            id: "dev",
+            type: "agent",
+          },
+          {
+            channel: "feishu",
+            channel_user_kind: "app_id",
+            id: "dev",
+            type: "agent",
+          },
+        ],
+      },
+      (key, params = {}) => {
+        const values: Record<string, string> = {
+          agentDeleteBoundChannels: "This agent is bound to {channels}.",
+          agentDeleteCascadeNote: "Deleting the agent will also disconnect it from those channels.",
+          agentDeleteConfirmMessage: 'Delete agent "{name}"?',
+        };
+        return (values[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => `${params[name] ?? ""}`);
+      },
+    );
+
+    expect(message).toBe(
+      [
+        'Delete agent "Demo Agent"?',
+        "",
+        "This agent is bound to Feishu.",
+        "",
+        "Deleting the agent will also disconnect it from those channels.",
+      ].join("\n"),
+    );
+  });
+
+  it("keeps JSON profile fields object-shaped", () => {
+    expect(parseJSONMap("")).toEqual({});
+    expect(parseJSONMap('{"temperature":0.1}')).toEqual({ temperature: 0.1 });
+    expect(() => parseJSONMap("[1,2,3]")).toThrow("Expected a JSON object");
+
+    expect(
+      draftToProfile({
+        api_key: "",
+        api_key_preview: "",
+        api_key_set: false,
+        base_url: "http://127.0.0.1:11435/v1",
+        enable_fast_mode: true,
+        envRows: [{ key: "MODEL_HOME", value: "/models" }],
+        headersText: '{"Authorization":"Bearer test"}',
+        model_id: "Qwen/Qwen3-0.6B-GGUF",
+        model_provider_id: "csghub-lite",
+        provider: "csghub_lite",
+        reasoning_effort: "",
+        requestOptionsText: '{"top_p":0.9}',
+        runtime_kind: "picoclaw_sandbox",
+      }),
+    ).toMatchObject({
+      enable_fast_mode: true,
+      env: { MODEL_HOME: "/models" },
+      headers: {},
+      reasoning_effort: "auto",
+      request_options: { top_p: 0.9 },
+    });
+  });
+
+  it("does not serialize hidden OpenAPI fields for CSGHub Lite profiles", () => {
+    expect(
+      draftToProfile({
+        api_key: "stale-key",
+        api_key_preview: "",
+        api_key_set: false,
+        base_url: "https://api.deepseek.com",
+        enable_fast_mode: false,
+        envRows: [],
+        headersText: '{"X-Stale":"1"}',
+        model_id: "Qwen3-0.6B-GGUF",
+        provider: "csghub_lite",
+        reasoning_effort: "medium",
+        requestOptionsText: "{}",
+        runtime_kind: "codex",
+      }),
+    ).toMatchObject({
+      base_url: "",
+      api_key: "",
+      headers: {},
+      model_id: "Qwen3-0.6B-GGUF",
+    });
+
+    expect(
+      draftToProfile({
+        api_key: "stale-key",
+        api_key_preview: "",
+        api_key_set: false,
+        base_url: "https://api.deepseek.com",
+        enable_fast_mode: false,
+        envRows: [],
+        headersText: '{"X-Stale":"1"}',
+        model_id: "deepseek-v4-flash",
+        provider: "csghub",
+        reasoning_effort: "medium",
+        requestOptionsText: "{}",
+        runtime_kind: "picoclaw_sandbox",
+      }),
+    ).toMatchObject({
+      base_url: "",
+      api_key: "",
+      headers: {},
+      model_id: "deepseek-v4-flash",
+    });
+  });
+
+  it("merges generic runtime options into the saved payload", () => {
+    expect(
+      draftRuntimeOptionsForSave({
+        runtime_options: {
+          ignored_empty: "   ",
+          local_workspace_dir: "  /tmp/project  ",
+        },
+      }),
+    ).toEqual({
+      local_workspace_dir: "/tmp/project",
+    });
+    expect(
+      draftRuntimeOptionsForSave({
+        runtime_options: {
+          local_workspace_dir: "   ",
+        },
+      }),
+    ).toBeNull();
+
+    expect(
+      runtimeOptionSchemasForAgent("codex", null, {
+        runtime_option_schemas: {
+          codex: [
+            {
+              key: "local_workspace_dir",
+              path: "local_workspace_dir",
+              label: "Local Workspace Dir",
+              label_zh: "本地工作目录",
+              label_en: "Local Workspace Dir",
+              description_zh: "留空时使用默认 Agent 工作目录。",
+              description_en: "Leave empty to use the default agent workspace.",
+            },
+          ],
+        },
+      }),
+    ).toEqual([
+      {
+        key: "local_workspace_dir",
+        path: "local_workspace_dir",
+        label: "Local Workspace Dir",
+        label_zh: "本地工作目录",
+        label_en: "Local Workspace Dir",
+        description: "",
+        description_zh: "留空时使用默认 Agent 工作目录。",
+        description_en: "Leave empty to use the default agent workspace.",
+        type: "text",
+        required: false,
+        picker: "",
+        options: [],
+        choices: [],
+        default_value: "",
+        presentation: "",
+      },
+    ]);
+    expect(
+      runtimeOptionSchemasForAgent(
+        "codex",
+        {
+          id: "agent-manager",
+          role: "manager",
+          runtime: {
+            option_schemas: [
+              {
+                path: "local_workspace_dir",
+                label: "Local Workspace Dir",
+              },
+            ],
+          },
+        },
+        {
+          runtime_option_schemas: {
+            codex: [
+              {
+                path: "local_workspace_dir",
+                label: "Local Workspace Dir",
+              },
+            ],
+          },
+        },
+      ),
+    ).toEqual([]);
+    expect(
+      localizedRuntimeOptionLabel(
+        {
+          path: "local_workspace_dir",
+          label: "Local Workspace Dir",
+          label_zh: "本地工作目录",
+          label_en: "Local Workspace Dir",
+        },
+        "zh",
+      ),
+    ).toBe("本地工作目录");
+    expect(
+      localizedRuntimeOptionDescription(
+        {
+          path: "local_workspace_dir",
+          description_zh: "留空时使用默认 Agent 工作目录。",
+          description_en: "Leave empty to use the default agent workspace.",
+        },
+        "en",
+      ),
+    ).toBe("Leave empty to use the default agent workspace.");
+  });
+
+  it("parses and saves MCP servers as a direct map", () => {
+    const parsed = parseMCPServersText('{"context7":{"command":"npx","args":["-y"]}}');
+
+    expect(parsed).toEqual({
+      ok: true,
+      value: {
+        context7: {
+          command: "npx",
+          args: ["-y"],
+        },
+      },
+    });
+    expect(parseMCPServersText("")).toEqual({ ok: true, value: null });
+    expect(parseMCPServersText("[1]")).toEqual({ ok: false, error: "object_required" });
+    expect(parseMCPServersText("{")).toEqual({ ok: false, error: "invalid_json" });
+    expect(supportsMCPServers("openclaw_sandbox")).toBe(true);
+    expect(supportsMCPServers("picoclaw_sandbox")).toBe(true);
+    expect(supportsMCPServers("codex")).toBe(true);
+
+    const mcpServers = setMCPServers({ context7: { command: "npx" } });
+    expect(mcpServers).toEqual({
+      context7: {
+        command: "npx",
+      },
+    });
+    expect(mcpServersText(mcpServers)).toContain('"context7"');
+    expect(draftMCPServersForSave({ mcpServers })).toEqual(mcpServers);
+    expect(mcpServersText({})).toBe("{}");
+    expect(draftMCPServersForSave({ mcpServers: undefined })).toBeUndefined();
+    expect(draftMCPServersForSave({ mcpServers: null })).toBeNull();
+    expect(draftMCPServersForSave({ mcpServers: {} })).toEqual({});
+    expect(draftRuntimeOptionsForSave({ runtime_options: { local_workspace_dir: "/tmp/project" } })).toEqual({
+      local_workspace_dir: "/tmp/project",
+    });
+    expect(setMCPServers(null)).toBeNull();
+  });
+
+  it("selects runtime-specific templates and images", () => {
+    const templates = [
+      { id: "builtin.manager-codex", name: "manager-codex", role: "manager", runtime_kind: "codex" },
+      { id: "builtin.codex-worker", name: "generic-assistant-codex", role: "worker", runtime_kind: "codex" },
+      { id: "custom/worker", name: "custom-worker", runtime_kind: "picoclaw_sandbox" },
+      { id: "builtin.openclaw-worker", name: "openclaw-worker", runtime_kind: "openclaw_sandbox" },
+      { id: "builtin.picoclaw-worker", name: "picoclaw-worker", runtime_kind: "picoclaw_sandbox" },
+    ];
+    const bootstrapConfig = {
+      default_worker_template: "custom/worker",
+      effective_manager_image: "manager:effective",
+      runtime_default_images: {
+        openclaw_sandbox: "openclaw:worker",
+        picoclaw_sandbox: "picoclaw:worker",
+      },
+      runtime_kind: "openclaw_sandbox",
+    };
+
+    expect(pickDefaultAgentTemplate(templates, "picoclaw_sandbox", bootstrapConfig)?.id).toBe("custom/worker");
+    expect(pickDefaultAgentTemplate(templates, "openclaw_sandbox", bootstrapConfig)?.id).toBe(
+      "builtin.openclaw-worker",
+    );
+    expect(pickDefaultAgentTemplate(templates, "notification", bootstrapConfig)).toBeNull();
+    expect(pickDefaultAgentTemplate(templates, "codex", bootstrapConfig)?.id).toBe("builtin.codex-worker");
+    expect(runtimeImageForKind("openclaw_sandbox", bootstrapConfig, "fallback:worker")).toBe("openclaw:worker");
+    expect(defaultWorkerImageForRuntime(templates, "openclaw_sandbox", bootstrapConfig, "fallback:worker")).toBe(
+      "openclaw:worker",
+    );
+    expect(runtimeImageForKind("codex", bootstrapConfig, "fallback:worker")).toBe("");
+    expect(runtimeImageForKind("notification", bootstrapConfig, "fallback:worker")).toBe("");
+
+    expect(
+      applyTemplateToDraft(
+        {
+          api_key: "",
+          api_key_preview: "",
+          api_key_set: false,
+          base_url: "",
+          enable_fast_mode: false,
+          envRows: [],
+          headersText: "{}",
+          model_id: "",
+          provider: "csghub_lite",
+          reasoning_effort: "medium",
+          requestOptionsText: "{}",
+          runtime_kind: "picoclaw_sandbox",
+        },
+        templates[3],
+        bootstrapConfig,
+      ),
+    ).toMatchObject({
+      from_template: "builtin.openclaw-worker",
+      image: "openclaw:worker",
+      runtime_kind: "openclaw_sandbox",
+      template_name: "openclaw-worker",
+    });
+  });
+
+  it("falls back to matching worker template images when runtime bootstrap image defaults are stale", () => {
+    const templates = [
+      {
+        id: "builtin.picoclaw-worker",
+        name: "picoclaw-worker",
+        role: "worker",
+        runtime_kind: "picoclaw_sandbox",
+        image: "picoclaw:worker",
+      },
+      {
+        id: "builtin.openclaw-worker",
+        name: "openclaw-worker",
+        role: "worker",
+        runtime_kind: "openclaw_sandbox",
+        image: "openclaw:worker",
+      },
+    ];
+
+    expect(
+      defaultWorkerImageForRuntime(
+        templates,
+        "openclaw_sandbox",
+        {
+          default_worker_template: "builtin.picoclaw-worker",
+          runtime_default_images: {
+            picoclaw_sandbox: "picoclaw:worker",
+          },
+          runtime_kind: "picoclaw_sandbox",
+        },
+        "picoclaw:current",
+      ),
+    ).toBe("openclaw:worker");
+  });
+
+  it("excludes manager templates from worker template choices", () => {
+    const templates = [
+      { id: "builtin.manager-codex", name: "manager-codex", role: "manager", runtime_kind: "codex" },
+      { id: "builtin.picoclaw-worker", name: "picoclaw-worker", role: "worker", runtime_kind: "picoclaw_sandbox" },
+      { id: "custom/roleless", name: "roleless", runtime_kind: "picoclaw_sandbox" },
+    ];
+
+    expect(workerSelectableTemplates(templates).map((item) => item.id)).toEqual([
+      "builtin.picoclaw-worker",
+      "custom/roleless",
+    ]);
+    expect(pickDefaultAgentTemplate(templates, "picoclaw_sandbox", null)?.id).toBe("builtin.picoclaw-worker");
+  });
+
+  it("excludes only the builtin OpenClaw template from create-agent template choices", () => {
+    const templates = [
+      { id: "builtin.codex-worker", name: "generic-assistant-codex", role: "worker", runtime_kind: "codex" },
+      {
+        id: "builtin.openclaw-worker",
+        name: "generic-assistant-openclaw",
+        role: "worker",
+        runtime_kind: "openclaw_sandbox",
+      },
+      {
+        id: "Agentic/feishu-assistant",
+        name: "feishu-assistant",
+        role: "worker",
+        runtime_kind: "openclaw_sandbox",
+      },
+      { id: "local.review-worker", name: "review-worker", role: "worker", runtime_kind: "codex" },
+    ];
+
+    expect(createAgentSelectableTemplates(templates).map((item) => item.id)).toEqual([
+      "builtin.codex-worker",
+      "Agentic/feishu-assistant",
+      "local.review-worker",
+    ]);
+    expect(isBuiltinOpenClawWorkerTemplate(templates[1])).toBe(true);
+    expect(isBuiltinOpenClawWorkerTemplate(templates[2])).toBe(false);
+  });
+
+  it("applies template image_env contracts to draft env rows", () => {
+    expect(
+      applyTemplateToDraft(
+        {
+          api_key: "",
+          api_key_preview: "",
+          api_key_set: false,
+          base_url: "",
+          enable_fast_mode: false,
+          envRows: [{ key: "OLD", value: "keep" }],
+          headersText: "{}",
+          model_id: "",
+          provider: "csghub_lite",
+          reasoning_effort: "medium",
+          requestOptionsText: "{}",
+          runtime_kind: "picoclaw_sandbox",
+        },
+        {
+          id: "custom/gitlab",
+          name: "gitlab-assistant",
+          runtime_kind: "picoclaw_sandbox",
+          image_env: [
+            { name: "GITLAB_TOKEN", required: true, secret: true },
+            { name: "GITLAB_URL", default: "https://gitlab.example.com" },
+          ],
+        },
+        null,
+      )?.envRows,
+    ).toEqual([
+      { key: "GITLAB_TOKEN", required: true, value: "" },
+      { key: "GITLAB_URL", required: false, value: "https://gitlab.example.com" },
+    ]);
+    expect(agentDraftMissingRequiredEnv({ envRows: [{ key: "GITLAB_TOKEN", required: true, value: "" }] })).toBe(true);
+    expect(agentDraftMissingRequiredEnv({ envRows: [{ key: "GITLAB_TOKEN", required: true, value: "token" }] })).toBe(
+      false,
+    );
+  });
+
+  it("uses Codex as the only manager runtime option", () => {
+    expect(
+      availableManagerRuntimeOptions({
+        supported_runtime_kinds: ["picoclaw_sandbox", "openclaw_sandbox", "codex", "notifier", "picoclaw_sandbox"],
+      }).map((option) => option.value),
+    ).toEqual(["codex"]);
+
+    expect(availableManagerRuntimeOptions(null).map((option) => option.value)).toEqual(["codex"]);
+  });
+
+  it("prefers a user-set avatar over the agent avatar when available", () => {
+    const usersById = new Map([
+      ["u-gitlab", { id: "u-gitlab", avatar: "avatar/cartoon-3.png", name: "GitLab Assistant" }],
+    ]);
+
+    expect(
+      resolveAgentAvatarSource(
+        {
+          id: "u-gitlab",
+          avatar: "GI",
+          name: "GitLab Assistant",
+          role: "worker",
+        },
+        usersById,
+      ),
+    ).toBe("avatar/cartoon-3.png");
+  });
+
+  it("resolves migrated agent avatars from linked IM users", () => {
+    const usersById = new Map([["user-dahym7", { id: "user-dahym7", avatar: "avatar/3D-5.png", name: "qa" }]]);
+
+    expect(
+      resolveAgentAvatarSource(
+        {
+          id: "agent-dahym7",
+          name: "qa",
+          role: "worker",
+          participants: [
+            {
+              agent_id: "agent-dahym7",
+              channel: "csgclaw",
+              channel_user_kind: "local_user_id",
+              channel_user_ref: "user-dahym7",
+              id: "pt-dahym7",
+              type: "agent",
+            },
+          ],
+        },
+        usersById,
+      ),
+    ).toBe("avatar/3D-5.png");
+  });
+
+  it("resolves migrated agent avatars from canonical IM users without a local participant", () => {
+    const usersById = new Map([["user-zoyz2k", { id: "user-zoyz2k", avatar: "avatar/3D-3.png", name: "dev" }]]);
+
+    expect(
+      resolveAgentAvatarSource(
+        {
+          id: "agent-zoyz2k",
+          name: "dev",
+          role: "worker",
+          participants: [
+            {
+              agent_id: "agent-zoyz2k",
+              channel: "feishu",
+              channel_user_kind: "app_id",
+              id: "pt-zoyz2k-5905c292",
+              type: "agent",
+            },
+          ],
+        },
+        usersById,
+      ),
+    ).toBe("avatar/3D-3.png");
+  });
+
+  it("selects a built-in avatar that is not already used", () => {
+    const availableAvatar = AGENT_AVATAR_OPTIONS.at(-1)?.value || "";
+    const sources = AGENT_AVATAR_OPTIONS.slice(0, -1).map((option) => ({ avatar: option.value }));
+
+    expect(selectUnusedAgentAvatar(sources)).toBe(availableAvatar);
+  });
+
+  it("keeps manager rebuild runtime and image fixed to Codex", () => {
+    const variants = collectManagerTemplateVariants([
+      {
+        id: "builtin.manager-codex",
+        role: "manager",
+        runtime_kind: "codex",
+        image: "",
+      },
+      {
+        id: "builtin.openclaw-worker",
+        role: "worker",
+        runtime_kind: "openclaw_sandbox",
+        image: "openclaw:worker",
+      },
+      {
+        id: "duplicate.manager-codex",
+        role: "manager",
+        runtime_kind: "codex",
+        image: "",
+      },
+    ]);
+
+    expect(variants).toEqual([{ runtimeKind: "codex", image: "" }]);
+    expect(
+      availableManagerRebuildRuntimeOptions(
+        variants,
+        { supported_runtime_kinds: ["codex", "picoclaw_sandbox"] },
+        "custom_sandbox",
+      ).map((option) => option.value),
+    ).toEqual(["codex"]);
+    expect(
+      defaultManagerRebuildImageForRuntime(
+        variants,
+        "codex",
+        { runtime_default_images: { picoclaw_sandbox: "picoclaw:latest" } },
+        "picoclaw:old",
+      ),
+    ).toBe("");
+    expect(
+      defaultManagerRebuildImageForRuntime(
+        [],
+        "codex",
+        {
+          effective_manager_image: "picoclaw:effective-manager",
+          runtime_default_images: { picoclaw_sandbox: "picoclaw:worker" },
+          runtime_kind: "picoclaw_sandbox",
+        },
+        "fallback:manager",
+      ),
+    ).toBe("");
+  });
+
+  it("normalizes runtime and auth provider labels", () => {
+    expect(normalizeRuntimeKind("codex")).toBe("codex");
+    expect(notificationPushWebhookPathForBot("u-test")).toBe(
+      "/api/v1/channels/csgclaw/participants/u-test/notifications",
+    );
+    expect(normalizeRuntimeKind("unknown")).toBe("unknown");
+    expect(normalizeAuthProviderName("claude-code")).toBe("claude_code");
+    expect(providerNeedsAuth("claude")).toBe(true);
+    expect(providerNeedsAuth("api")).toBe(false);
+    expect(formatProviderLabel("csghub_lite")).toBe("CSGHub Lite");
+    expect(formatProviderLabel("csghub")).toBe("OpenCSG");
+  });
+
+  it("allows Codex and DSH templates to publish to the community", () => {
+    expect(canPublishCommunityTemplateRuntime("codex")).toBe(true);
+    expect(canPublishCommunityTemplateRuntime("dsh")).toBe(true);
+    expect(canPublishCommunityTemplateRuntime("openclaw_sandbox")).toBe(false);
+    expect(canPublishCommunityTemplateRuntime("picoclaw")).toBe(false);
+  });
+
+  it("advances agent creation progress toward each step target", () => {
+    expect(advanceAgentProgress(null)).toBeNull();
+    expect(
+      advanceAgentProgress({
+        index: 0,
+        percent: 4,
+        startedAt: 1,
+        status: "running",
+        steps: [{ label: "configure", target: 16 }],
+      }),
+    ).toMatchObject({ index: 0, percent: 8 });
+    expect(
+      advanceAgentProgress({
+        index: 0,
+        percent: 16,
+        startedAt: 1,
+        status: "running",
+        steps: [
+          { label: "configure", target: 16 },
+          { label: "start", target: 88 },
+        ],
+      }),
+    ).toMatchObject({ index: 1, percent: 16 });
+  });
+
+  it("maps non-object env values to one blank editable row", () => {
+    expect(mapToEnvRows(null)).toEqual([{ key: "", value: "" }]);
+    expect(mapToEnvRows(["not", "a", "map"])).toEqual([{ key: "", value: "" }]);
+  });
+
+  it("normalizes notification bot runtime options outside request options", () => {
+    const draft = agentToDraft({
+      id: "n-1",
+      name: "Notifier",
+      role: "worker",
+      type: "notification",
+      runtime_options: {
+        delivery_mode: "remote_pull",
+        remote_url: "https://relay.example.com/api/v1/inbox/messages",
+        notification_profile: { delivery_complete: true, remote_token_set: true },
+      },
+    });
+
+    expect(draft.bot_type).toBe("notification");
+    expect(draft.notifier_delivery_mode).toBe("remote_pull");
+    expect(draft.notifier_remote_url).toBe("https://relay.example.com/api/v1/inbox/messages");
+    expect(draft.notifier_delivery_complete).toBe(true);
+    expect(notifierFormIsComplete(draft)).toBe(true);
+    expect(isAgentIncomplete({ type: "notification", runtime_options: {} })).toBe(true);
+    expect(isAgentIncomplete({ type: "notification", available: true, runtime_options: {} })).toBe(false);
+  });
+
+  it("treats a saved profile draft as configured even when profile_complete is false", () => {
+    const draft = agentToDraft({
+      id: "u-manager",
+      profile_complete: false,
+      agent_profile: {
+        profile_complete: false,
+        provider: "api",
+        model_provider_id: "openai",
+        api_key_set: true,
+        base_url: "https://api.example/v1",
+        model_id: "glm-5.1",
+      },
+    });
+
+    expect(
+      isAgentIncomplete(
+        { id: "u-manager", profile_complete: false, agent_profile: { profile_complete: false } },
+        draft,
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps lifecycle status offline and provides a separate container detail", () => {
+    const t = (key: string) => key;
+    const dockerAgent = (status: string) => ({ status, runtime: { state: status, sandbox_provider: "docker" } });
+    expect(agentStatusLabel("profile_incomplete", t)).toBe("offline");
+    expect(agentStatusLabel("exited", t)).toBe("offline");
+    expect(agentRuntimeStatusDetailLabel(dockerAgent("created"), t)).toBe("agentContainerCreated");
+    expect(agentRuntimeStatusDetailLabel(dockerAgent("paused"), t)).toBe("agentContainerPaused");
+    expect(agentRuntimeStatusDetailLabel(dockerAgent("restarting"), t)).toBe("agentContainerRestarting");
+    expect(agentRuntimeStatusDetailLabel(dockerAgent("removing"), t)).toBe("agentContainerRemoving");
+    expect(agentRuntimeStatusDetailLabel(dockerAgent("exited"), t)).toBe("agentContainerStopped");
+    expect(agentRuntimeStatusDetailLabel(dockerAgent("dead"), t)).toBe("agentContainerDead");
+    expect(agentRuntimeStatusDetailLabel({ status: "stopped", runtime: { sandbox_provider: "boxlite" } }, t)).toBe("");
+    expect(agentRuntimeStatusDetailLabel({ status: "stopped", runtime_kind: "codex" }, t)).toBe("");
+    expect(agentStatusLabel("running", t)).toBe("online");
+    expect(agentStatusLabel("starting", t)).toBe("agentStatusStarting");
+  });
+
+  it.each(["created", "paused", "restarting", "removing", "stopped", "exited", "dead", "unknown"])(
+    "treats %s lifecycle status as offline",
+    (status) => {
+      expect(isAgentLifecycleRunning({ status })).toBe(false);
+    },
+  );
+
+  it("shows the agent as offline whenever its container is not running", () => {
+    const t = (key: string) => key;
+    expect(agentAvailabilityStatusLabel({ status: "exited" }, t)).toBe("offline");
+    expect(agentAvailabilityStatusLabel({ status: "created", runtime: { startup_pending: true } }, t)).toBe("offline");
+  });
+
+  it("reads the server-owned configured runtime startup marker", () => {
+    expect(isAgentRuntimeStartupPending({ runtime: { startup_pending: true } })).toBe(true);
+    expect(isAgentRuntimeStartupPending({ runtime: { startup_pending: false } })).toBe(false);
+  });
+
+  it("keeps the last degraded observation visible until the server reports readiness", () => {
+    const degradedGateway = {
+      status: "running",
+      runtime: { state: "running", availability: { state: "degraded", expires_at: "2026-07-30T04:30:00Z" } },
+    };
+    expect(isAgentGatewayDegraded(degradedGateway, Date.parse("2026-07-30T04:29:59Z"))).toBe(true);
+    expect(isAgentGatewayDegraded(degradedGateway, Date.parse("2026-07-30T04:30:00Z"))).toBe(true);
+    expect(isAgentGatewayDegraded(degradedGateway, Date.parse("2026-07-30T04:35:00Z"))).toBe(true);
+  });
+
+  it("does not show a degraded gateway runtime as online", () => {
+    const degradedGateway = {
+      status: "running",
+      runtime: {
+        state: "running",
+        availability: {
+          state: "degraded",
+          reason: "control_plane_unavailable",
+          expires_at: "2099-01-01T00:00:00Z",
+        },
+      },
+    };
+    expect(isAgentRunning(degradedGateway)).toBe(true);
+    expect(isAgentAvailable(degradedGateway)).toBe(false);
+    expect(agentAvailabilityStatusLabel(degradedGateway, (key) => key)).toBe("offline");
+    expect(agentGatewayUnavailableLabel(degradedGateway, (key) => key)).toBe("agentRuntimeDockerUnavailable");
+  });
+
+  it("uses user-facing runtime failure labels instead of gateway terminology", () => {
+    const degradedRuntime = (reason: string) => ({
+      runtime: { availability: { state: "degraded", reason } },
+    });
+    const t = (key: string) => key;
+
+    expect(agentGatewayUnavailableLabel(degradedRuntime("readiness_failed"), t)).toBe("agentRuntimeServiceUnavailable");
+    expect(agentGatewayUnavailableLabel(degradedRuntime("probe_timed_out"), t)).toBe("agentRuntimeCheckTimedOut");
+    expect(agentGatewayUnavailableLabel(degradedRuntime("runtime_not_found"), t)).toBe("agentRuntimeNotFound");
+    expect(agentGatewayUnavailableLabel(degradedRuntime("runtime_busy"), t)).toBe("agentRuntimeBusy");
+    expect(agentGatewayUnavailableLabel(degradedRuntime("unexpected_reason"), t)).toBe(
+      "agentRuntimeServiceUnavailable",
+    );
+  });
+
+  it("does not show an unknown sandbox availability gap as online", () => {
+    const checkingGateway = {
+      status: "running",
+      runtime_kind: "openclaw_sandbox",
+      runtime: {
+        kind: "openclaw_sandbox",
+        state: "running",
+        availability: {
+          state: "unknown",
+          expires_at: "2099-01-01T00:00:00Z",
+        },
+      },
+    };
+    expect(isAgentGatewayAvailabilityUnknown(checkingGateway)).toBe(true);
+    expect(isAgentRunning(checkingGateway)).toBe(true);
+    expect(isAgentAvailable(checkingGateway)).toBe(false);
+    expect(isAgentLifecycleRunning(checkingGateway)).toBe(true);
+    expect(agentAvailabilityStatusLabel(checkingGateway, (key) => key)).toBe("agentStatusChecking");
+  });
+
+  it("waits for manager runtime only when profile save may bootstrap sandbox", () => {
+    const runningManager = {
+      id: "u-manager",
+      box_id: "box-manager",
+      profile_complete: true,
+      status: "running",
+    };
+    const stoppedManager = { ...runningManager, status: "stopped" };
+
+    expect(shouldWaitForManagerRuntimeAfterProfileSave(runningManager)).toBe(false);
+    expect(shouldWaitForManagerRuntimeAfterProfileSave(stoppedManager)).toBe(false);
+    expect(shouldWaitForManagerRuntimeAfterProfileSave(runningManager, { profileIncompleteBeforeSave: true })).toBe(
+      true,
+    );
+    expect(shouldWaitForManagerRuntimeAfterProfileSave({ ...runningManager, box_id: "" })).toBe(true);
+    expect(
+      shouldWaitForManagerRuntimeAfterProfileSave({
+        id: "u-manager",
+        profile_complete: false,
+        status: "profile_incomplete",
+      }),
+    ).toBe(true);
+  });
+
+  it("treats settled manager runtime states as complete for polling", () => {
+    expect(
+      agentRuntimePollSettled({
+        id: "u-manager",
+        box_id: "box-manager",
+        status: "stopped",
+      }),
+    ).toBe(true);
+    expect(
+      agentRuntimePollSettled({
+        id: "u-manager",
+        box_id: "",
+        profile_complete: true,
+        status: "stopped",
+      }),
+    ).toBe(true);
+    expect(
+      agentRuntimePollSettled({
+        id: "u-manager",
+        box_id: "",
+        profile_complete: false,
+        status: "profile_incomplete",
+      }),
+    ).toBe(false);
+  });
+
+  it("allows meta-only agent page saves while LLM profile is incomplete", () => {
+    const savedDraft = agentToDraft({
+      id: "u-manager",
+      name: "Manager",
+      avatar: "avatar-a",
+      description: "desc",
+      provider: "api",
+      profile_complete: false,
+    });
+    const avatarOnlyDraft = { ...savedDraft, avatar: "avatar-b" };
+    const descriptionOnlyDraft = { ...savedDraft, description: "updated desc" };
+
+    expect(agentPageLLMProfileChanged(avatarOnlyDraft, savedDraft)).toBe(false);
+    expect(agentPageLLMProfileChanged(descriptionOnlyDraft, savedDraft)).toBe(false);
+    expect(agentProfilePageSaveDisabled(avatarOnlyDraft, { id: "u-manager" }, { savedDraft })).toBe(false);
+    expect(agentProfilePageSaveDisabled(descriptionOnlyDraft, { id: "u-manager" }, { savedDraft })).toBe(false);
+  });
+
+  it("blocks agent page saves when LLM profile fields change while incomplete", () => {
+    const savedDraft = agentToDraft({
+      id: "u-manager",
+      name: "Manager",
+      provider: "api",
+      profile_complete: false,
+    });
+    const modelChangedDraft = { ...savedDraft, model_id: "gpt-test", base_url: "https://api.example.test/v1" };
+
+    expect(agentPageLLMProfileChanged(modelChangedDraft, savedDraft)).toBe(true);
+    expect(agentProfilePageSaveDisabled(modelChangedDraft, { id: "u-manager" }, { savedDraft })).toBe(true);
+  });
+
+  it("requires a catalog provider reference for model draft completeness", () => {
+    expect(
+      isAgentProfileDraftComplete({
+        provider: "api",
+        base_url: "https://api.example.test/v1",
+        model_id: "gpt-test",
+      }),
+    ).toBe(false);
+    expect(
+      isAgentProfileDraftComplete({
+        provider: "api",
+        api_key_set: true,
+        base_url: "https://api.example.test/v1",
+        model_provider_id: "openai",
+        model_id: "gpt-test",
+      }),
+    ).toBe(true);
+  });
+
+  it("locks runtime and image on create when a template is selected", () => {
+    expect(agentCreateTemplateLocked({ from_template: "" }, "create")).toBe(false);
+    expect(agentCreateTemplateLocked({ from_template: "builtin.picoclaw-worker" }, "create")).toBe(true);
+    expect(agentCreateTemplateLocked({ from_template: "builtin.picoclaw-worker" }, "edit")).toBe(false);
+  });
+
+  it("builds notifier pull subscriptions and route previews", () => {
+    const draft = ensureNotifierPullSubscriptionDraft({
+      bot_type: "notification",
+      notifier_delivery_mode: "remote_pull",
+    }) as ReturnType<typeof agentToDraft>;
+
+    expect(draft.notifier_remote_subscription_id).toMatch(/^sub-/);
+    expect(
+      draftNotifierRuntimeOptionsForSave({
+        ...draft,
+        notifier_remote_url: "https://relay.example.com/api/v1/webhooks/ingress",
+        notifier_remote_token: "token",
+      }),
+    ).toMatchObject({
+      delivery_mode: "remote_pull",
+      remote_url: "https://relay.example.com/api/v1/webhooks/ingress",
+      remote_token: "token",
+    });
+    expect(notifierComputedPullRoutes("https://relay.example.com/api/v1/webhooks/ingress")).toEqual({
+      messages: "https://relay.example.com/api/v1/inbox/messages",
+      ack: "https://relay.example.com/api/v1/inbox/ack",
+    });
+    expect(notifierThirdPartyRelayWebhookURL("https://relay.example.com/api/v1/inbox/messages", "sub-1")).toBe(
+      "https://relay.example.com/api/v1/webhooks/ingress?subscription_id=sub-1",
+    );
+    expect(notifierThirdPartyRelayWebhookURL("http://opencsg-stg.com/api/v1/csgbot/notification-relay", "sub-1")).toBe(
+      "http://opencsg-stg.com/api/v1/csgbot/notification-relay/webhooks/ingress?subscription_id=sub-1",
+    );
+    expect(notifierThirdPartyRelayWebhookURL("https://relay.example.com", "sub-1")).toBe(
+      "https://relay.example.com/webhooks/ingress?subscription_id=sub-1",
+    );
+  });
+
+  it("partitions workspace agents into workers and notification bots", () => {
+    const agents = [
+      { id: "u-manager", role: "manager", type: "normal" },
+      { id: "u-worker", role: "worker", type: "normal" },
+      { id: "u-notify", role: "worker", type: "notification" },
+    ];
+    const { workerAgentItems, notificationAgentItems } = partitionWorkspaceAgentItems(agents);
+    expect(workerAgentItems.map((item) => item.id)).toEqual(["u-manager", "u-worker"]);
+    expect(notificationAgentItems.map((item) => item.id)).toEqual(["u-notify"]);
+    expect(isNotificationBotAgent({ type: "notification" })).toBe(true);
+    expect(isNotificationBotAgent({ bot_type: "notification" })).toBe(true);
+  });
+
+  it("uses bootstrap advertise_base_url for notifier webhook origin", () => {
+    expect(resolvedNotifierWebhookOrigin(null)).toBe("");
+    expect(resolvedNotifierWebhookOrigin({ advertise_base_url: "http://127.0.0.1:18080/" })).toBe(
+      "http://127.0.0.1:18080",
+    );
+  });
+});

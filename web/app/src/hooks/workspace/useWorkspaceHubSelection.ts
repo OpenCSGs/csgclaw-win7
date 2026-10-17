@@ -1,0 +1,747 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { errorMessage } from "@/api/client";
+import { fetchHubWorkspace, fetchHubWorkspaceFile, updateHubWorkspaceFile } from "@/api/hub";
+import { hasSkillName, isOfficialSkill, isPersonalSkill } from "@/models/skillhub";
+import { mergeHubTemplateDetail, type HubWorkspaceFile } from "@/models/hubWorkspace";
+import { resolveHubListSelection } from "@/models/hubSelection";
+import { WorkspacePaneTypes } from "@/models/routing";
+import { flattenWorkspaceDirectoryListings } from "@/models/workspace";
+import type { WorkspaceDirectoryListings } from "@/models/workspace";
+import { useWorkspaceUiStore } from "./workspaceUiStore";
+import type { HubResourceType } from "./workspaceUiStore";
+import { useWorkspaceMCPSelection } from "./useWorkspaceMCPSelection";
+import { useWorkspaceKnowledgeBaseSelection } from "./useWorkspaceKnowledgeBaseSelection";
+import {
+  workspaceQueryKeys,
+  useWorkspaceHubTemplateQuery,
+  useWorkspaceHubWorkspaceQuery,
+  useWorkspaceHubWorkspaceFileQuery,
+  useWorkspaceOfficialSkillsQuery,
+  useWorkspaceSkillFileQuery,
+  useWorkspaceSkillsQuery,
+  useWorkspaceSkillTreeQuery,
+} from "./workspaceQueries";
+import type { HubTemplate } from "@/models/hubWorkspace";
+import type { WorkspacePane } from "@/models/routing";
+import type { UseWorkspaceHubSelectionArgs } from "./types";
+import { isOpenCSGAuthenticationError } from "./useOpenCSGAuthGuard";
+
+type TemplateWorkspaceFilesState = {
+  files: Record<string, HubWorkspaceFile>;
+  templateID: string;
+};
+
+export type HubSelectionState = {
+  selectedHubResourceType: HubResourceType;
+  selectedHubSkillName: string;
+  selectedHubTemplateId: string;
+  selectedKnowledgeBaseID: string;
+  selectedMCPServerName: string;
+};
+
+export function resolveRouteDrivenHubSelection(
+  activePane: WorkspacePane,
+  selection: HubSelectionState,
+): HubSelectionState {
+  if (activePane.type !== WorkspacePaneTypes.hub || !activePane.resourceType) {
+    return selection;
+  }
+
+  const id = String(activePane.id ?? "");
+  const resolved = { ...selection, selectedHubResourceType: activePane.resourceType };
+  switch (activePane.resourceType) {
+    case "template":
+      return { ...resolved, selectedHubTemplateId: id };
+    case "skill":
+      return { ...resolved, selectedHubSkillName: id };
+    case "mcp":
+      return { ...resolved, selectedMCPServerName: id };
+    case "knowledge":
+      return { ...resolved, selectedKnowledgeBaseID: id };
+  }
+}
+
+export function templateWorkspaceFilesStateNeedsReset(state: TemplateWorkspaceFilesState): boolean {
+  return Boolean(state.templateID || Object.keys(state.files).length);
+}
+
+export function resolveHubTemplateSelection(
+  templates: readonly HubTemplate[],
+  current: string,
+  preserveMissing = false,
+): string {
+  if (templates.some((item) => item.id === current) || (current && preserveMissing)) {
+    return current;
+  }
+  return "";
+}
+
+export function useWorkspaceHubSelection({
+  activePane,
+  templates,
+  templatesQuery,
+  loaded,
+  manualError = "",
+  openCSGAuthGuard,
+  refreshTemplates,
+  t,
+}: UseWorkspaceHubSelectionArgs) {
+  const {
+    authenticated: openCSGAuthenticated,
+    handleAuthenticationError: handleOpenCSGAuthenticationError,
+    requireAuthentication: requireOpenCSGAuthentication,
+  } = openCSGAuthGuard;
+  const queryClient = useQueryClient();
+  const resourcesTemplates = useMemo(() => templates ?? [], [templates]);
+  const storedSelectedHubTemplateId = useWorkspaceUiStore((state) => state.selectedHubTemplateId);
+  const setSelectedHubTemplateId = useWorkspaceUiStore((state) => state.setSelectedHubTemplateId);
+  const selectedHubWorkspacePath = useWorkspaceUiStore((state) => state.selectedHubWorkspacePath);
+  const setSelectedHubWorkspacePath = useWorkspaceUiStore((state) => state.setSelectedHubWorkspacePath);
+  const storedSelectedHubSkillName = useWorkspaceUiStore((state) => state.selectedHubSkillName);
+  const setSelectedHubSkillName = useWorkspaceUiStore((state) => state.setSelectedHubSkillName);
+  const selectedHubSkillPath = useWorkspaceUiStore((state) => state.selectedHubSkillPath);
+  const setSelectedHubSkillPath = useWorkspaceUiStore((state) => state.setSelectedHubSkillPath);
+  const storedSelectedMCPServerName = useWorkspaceUiStore((state) => state.selectedMCPServerName);
+  const setSelectedMCPServerName = useWorkspaceUiStore((state) => state.setSelectedMCPServerName);
+  const storedSelectedHubResourceType = useWorkspaceUiStore((state) => state.selectedHubResourceType);
+  const setSelectedHubResourceType = useWorkspaceUiStore((state) => state.setSelectedHubResourceType);
+  const storedSelectedKnowledgeBaseID = useWorkspaceUiStore((state) => state.selectedKnowledgeBaseID);
+  const setSelectedKnowledgeBaseID = useWorkspaceUiStore((state) => state.setSelectedKnowledgeBaseID);
+  const {
+    selectedHubResourceType,
+    selectedHubSkillName,
+    selectedHubTemplateId,
+    selectedKnowledgeBaseID,
+    selectedMCPServerName,
+  } = resolveRouteDrivenHubSelection(activePane, {
+    selectedHubResourceType: storedSelectedHubResourceType,
+    selectedHubSkillName: storedSelectedHubSkillName,
+    selectedHubTemplateId: storedSelectedHubTemplateId,
+    selectedKnowledgeBaseID: storedSelectedKnowledgeBaseID,
+    selectedMCPServerName: storedSelectedMCPServerName,
+  });
+  const [remoteSkillsEnabled, setRemoteSkillsEnabled] = useState(false);
+  const [remoteSkillsSearch, setRemoteSkillsSearch] = useState("");
+  const [remoteSkillsSearchQuery, setRemoteSkillsSearchQuery] = useState("");
+  const skillsQuery = useWorkspaceSkillsQuery({ enabled: selectedHubResourceType === "skill" });
+  const officialSkillsQuery = useWorkspaceOfficialSkillsQuery(remoteSkillsSearchQuery, {
+    enabled: remoteSkillsEnabled && openCSGAuthenticated,
+  });
+  const skills = useMemo(
+    () => (skillsQuery.data ?? []).filter((item) => !isOfficialSkill(item) && !isPersonalSkill(item)),
+    [skillsQuery.data],
+  );
+  const remoteSkills = useMemo(() => {
+    const pages = officialSkillsQuery.data?.pages ?? [];
+    const seen = new Set<string>();
+    return pages.flatMap((page) =>
+      page.items.filter((item) => {
+        const key = item.remotePath || item.name;
+        if (!key || seen.has(key)) {
+          return false;
+        }
+        seen.add(key);
+        return true;
+      }),
+    );
+  }, [officialSkillsQuery.data]);
+  const selectedHubTemplate = useMemo(
+    () =>
+      selectedHubTemplateId ? (resourcesTemplates.find((item) => item.id === selectedHubTemplateId) ?? null) : null,
+    [resourcesTemplates, selectedHubTemplateId],
+  );
+  const selectedHubSkill = useMemo(
+    () => resolveHubListSelection(skills, selectedHubSkillName, (item) => item.name),
+    [selectedHubSkillName, skills],
+  );
+  const [workspaceListingsState, setWorkspaceListingsState] = useState<{
+    templateID: string;
+    listings: WorkspaceDirectoryListings;
+  }>({ templateID: "", listings: {} });
+  const [loadingWorkspaceDirs, setLoadingWorkspaceDirs] = useState<ReadonlySet<string>>(new Set());
+  const [workspaceDirectoryError, setWorkspaceDirectoryError] = useState("");
+  const [templateWorkspaceFilesState, setTemplateWorkspaceFilesState] = useState<TemplateWorkspaceFilesState>({
+    files: {},
+    templateID: "",
+  });
+  const hubTemplateDetailQuery = useWorkspaceHubTemplateQuery(selectedHubTemplateId);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setRemoteSkillsSearchQuery(remoteSkillsSearch.trim());
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [remoteSkillsSearch]);
+
+  useEffect(() => {
+    if (!resourcesTemplates.length) {
+      setSelectedHubWorkspacePath("");
+    }
+    setSelectedHubTemplateId((current) =>
+      resolveHubTemplateSelection(
+        resourcesTemplates,
+        current,
+        !loaded ||
+          Boolean(templatesQuery?.isFetching) ||
+          (current === selectedHubTemplateId &&
+            (hubTemplateDetailQuery.isFetching || hubTemplateDetailQuery.data?.id === current)),
+      ),
+    );
+  }, [
+    hubTemplateDetailQuery.data?.id,
+    hubTemplateDetailQuery.isFetching,
+    loaded,
+    resourcesTemplates,
+    selectedHubTemplateId,
+    setSelectedHubTemplateId,
+    setSelectedHubWorkspacePath,
+    templatesQuery?.isFetching,
+  ]);
+
+  useEffect(() => {
+    setSelectedHubWorkspacePath("");
+    setTemplateWorkspaceFilesState({ files: {}, templateID: selectedHubTemplateId });
+  }, [selectedHubTemplateId, setSelectedHubWorkspacePath]);
+
+  useEffect(() => {
+    if (!skills.length) {
+      setSelectedHubSkillName("");
+      setSelectedHubSkillPath("");
+      return;
+    }
+    setSelectedHubSkillName((current) => (hasSkillName(skills, current) ? current : ""));
+  }, [setSelectedHubSkillName, setSelectedHubSkillPath, skills]);
+
+  useEffect(() => {
+    if (selectedHubSkillName) {
+      setSelectedHubSkillPath(`${selectedHubSkillName}/SKILL.md`);
+    } else {
+      setSelectedHubSkillPath("");
+    }
+  }, [selectedHubSkillName, setSelectedHubSkillPath]);
+
+  const hubWorkspaceQuery = useWorkspaceHubWorkspaceQuery(selectedHubTemplateId);
+  const hubWorkspaceFileQuery = useWorkspaceHubWorkspaceFileQuery(selectedHubTemplateId, selectedHubWorkspacePath);
+  const skillTreeQuery = useWorkspaceSkillTreeQuery(selectedHubSkillName);
+  const skillFileQuery = useWorkspaceSkillFileQuery(selectedHubSkillPath);
+  const refetchHubTemplateDetail = hubTemplateDetailQuery.refetch;
+  const refetchHubWorkspace = hubWorkspaceQuery.refetch;
+  const refetchSkills = skillsQuery.refetch;
+  const refetchRemoteSkills = officialSkillsQuery.refetch;
+  const refetchSkillTree = skillTreeQuery.refetch;
+  const loadMoreRemoteSkills = useCallback(async () => {
+    if (
+      !remoteSkillsEnabled ||
+      !requireOpenCSGAuthentication() ||
+      !officialSkillsQuery.hasNextPage ||
+      officialSkillsQuery.isFetchingNextPage
+    ) {
+      return;
+    }
+    await officialSkillsQuery.fetchNextPage();
+  }, [officialSkillsQuery, remoteSkillsEnabled, requireOpenCSGAuthentication]);
+
+  const changeRemoteSkillsEnabled = useCallback(
+    (enabled: boolean) => {
+      if (enabled && !requireOpenCSGAuthentication()) {
+        return;
+      }
+      setRemoteSkillsEnabled(enabled);
+    },
+    [requireOpenCSGAuthentication],
+  );
+
+  const refreshRemoteSkills = useCallback(async () => {
+    if (!requireOpenCSGAuthentication()) {
+      return;
+    }
+    const result = await refetchRemoteSkills();
+    if (result.error) {
+      handleOpenCSGAuthenticationError(result.error);
+    }
+    return result;
+  }, [handleOpenCSGAuthenticationError, refetchRemoteSkills, requireOpenCSGAuthentication]);
+
+  useEffect(() => {
+    if (officialSkillsQuery.error) {
+      handleOpenCSGAuthenticationError(officialSkillsQuery.error);
+    }
+  }, [handleOpenCSGAuthenticationError, officialSkillsQuery.error]);
+
+  const selectedHubTemplateView = mergeHubTemplateDetail(
+    hubTemplateDetailQuery.data?.id === selectedHubTemplateId ? hubTemplateDetailQuery.data : null,
+    selectedHubTemplate,
+  );
+  const workspaceListings = useMemo(
+    () => (workspaceListingsState.templateID === selectedHubTemplateId ? workspaceListingsState.listings : {}),
+    [selectedHubTemplateId, workspaceListingsState],
+  );
+  const workspaceEntries = useMemo(() => flattenWorkspaceDirectoryListings(workspaceListings), [workspaceListings]);
+
+  useEffect(() => {
+    if (!selectedHubTemplateId) {
+      if (templateWorkspaceFilesStateNeedsReset(templateWorkspaceFilesState)) {
+        setTemplateWorkspaceFilesState({ files: {}, templateID: "" });
+      }
+      return;
+    }
+    const desiredPaths = [
+      "instructions/AGENTS.md",
+      ...workspaceEntries
+        .filter(
+          (entry) =>
+            entry.type === "file" &&
+            (entry.path === "mcps/mcp.json" || (entry.path.startsWith("skills/") && entry.path.endsWith("/SKILL.md"))),
+        )
+        .map((entry) => entry.path),
+    ];
+    if (!desiredPaths.length) {
+      return;
+    }
+    const state = templateWorkspaceFilesState.templateID === selectedHubTemplateId ? templateWorkspaceFilesState : null;
+    const missingPaths = desiredPaths.filter((path) => !state?.files[path]);
+    if (!missingPaths.length) {
+      return;
+    }
+    let canceled = false;
+    void Promise.all(
+      missingPaths.map(async (path) => {
+        try {
+          const file = await fetchHubWorkspaceFile(selectedHubTemplateId, path);
+          return [path, file] as const;
+        } catch {
+          return null;
+        }
+      }),
+    ).then((items) => {
+      if (canceled) {
+        return;
+      }
+      setTemplateWorkspaceFilesState((current) => {
+        const files = current.templateID === selectedHubTemplateId ? current.files : {};
+        const nextFiles = { ...files };
+        items.forEach((item) => {
+          if (item) {
+            nextFiles[item[0]] = item[1];
+          }
+        });
+        return { files: nextFiles, templateID: selectedHubTemplateId };
+      });
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [selectedHubTemplateId, templateWorkspaceFilesState, workspaceEntries]);
+
+  useEffect(() => {
+    setWorkspaceListingsState({ templateID: selectedHubTemplateId, listings: {} });
+    setLoadingWorkspaceDirs(new Set());
+    setWorkspaceDirectoryError("");
+  }, [selectedHubTemplateId]);
+
+  useEffect(() => {
+    if (!selectedHubTemplateId || !hubWorkspaceQuery.data) {
+      return;
+    }
+    setWorkspaceListingsState({
+      templateID: selectedHubTemplateId,
+      listings: { "": hubWorkspaceQuery.data.entries ?? [] },
+    });
+  }, [hubWorkspaceQuery.data, selectedHubTemplateId]);
+
+  const loadWorkspaceDirectory = useCallback(
+    async (workspacePath: string) => {
+      if (!selectedHubTemplateId || Object.hasOwn(workspaceListings, workspacePath)) {
+        return;
+      }
+      setLoadingWorkspaceDirs((current) => new Set(current).add(workspacePath));
+      setWorkspaceDirectoryError("");
+      try {
+        const listing = await queryClient.fetchQuery({
+          queryKey: workspaceQueryKeys.hubWorkspace(selectedHubTemplateId, workspacePath),
+          queryFn: () => fetchHubWorkspace(selectedHubTemplateId, workspacePath),
+        });
+        setWorkspaceListingsState((current) => {
+          if (current.templateID !== selectedHubTemplateId) {
+            return current;
+          }
+          return {
+            ...current,
+            listings: {
+              ...current.listings,
+              [workspacePath]: listing.entries ?? [],
+            },
+          };
+        });
+      } catch (error) {
+        setWorkspaceDirectoryError(errorMessage(error, t("resourcesWorkspaceLoadFailed")));
+      } finally {
+        setLoadingWorkspaceDirs((current) => {
+          const next = new Set(current);
+          next.delete(workspacePath);
+          return next;
+        });
+      }
+    },
+    [queryClient, selectedHubTemplateId, t, workspaceListings],
+  );
+
+  const selectWorkspaceFile = useCallback(
+    (workspacePath: string) => {
+      setSelectedHubWorkspacePath(workspacePath);
+    },
+    [setSelectedHubWorkspacePath],
+  );
+
+  const saveTemplateInstructions = useCallback(
+    async (content: string) => {
+      if (!selectedHubTemplateId) return false;
+      try {
+        const file = await updateHubWorkspaceFile(selectedHubTemplateId, "instructions/AGENTS.md", content);
+        setTemplateWorkspaceFilesState((current) => ({
+          files: { ...(current.templateID === selectedHubTemplateId ? current.files : {}), [file.path]: file },
+          templateID: selectedHubTemplateId,
+        }));
+        queryClient.setQueryData(workspaceQueryKeys.hubWorkspaceFile(selectedHubTemplateId, file.path), file);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [queryClient, selectedHubTemplateId],
+  );
+  const selectSkillFile = useCallback(
+    (skillPath: string) => {
+      setSelectedHubSkillPath(skillPath);
+    },
+    [setSelectedHubSkillPath],
+  );
+
+  const listError = manualError || (templatesQuery?.isError ? t("resourcesLoadFailed") : "");
+  const detailError = hubTemplateDetailQuery.error
+    ? errorMessage(hubTemplateDetailQuery.error, t("resourcesWorkspaceLoadFailed"))
+    : "";
+  const workspaceTreeError = hubWorkspaceQuery.error
+    ? errorMessage(hubWorkspaceQuery.error, t("resourcesWorkspaceLoadFailed"))
+    : workspaceDirectoryError;
+  const workspaceFileError = hubWorkspaceFileQuery.error
+    ? errorMessage(hubWorkspaceFileQuery.error, t("resourcesWorkspaceFileLoadFailed"))
+    : "";
+  const skillsError = skillsQuery.error ? errorMessage(skillsQuery.error, t("resourcesSkillsLoadFailed")) : "";
+  const remoteSkillsError =
+    remoteSkillsEnabled && officialSkillsQuery.error && !isOpenCSGAuthenticationError(officialSkillsQuery.error)
+      ? errorMessage(officialSkillsQuery.error, t("resourcesSkillRemoteSkillsLoadFailed"))
+      : "";
+  const skillTreeError = skillTreeQuery.error
+    ? errorMessage(skillTreeQuery.error, t("resourcesSkillFilesLoadFailed"))
+    : "";
+  const skillFileError = skillFileQuery.error
+    ? errorMessage(skillFileQuery.error, t("resourcesSkillFileLoadFailed"))
+    : "";
+  const {
+    clearMCPProbe,
+    checkSelectedMCPServerSource,
+    createMCPServer,
+    deleteMCPServer,
+    installRemoteMCPServer,
+    loadMoreRemoteMCPServers,
+    mcpServers,
+    mcpServersFetching,
+    mcpServersLoaded,
+    mcpCreateSource,
+    knowledgeBaseAdded,
+
+    mcpAdded,
+    mcpCreateError,
+    mcpCreateDialogOpen,
+    mcpCreateInitialDocument,
+    mcpMutationBusy,
+    mcpMutationError,
+    mcpProbeBusy,
+    mcpProbeError,
+    mcpProbeResult,
+    mcpSourceBusy,
+    mcpSourceError,
+    mcpSourceStatus,
+    mcpSourceSyncBusy,
+    mcpStateError,
+    openCreateMCPDialog,
+    refetchRemoteMCPServers,
+    refetchMCPServers,
+    remoteMCPInstallBusy,
+    remoteMCPServers,
+    remoteMCPServersError,
+    remoteMCPServersHasMore,
+    remoteMCPServersLoading,
+    remoteMCPServersLoadingMore,
+    remoteMCPServersSearch,
+    setRemoteMCPServersEnabled,
+    setRemoteMCPServersSearch,
+    selectedMCPServer,
+    setMCPCreateDialogOpen,
+    syncSelectedMCPServerSource,
+    probeMCPServer,
+    updateMCPServer,
+  } = useWorkspaceMCPSelection({
+    selectedMCPServerName,
+    selectedHubResourceType,
+    setSelectedMCPServerName,
+    setSelectedHubResourceType,
+    skillCount: skills.length,
+    skillsLoaded: skillsQuery.isFetched,
+    t,
+    templateCount: resourcesTemplates.length,
+    templatesLoaded: templatesQuery?.isFetched ?? false,
+    enabled:
+      selectedHubResourceType === "mcp" ||
+      activePane.type === WorkspacePaneTypes.agent ||
+      activePane.type === WorkspacePaneTypes.apps,
+    openCSGAuthGuard,
+  });
+
+  const knowledgeBases = useWorkspaceKnowledgeBaseSelection({
+    openCSGAuthGuard,
+    enabled: selectedHubResourceType === "knowledge",
+    openCreateMCPDialog,
+    selectedKnowledgeBaseID,
+    setSelectedKnowledgeBaseID,
+    t,
+  });
+
+  const retry = useCallback(async () => {
+    if (refreshTemplates) {
+      await refreshTemplates();
+    }
+    if (selectedHubTemplateId) {
+      await refetchHubTemplateDetail();
+      await refetchHubWorkspace();
+    }
+    await refetchSkills();
+    if (selectedHubSkillName) {
+      await refetchSkillTree();
+    }
+    await refetchMCPServers();
+  }, [
+    refetchHubTemplateDetail,
+    refetchHubWorkspace,
+    refetchMCPServers,
+    refetchSkillTree,
+    refetchSkills,
+    refreshTemplates,
+    selectedHubSkillName,
+    selectedHubTemplateId,
+  ]);
+
+  return {
+    templates: resourcesTemplates,
+    skills,
+    remoteSkills,
+    remoteSkillsHasMore: Boolean(officialSkillsQuery.hasNextPage),
+    remoteSkillsLoading:
+      remoteSkillsEnabled && officialSkillsQuery.isFetching && !officialSkillsQuery.isFetchingNextPage,
+    remoteSkillsLoadingMore: officialSkillsQuery.isFetchingNextPage,
+    remoteSkillsEnabled,
+    remoteSkillsSearch,
+    remoteSkillsError,
+    loadMoreRemoteSkills,
+    refetchRemoteSkills: refreshRemoteSkills,
+    setRemoteSkillsEnabled: changeRemoteSkillsEnabled,
+    setRemoteSkillsSearch,
+    loaded,
+    listError,
+    skillsError,
+    mcpServers,
+    mcpStateError,
+    mcpMutationBusy,
+    mcpMutationError,
+    mcpProbeBusy,
+    mcpProbeError,
+    mcpProbeResult,
+    mcpSourceBusy,
+    mcpSourceError,
+    mcpSourceStatus,
+    mcpSourceSyncBusy,
+    mcpCreateSource,
+    knowledgeBaseAdded,
+
+    mcpAdded,
+    mcpCreateError,
+    mcpCreateDialogOpen,
+    mcpCreateInitialDocument,
+    openCreateMCPDialog,
+    setMCPCreateDialogOpen,
+    knowledgeBases,
+    selectedKnowledgeBaseID,
+    setSelectedKnowledgeBaseID,
+    error:
+      listError ||
+      detailError ||
+      workspaceTreeError ||
+      skillsError ||
+      skillTreeError ||
+      (selectedHubResourceType === "mcp" ? mcpStateError : ""),
+    selectedHubTemplateId,
+    setSelectedHubTemplateId,
+    selectedHubTemplate,
+    selectedHubTemplateView,
+    selectedHubSkillName,
+    setSelectedHubSkillName,
+    selectedHubSkill,
+    selectedHubSkillView: selectedHubSkill,
+    selectedHubSkillPath,
+    setSelectedHubSkillPath,
+    selectedMCPServerName,
+    setSelectedMCPServerName,
+    selectedMCPServer,
+    selectedHubResourceType,
+    setSelectedHubResourceType,
+    hubTemplateDetail: hubTemplateDetailQuery.data ?? null,
+    hubTemplateDetailLoading: hubTemplateDetailQuery.isFetching,
+    hubTemplateDetailError: detailError,
+    refetchHubTemplateDetail,
+    selectedHubWorkspacePath,
+    workspaceEntries,
+    workspaceTreeLoading: hubWorkspaceQuery.isFetching,
+    workspaceTreeError,
+    loadingWorkspaceDirs,
+    loadWorkspaceDirectory,
+    setSelectedHubWorkspacePath,
+    selectWorkspaceFile,
+    hubWorkspaceFile: hubWorkspaceFileQuery.data ?? null,
+    hubWorkspaceFileLoading: hubWorkspaceFileQuery.isFetching,
+    hubWorkspaceFileError: workspaceFileError,
+    refetchHubWorkspaceFile: hubWorkspaceFileQuery.refetch,
+    mcpServersLoading: mcpServersFetching,
+    mcpServersError: mcpStateError,
+    refetchMCPServers,
+    remoteMCPServers,
+    remoteMCPServersError,
+    remoteMCPServersHasMore,
+    remoteMCPServersLoading,
+    remoteMCPServersLoadingMore,
+    remoteMCPServersSearch,
+    remoteMCPInstallBusy,
+    loadMoreRemoteMCPServers,
+    refetchRemoteMCPServers,
+    setRemoteMCPServersEnabled,
+    setRemoteMCPServersSearch,
+    skillTree: skillTreeQuery.data ?? null,
+    skillTreeLoading: skillTreeQuery.isFetching,
+    skillTreeError,
+    refetchSkillTree,
+    skillFile: skillFileQuery.data ?? null,
+    skillFileLoading: skillFileQuery.isFetching,
+    skillFileError,
+    refetchSkillFile: skillFileQuery.refetch,
+    selectSkillFile,
+    retry,
+    detailPaneProps: {
+      templates: resourcesTemplates,
+      skills,
+      mcpServers,
+      selectedTemplate: selectedHubTemplateView,
+      selectedTemplateId: selectedHubTemplateId,
+      selectedSkill: selectedHubSkill,
+      selectedSkillName: selectedHubSkillName,
+      selectedSkillPath: selectedHubSkillPath,
+      selectedMCPServer,
+      selectedMCPServerName,
+      mcpMutationBusy,
+      mcpMutationError,
+      mcpProbeBusy,
+      mcpProbeError,
+      mcpProbeResult,
+      mcpSourceBusy,
+      mcpSourceError,
+      mcpSourceStatus,
+      mcpSourceSyncBusy,
+      mcpCreateSource,
+      knowledgeBaseAdded,
+
+      mcpAdded,
+      mcpCreateError,
+      mcpCreateDialogOpen,
+      mcpCreateInitialDocument,
+      knowledgeBases,
+      remoteMCPServers,
+      remoteMCPServersError,
+      remoteMCPServersHasMore,
+      remoteMCPServersLoading,
+      remoteMCPServersLoadingMore,
+      remoteMCPServersSearch,
+      remoteMCPInstallBusy,
+      onMCPCreateDialogOpenChange: setMCPCreateDialogOpen,
+      onCheckMCPSource: checkSelectedMCPServerSource,
+      onClearMCPProbe: clearMCPProbe,
+      onInstallRemoteMCP: installRemoteMCPServer,
+      onLoadMoreRemoteMCPServers: loadMoreRemoteMCPServers,
+      onRefreshRemoteMCPServers: refetchRemoteMCPServers,
+      onRemoteMCPServersSearchChange: setRemoteMCPServersSearch,
+      onRemoteMCPVisibleChange: setRemoteMCPServersEnabled,
+      selectedResourceType: selectedHubResourceType,
+      loaded:
+        selectedHubResourceType === "skill"
+          ? skillsQuery.isFetched
+          : selectedHubResourceType === "mcp"
+            ? mcpServersLoaded
+            : selectedHubResourceType === "knowledge"
+              ? !knowledgeBases.loading
+              : loaded,
+      mcpStateError,
+      mcpStateLoading: mcpServersFetching,
+      error:
+        listError ||
+        detailError ||
+        workspaceTreeError ||
+        skillsError ||
+        skillTreeError ||
+        (selectedHubResourceType === "mcp" ? mcpStateError : ""),
+      workspaceEntries,
+      workspaceTreeLoading: hubWorkspaceQuery.isFetching,
+      loadingWorkspaceDirs,
+      selectedWorkspacePath: selectedHubWorkspacePath,
+      workspaceFile: hubWorkspaceFileQuery.data ?? null,
+      workspaceFiles:
+        templateWorkspaceFilesState.templateID === selectedHubTemplateId ? templateWorkspaceFilesState.files : {},
+      workspaceFileLoading: hubWorkspaceFileQuery.isFetching,
+      workspaceFileError,
+      skillTree: skillTreeQuery.data ?? null,
+      skillTreeLoading: skillTreeQuery.isFetching,
+      skillTreeError,
+      skillFile: skillFileQuery.data ?? null,
+      skillFileLoading: skillFileQuery.isFetching,
+      skillFileError,
+      onRetry: retry,
+      onSelectTemplate: (item: HubTemplate | null | undefined) => {
+        if (item?.id) {
+          setSelectedHubResourceType("template");
+          setSelectedHubTemplateId(item.id);
+        }
+      },
+      onSelectSkill: (name: string | null | undefined) => {
+        const value = String(name || "").trim();
+        if (value) {
+          setSelectedHubResourceType("skill");
+          setSelectedHubSkillName(value);
+        }
+      },
+      onSelectMCP: (name: string | null | undefined) => {
+        const value = String(name || "").trim();
+        if (value) {
+          setSelectedHubResourceType("mcp");
+          setSelectedMCPServerName(value);
+        }
+      },
+      onCreateMCP: createMCPServer,
+      onProbeMCP: probeMCPServer,
+      onSyncMCPSource: syncSelectedMCPServerSource,
+      onUpdateMCP: updateMCPServer,
+      onDeleteMCP: deleteMCPServer,
+      onSelectWorkspaceFile: selectWorkspaceFile,
+      onUpdateTemplateInstructions: saveTemplateInstructions,
+      onToggleWorkspaceDir: loadWorkspaceDirectory,
+      onSelectSkillFile: selectSkillFile,
+    },
+  };
+}

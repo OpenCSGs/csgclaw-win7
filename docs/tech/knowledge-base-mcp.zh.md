@@ -1,0 +1,173 @@
+# AgenticHub 知识库 MCP 流程
+
+本文简要记录 AgenticHub 知识库从 CSGClaw 中发现、配置、挂载到 Agent、发布为社区模板，再由其他用户启动的完整流程，以及知识库配置发生变化后的手动更新机制。
+
+## 完整流程
+
+```text
+发布者侧
+========
+
+┌──────────────────────────────┐
+│ 1. AgenticHub 知识库列表     │
+│                              │
+│ id:         143              │
+│ content_id: kb_investment    │
+│ metadata.mcp_endpoint_url    │
+│ metadata.resource_state      │
+└──────────────┬───────────────┘
+               │ CSGClaw 使用当前 OpenCSG 登录信息读取列表
+               │ 并判断知识库内容和 MCP 是否可用
+               ▼
+┌──────────────────────────────┐
+│ 2. 配置成全局 MCP            │
+│                              │
+│ MCP 名称 = content_id        │
+│ 保存 URL、Token、transport   │
+│ 保存知识库来源标记 _meta     │
+└──────────────┬───────────────┘
+               │ 用户在 Agent 页面选择“添加 MCP”
+               ▼
+┌──────────────────────────────┐
+│ 3. 挂载到单个 Agent          │
+│                              │
+│ 从全局 MCP 复制一份配置      │
+│ 保存到 Agent.mcpServers      │
+│ Agent 后续使用自己的配置副本 │
+└──────────────┬───────────────┘
+               │ Agent 启动或配置应用
+               ▼
+┌──────────────────────────────┐
+│ 4. MCP Runtime               │
+│                              │
+│ 去掉 CSGClaw 管理用 _meta    │
+│ 使用已保存的 URL 和 Token    │
+│ 连接知识库 MCP               │
+└──────────────┬───────────────┘
+               │
+               │ 用户将 Agent 发布为模板
+               ▼
+┌──────────────────────────────┐
+│ 5. 发布到云端社区            │
+│                              │
+│ 保留知识库身份：             │
+│   resource_id + content_id   │
+│ 移除 headers、Token 等凭证   │
+│ 写入模板的 mcps/mcp.json     │
+└──────────────┬───────────────┘
+               │
+               ▼
+       ┌────────────────┐
+       │ AgenticHub 社区 │
+       │    Agent 模板   │
+       └────────┬───────┘
+                │ 其他用户选择模板并创建 Agent
+                ▼
+
+使用者侧
+========
+
+┌──────────────────────────────┐
+│ 6. 下载并展开模板            │
+│                              │
+│ 读取模板中的知识库来源标记   │
+│ 模板中没有发布者的 Token     │
+└──────────────┬───────────────┘
+               │ 使用 resource_id 重新查询 AgenticHub
+               │ 校验返回的 content_id 未发生变化
+               ▼
+┌──────────────────────────────┐
+│ 7. 补齐当前使用者的配置      │
+│                              │
+│ 使用最新 mcp_endpoint_url    │
+│ 注入当前使用者的 CSGHub Token│
+└──────────────┬───────────────┘
+               │ 保存为新 Agent 自己的 MCP 配置副本
+               ▼
+┌──────────────────────────────┐
+│ 8. 创建并启动新 Agent        │
+│                              │
+│ Runtime 启动知识库 MCP       │
+│ Agent 使用知识库提供的工具   │
+└──────────────────────────────┘
+```
+
+全局 MCP 和 Agent MCP 是两份配置。全局 MCP 是本机可复用的候选列表；Agent MCP 属于单个 Agent，可以随 Agent 一起保存和发布。删除或修改其中一层不会隐式改写另一层。
+
+从 Agent 页面添加 MCP 时，CSGClaw 将全局 catalog 中的知识库 MCP 视为可信配置快照，直接复制到 Agent；该操作以及 Agent MCP 页面加载都不会根据 `_meta` 再请求 AgenticHub 详情接口。知识库 `_meta` 会继续保留，用于页面标识和模板发布。复制后仍会执行通用 MCP schema 与目标 Runtime 的配置校验。
+
+## 配置内容
+
+知识库 MCP 使用 `content_id` 作为 MCP 名称。管理信息保存在 `_meta["com.opencsg/mcp"]` 中：
+
+- `resource_id`：AgenticHub 知识库记录的数字 ID，用于重新查询来源。
+- `content_id`：知识库的稳定唯一标识，同时用作 MCP 名称；更新时用它防止关联到另一份知识库。
+- `type = "llm_wiki"`：标识这是知识库 MCP。
+- `auth_type = "csghub_access_token"`：标识连接使用 CSGHub 登录 Token。
+
+知识库列表接口在每个 item 中提供 CSGClaw 使用的状态字段，同时通过 `csghub_response` 保留该 item 对应的完整 CSGHub 原始返回值。
+
+本地全局 MCP 和 Agent MCP 都保存可直接运行的 URL 与 Token。交给 Runtime 时只移除 CSGClaw 自己使用的 `_meta`，不改变 URL 和鉴权信息。
+
+发布社区模板时会移除 `headers`、`env` 以及名称包含 Token、Secret、Password、API Key 的字段，但保留知识库来源标记。这样既能重新找到同一个知识库，也不会把发布者凭证交给模板使用者。
+
+## 检查和更新
+
+知识库的 MCP 地址可能在 AgenticHub 中调整，用户也可能手动刷新 CSGHub Token。CSGClaw 不会在普通启动、运行或 Agent MCP 设置过程中自动覆盖已保存配置。来源比较和手动更新只发生在全局 MCP 管理流程中。
+
+```text
+                         只读取并比较，不自动写入
+AgenticHub 当前配置 ─────────────────────────────────────┐
+                                                       │
+                    ┌──────────────────────────────────▼─┐
+                    │ URL / transport / headers 是否变化 │
+                    └──────────────┬─────────────────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │                             │
+                  无变化                         有变化
+                    │                             │
+              页面不展示提示            展示“知识库 MCP 配置有更新”
+                                                  │
+                                                  ▼
+                                         在全局 MCP 页面更新
+                                                  │
+                                                  ▼
+                                         只更新全局 MCP 副本
+```
+
+补充规则：
+
+- 全局 MCP 来源检查失败时保留并继续使用当前配置，只展示“重新检查”。
+- 全局 MCP 连接测试失败时，会额外触发一次来源检查，帮助判断是否因为知识库配置已经变化。
+- 全局 MCP 更新只替换知识库负责的地址、传输方式和鉴权信息，并保留超时等本地 Runtime 参数。
+- Agent MCP 页面不执行来源检查，也不提供来源同步；已挂载配置继续作为独立快照使用。
+- 更新操作同时校验 `resource_id` 和 `content_id`，知识库身份不一致时拒绝覆盖。
+
+## 快照原则
+
+已有 Agent 的 MCP 是可运行的配置副本，不是每次启动都解析的远端引用。这样 Agent 配置可以独立保存、复制和发布，也能在暂时无法访问 AgenticHub 时继续使用原有配置或删除 MCP。
+
+社区模板是例外：发布时已经移除凭证，因此从模板创建 Agent 时会尝试访问 AgenticHub，并用当前使用者的 URL 和 Token 生成一份新的可运行配置副本。这个刷新过程是 best-effort：知识库未就绪、查询失败或 Token 不可用时，创建流程保留模板中已脱敏的 MCP 配置并继续创建 Agent，不让外部知识库状态阻塞云端部署。保留的知识库来源标记仍用于标识和后续模板发布；失败时不会向模板携带的 URL 注入当前使用者的 Token。
+
+## OpenCSG MCP Gateway
+
+普通 OpenCSG MCP 可以通过受信任的统一 Gateway 暴露工具。模板使用以下来源标记：
+
+```json
+{
+  "_meta": {
+    "com.opencsg/mcp": {
+      "type": "opencsg_mcp_gateway",
+      "auth_type": "csghub_access_token",
+      "file_bindings": ["parse_file_content"]
+    }
+  }
+}
+```
+
+模板仍需提供非空 `url` 以兼容通用 MCP schema，但运行时不会信任或直接连接该地址。CSGClaw 将配置改写为本机 `/api/v1/opencsg-mcp-gateway/mcp` 代理，并使用 CSGClaw 服务 Token 保护该连接。代理在每个请求上读取当前 OpenCSG 登录凭据，只把用户 Token 转发到当前登录环境配置的 `{AIGatewayBaseURL}/gateway/mcp`，不转发浏览器 Cookie，也不跟随上游重定向。
+
+发布模板时，通用模板清洗仍会删除 `headers` 与 `env`，但保留 `_meta`。因此发布者凭据和使用者凭据都不会写入社区模板，模板提供的 URL 也不能改变携带用户 Token 的上游目标。
+
+对于带本地文件输入的工具，模板通过受管 MCP 元数据中的 `file_bindings` 声明允许调用的工具，以及内容、文件名和 MIME 参数映射。Codex 实际连接每个 Agent 独立的 CSGClaw MCP File Facade；Facade 通过原生 `tools/list` 向模型暴露 `path` 参数，并在收到 `tools/call` 后校验和读取工作区文件，在模型上下文之外完成 Base64 编码，再调用目标 MCP。模型侧仍表现为标准 `mcp_tool_call`，不会出现 CSGClaw 专用文件解析工具。

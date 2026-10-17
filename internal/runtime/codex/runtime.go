@@ -1,0 +1,2226 @@
+package codex
+
+import (
+	"context"
+	"crypto/sha256"
+	skill "csgclaw/internal/skill/state"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net/url"
+	"os"
+	pathpkg "path"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"csgclaw/internal/activity"
+	"csgclaw/internal/codexmodel"
+	"csgclaw/internal/identity"
+	"csgclaw/internal/opencsgmcp"
+	agentruntime "csgclaw/internal/runtime"
+	runtimeinstructions "csgclaw/internal/runtime/instructions"
+	"csgclaw/internal/runtime/sandboxgateway"
+	"csgclaw/internal/sandbox"
+	templateembed "csgclaw/internal/template/embed"
+)
+
+const (
+	hostStateDirName       = ".codex"
+	configFileName         = "config.toml"
+	modelCatalogFileName   = "model_catalog.json"
+	hostSkillsManifestName = ".csgclaw-host-skills.json"
+	runtimeFileName        = "runtime.json"
+	sessionFileName        = "session.json"
+	stderrLogFileName      = "stderr.log"
+	workspaceDirName       = "workspace"
+	homeDirName            = "home"
+	logPollInterval        = 200 * time.Millisecond
+	codexProxyProviderName = "proxy"
+	codexModelProviderName = "codex"
+)
+
+const readOnlyRuntimeInstructions = `CSGClaw has placed this Agent in read-only mode.
+You may answer questions, analyze content already present in the conversation, load the main SKILL.md instructions for assigned Skills, and use only available read-only data tools.
+You must not claim to read local files, inspect environment variables, run commands, execute Skill scripts, modify files or external data, or request elevated permissions.
+If the user asks for a mutating or environment-changing operation, explain in the user's language that the Agent is read-only and that they can switch to Standard mode under Agent Profile > Runtime Environment > Execution Mode. Offer a read-only analysis or plan when useful.`
+
+var (
+	runtimeDirRemoveInitialDelay = 100 * time.Millisecond
+	runtimeDirRemoveMaxDelay     = 1 * time.Second
+	runtimeDirRemoveTries        = 15
+)
+
+const runtimeDirRemovalEntryLimit = 32
+
+type AgentRef struct {
+	SkillStates    map[string]skill.State
+	ID             string
+	Name           string
+	RuntimeID      string
+	HandleID       string
+	Instructions   string
+	RuntimeOptions map[string]any
+	MCPServers     map[string]any
+	Profile        agentruntime.Profile
+}
+
+type SessionSpec struct {
+	MCPCatalogRevision             uint64
+	RuntimeID                      string
+	AgentID                        string
+	AgentName                      string
+	BinaryPath                     string
+	RuntimeDir                     string
+	WorkspaceDir                   string
+	HomeDir                        string
+	CodexHomeDir                   string
+	StderrPath                     string
+	Profile                        agentruntime.Profile
+	ExecutionMode                  string
+	MemoryEnabled                  bool
+	MCPServers                     map[string]any
+	ConversationSessions           map[string]string
+	FilePublishingConversations    map[string]bool
+	ConversationProfileFingerprint string
+}
+
+type SessionHandle struct {
+	RuntimeID string
+}
+
+type Session struct {
+	ExtensionDigests               map[string]string
+	RuntimeID                      string
+	AgentID                        string
+	AgentName                      string
+	SessionID                      string
+	BinaryPath                     string
+	RuntimeDir                     string
+	WorkspaceDir                   string
+	HomeDir                        string
+	CodexHomeDir                   string
+	StderrPath                     string
+	ProcessID                      int
+	CreatedAt                      time.Time
+	StartedAt                      time.Time
+	AgentCapabilities              any
+	ConversationSessions           map[string]string
+	FilePublishingConversations    map[string]bool
+	ConversationProfileFingerprint string
+}
+
+type Manager interface {
+	Start(ctx context.Context, spec SessionSpec) (*Session, error)
+	Stop(ctx context.Context, handle SessionHandle) error
+	LiveSession(handle SessionHandle) (*Session, error)
+	Session(handle SessionHandle) (*Session, error)
+	Prompt(ctx context.Context, handle SessionHandle, req PromptRequest) (PromptResponse, error)
+}
+
+type SessionEventKind = activity.RuntimeEventKind
+
+const (
+	SessionEventUserMessageDelta   = activity.RuntimeEventUserMessageDelta
+	SessionEventTextDelta          = activity.RuntimeEventTextDelta
+	SessionEventThoughtDelta       = activity.RuntimeEventThoughtDelta
+	SessionEventToolCallStart      = activity.RuntimeEventToolCallStart
+	SessionEventToolCallUpdate     = activity.RuntimeEventToolCallUpdate
+	SessionEventPlanUpdate         = activity.RuntimeEventPlanUpdate
+	SessionEventPermissionRequest  = activity.RuntimeEventActionRequest
+	SessionEventPermissionDecision = activity.RuntimeEventActionDecision
+	SessionEventUserInputRequest   = activity.RuntimeEventUserInputRequest
+	SessionEventUserInputResolved  = activity.RuntimeEventUserInputResolved
+	SessionEventStructuredOutput   = activity.RuntimeEventStructuredOutput
+	SessionEventFileOutput         = activity.RuntimeEventFileOutput
+	SessionEventPromptCompleted    = activity.RuntimeEventPromptCompleted
+	SessionEventPromptFailed       = activity.RuntimeEventPromptFailed
+)
+
+type SessionEvent = activity.RuntimeEvent
+
+type SessionEventSink = activity.RuntimeEventSink
+
+type SessionEventSubscriber = activity.RuntimeEventSubscriber
+
+type SessionEventScopedSubscriber = activity.RuntimeSessionEventSubscriber
+
+type BinaryProvider interface {
+	Ensure(ctx context.Context) (string, error)
+}
+
+type Dependencies struct {
+	BinaryProvider        BinaryProvider
+	ResolveAgent          func(h agentruntime.Handle) (AgentRef, error)
+	MaterializeMCPServers func(context.Context, map[string]any) (map[string]any, error)
+	AgentHome             func(agentID string) (string, error)
+	Manager               Manager
+	EventSink             SessionEventSink
+	Permission            PermissionBroker
+	UserInput             UserInputBroker
+
+	MkdirAll     func(string, os.FileMode) error
+	ReadFile     func(string) ([]byte, error)
+	WriteFile    func(string, []byte, os.FileMode) error
+	Stat         func(string) (os.FileInfo, error)
+	RemoveAll    func(string) error
+	OpenFile     func(string, int, os.FileMode) (*os.File, error)
+	RunInitShell func(context.Context, string, string, []string) error
+
+	StopRuntimeProcesses func(string) ([]int, error)
+}
+
+func (r *Runtime) runtimeMCPServers(ctx context.Context, agentID string, servers map[string]any) (map[string]any, error) {
+	if r.deps.MaterializeMCPServers == nil {
+		return servers, nil
+	}
+	materialized, err := r.deps.MaterializeMCPServers(ctx, servers)
+	if err != nil {
+		return nil, err
+	}
+	return codexMCPFileBridgeServers(materialized, agentID)
+}
+
+func codexMCPFileBridgeServers(servers map[string]any, agentID string) (map[string]any, error) {
+	for serverName, raw := range servers {
+		entry, _ := raw.(map[string]any)
+		bindings, _ := entry[opencsgmcp.RuntimeFileBindingsKey].(map[string]any)
+		if len(bindings) == 0 {
+			continue
+		}
+		urlText, _ := entry["url"].(string)
+		marker := "/api/v1/opencsg-mcp-gateway/mcp"
+		if !strings.HasSuffix(strings.TrimRight(urlText, "/"), marker) {
+			continue
+		}
+		base := strings.TrimSuffix(strings.TrimRight(urlText, "/"), marker)
+		entry["url"] = base + "/api/v1/agents/" + url.PathEscape(agentID) + "/mcp-file-bridge/" + url.PathEscape(serverName)
+		headers, _ := entry["headers"].(map[string]any)
+		if headers == nil {
+			return nil, fmt.Errorf("materialize MCP file bridge %q: internal authorization header is unavailable", serverName)
+		}
+		authorization, _ := headers["Authorization"].(string)
+		rootToken := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+		if rootToken == "" || !strings.HasPrefix(strings.TrimSpace(authorization), "Bearer ") {
+			return nil, fmt.Errorf("materialize MCP file bridge %q: internal authorization token is unavailable", serverName)
+		}
+		headers["Authorization"] = "Bearer " + opencsgmcp.FileBridgeToken(rootToken, agentID, serverName)
+		delete(entry, opencsgmcp.RuntimeFileBindingsKey)
+	}
+	return servers, nil
+}
+
+type Runtime struct {
+	deps                     Dependencies
+	managerMu                sync.Mutex
+	configMu                 sync.Mutex
+	mcpCatalogMu             sync.RWMutex
+	mcpCatalogRevisions      map[string]uint64
+	mcpCatalogRevisionSource func(string) uint64
+}
+
+var (
+	_ agentruntime.Runtime                     = (*Runtime)(nil)
+	_ agentruntime.Provisioner                 = (*Runtime)(nil)
+	_ agentruntime.LogStreamer                 = (*Runtime)(nil)
+	_ agentruntime.RuntimeOptionSchemaProvider = (*Runtime)(nil)
+	_ agentruntime.RuntimeConfigController     = (*Runtime)(nil)
+	_ agentruntime.RuntimeStartConfigValidator = (*Runtime)(nil)
+	_ agentruntime.MCPServersController        = (*Runtime)(nil)
+	_ agentruntime.MCPServersReconciler        = (*Runtime)(nil)
+	_ agentruntime.MCPServersListController    = (*Runtime)(nil)
+	_ io.Closer                                = (*Runtime)(nil)
+)
+
+func New(deps Dependencies) *Runtime {
+	return &Runtime{deps: deps}
+}
+
+func (r *Runtime) Kind() string {
+	return agentruntime.KindCodex
+}
+
+func (r *Runtime) Close() error {
+	if r == nil {
+		return nil
+	}
+	closer, ok := r.currentSessionManager().(io.Closer)
+	if !ok {
+		return nil
+	}
+	return closer.Close()
+}
+
+func workspaceRoot(agentHome string) string {
+	return filepath.Join(agentHome, filepath.FromSlash(hostStateDirName), workspaceDirName)
+}
+
+func (r *Runtime) WorkspaceRoot(agentHome string) string {
+	return r.Layout(agentHome).WorkspaceRoot
+}
+
+func canonicalRuntimeAgentID(agentID string) string {
+	return identity.CanonicalAgentID(agentID)
+}
+
+func (r *Runtime) resolveWorkspaceDir(agentID string, runtimeOptions map[string]any) (string, error) {
+	if r.deps.AgentHome == nil {
+		return "", fmt.Errorf("agent home resolver is required")
+	}
+	agentHome, err := r.deps.AgentHome(canonicalRuntimeAgentID(agentID))
+	if err != nil {
+		return "", err
+	}
+	return ResolveWorkspaceDir(agentHome, runtimeOptions)
+}
+
+func (r *Runtime) Layout(agentHome string) agentruntime.Layout {
+	root := filepath.Join(agentHome, filepath.FromSlash(hostStateDirName))
+	return agentruntime.Layout{
+		WorkspaceRoot:    filepath.Join(root, workspaceDirName),
+		SkillsRoot:       filepath.Join(root, homeDirName, "skills"),
+		InstructionsPath: filepath.Join(root, homeDirName, "AGENTS.md"),
+		HostLogPaths:     []string{filepath.Join(root, homeDirName, stderrLogFileName)},
+	}
+}
+
+func (r *Runtime) SessionManager() Manager {
+	return r.sessionManager()
+}
+
+func (r *Runtime) EventSink() SessionEventSink {
+	return r.deps.EventSink
+}
+
+func (r *Runtime) EnsureSession(ctx context.Context, runtimeID, conversationKey string) (string, error) {
+	ensurer, ok := r.SessionManager().(interface {
+		EnsureSession(context.Context, SessionHandle, string) (string, error)
+	})
+	if !ok {
+		return "", fmt.Errorf("codex session manager does not support conversation sessions")
+	}
+	return ensurer.EnsureSession(ctx, SessionHandle{RuntimeID: runtimeID}, conversationKey)
+}
+
+func (r *Runtime) EnsureEngineSession(ctx context.Context, runtimeID, conversationKey string) (string, error) {
+	ensurer, ok := r.SessionManager().(interface {
+		EnsureEngineSession(context.Context, SessionHandle, string) (string, error)
+	})
+	if !ok {
+		return "", fmt.Errorf("codex session manager does not support Engine conversation sessions")
+	}
+	return ensurer.EnsureEngineSession(ctx, SessionHandle{RuntimeID: runtimeID}, conversationKey)
+}
+
+func (r *Runtime) ExistingSession(ctx context.Context, runtimeID, conversationKey string) (string, bool, error) {
+	resolver, ok := r.SessionManager().(interface {
+		ExistingSession(context.Context, SessionHandle, string) (string, bool, error)
+	})
+	if !ok {
+		return "", false, fmt.Errorf("codex session manager does not support strict conversation lookup")
+	}
+	return resolver.ExistingSession(ctx, SessionHandle{RuntimeID: runtimeID}, conversationKey)
+}
+
+func (r *Runtime) ExistingEngineSession(ctx context.Context, runtimeID, conversationKey string) (string, bool, error) {
+	resolver, ok := r.SessionManager().(interface {
+		ExistingEngineSession(context.Context, SessionHandle, string) (string, bool, error)
+	})
+	if !ok {
+		return "", false, fmt.Errorf("codex session manager does not support strict Engine conversation lookup")
+	}
+	return resolver.ExistingEngineSession(ctx, SessionHandle{RuntimeID: runtimeID}, conversationKey)
+}
+
+func (r *Runtime) Prompt(ctx context.Context, runtimeID, sessionID, prompt string) error {
+	_, err := r.SessionManager().Prompt(ctx, SessionHandle{RuntimeID: runtimeID}, PromptRequest{
+		SessionID: strings.TrimSpace(sessionID),
+		Prompt:    []PromptContentBlock{TextBlock(prompt)},
+	})
+	return err
+}
+
+func (r *Runtime) PromptTurn(ctx context.Context, runtimeID, sessionID, turnID string, blocks []PromptContentBlock, accepted func()) error {
+	_, err := r.SessionManager().Prompt(ctx, SessionHandle{RuntimeID: runtimeID}, PromptRequest{
+		SessionID:           strings.TrimSpace(sessionID),
+		ClientUserMessageID: strings.TrimSpace(turnID),
+		Prompt:              blocks,
+		OnAccepted:          accepted,
+	})
+	return err
+}
+
+func (r *Runtime) ResetConversation(ctx context.Context, runtimeID, conversationKey string) error {
+	resetter, ok := r.SessionManager().(interface {
+		ResetConversationHistory(context.Context, SessionHandle, string) error
+	})
+	if !ok {
+		return fmt.Errorf("codex session manager does not support conversation reset")
+	}
+	return resetter.ResetConversationHistory(ctx, SessionHandle{RuntimeID: runtimeID}, conversationKey)
+}
+
+func (r *Runtime) WorkspaceDir(runtimeID string) (string, error) {
+	session, err := r.SessionManager().LiveSession(SessionHandle{RuntimeID: strings.TrimSpace(runtimeID)})
+	if err != nil {
+		return "", err
+	}
+	workspace := strings.TrimSpace(session.WorkspaceDir)
+	if workspace == "" {
+		return "", fmt.Errorf("codex workspace is unavailable")
+	}
+	return workspace, nil
+}
+
+func (r *Runtime) Subscribe(runtimeID string) (<-chan SessionEvent, func()) {
+	subscriber, ok := r.deps.EventSink.(SessionEventSubscriber)
+	if !ok || subscriber == nil {
+		ch := make(chan SessionEvent)
+		close(ch)
+		return ch, func() {}
+	}
+	return subscriber.Subscribe(runtimeID)
+}
+
+func (r *Runtime) SubscribeSession(runtimeID, sessionID string) (<-chan SessionEvent, func()) {
+	if subscriber, ok := r.deps.EventSink.(SessionEventScopedSubscriber); ok && subscriber != nil {
+		return subscriber.SubscribeSession(runtimeID, sessionID)
+	}
+	return r.Subscribe(runtimeID)
+}
+
+func (r *Runtime) PermissionBroker() PermissionBroker {
+	return r.permissionBroker()
+}
+
+func (r *Runtime) UserInputBroker() UserInputBroker {
+	return r.userInputBroker()
+}
+
+func (r *Runtime) New(ctx context.Context, spec agentruntime.Spec) (agentruntime.Handle, error) {
+	spec.AgentID = canonicalRuntimeAgentID(spec.AgentID)
+	if err := r.ensureRuntimeHome(spec.AgentID); err != nil {
+		return agentruntime.Handle{}, err
+	}
+	// 服务启动时也会调用 New 恢复 manager；已有运行记录保持当前技能集合。
+	copyHostSkills := false
+	if _, err := r.readRuntimeMetadata(strings.TrimSpace(spec.RuntimeID)); errors.Is(err, os.ErrNotExist) {
+		copyHostSkills = true
+	} else if err != nil {
+		return agentruntime.Handle{}, fmt.Errorf("read codex runtime metadata: %w", err)
+	}
+	spec.Profile = spec.Profile.Normalized()
+	var conversationSessions map[string]string
+	var filePublishingConversations map[string]bool
+	if sessionMeta, readErr := r.readSessionMetadata(strings.TrimSpace(spec.RuntimeID)); readErr == nil {
+		conversationSessions, filePublishingConversations = persistedConversationsForProfile(sessionMeta, spec.Profile)
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return agentruntime.Handle{}, fmt.Errorf("read persisted codex conversations: %w", readErr)
+	}
+	session, err := r.ensureSession(ctx, SessionSpec{
+		RuntimeID:                   strings.TrimSpace(spec.RuntimeID),
+		AgentID:                     strings.TrimSpace(spec.AgentID),
+		AgentName:                   strings.TrimSpace(spec.AgentName),
+		Profile:                     spec.Profile,
+		ConversationSessions:        conversationSessions,
+		FilePublishingConversations: filePublishingConversations,
+	}, copyHostSkills)
+	if err != nil {
+		return agentruntime.Handle{}, err
+	}
+	return agentruntime.Handle{
+		RuntimeID: strings.TrimSpace(spec.RuntimeID),
+		HandleID:  strings.TrimSpace(session.SessionID),
+	}, nil
+}
+
+func (r *Runtime) Provision(ctx context.Context, req agentruntime.ProvisionRequest) error {
+	if r == nil {
+		return nil
+	}
+	agentID := canonicalRuntimeAgentID(req.AgentID)
+	if strings.TrimSpace(agentID) == "" {
+		return fmt.Errorf("runtime agent id is required")
+	}
+	if r.deps.AgentHome == nil {
+		return fmt.Errorf("agent home resolver is required")
+	}
+	agentHome, err := r.deps.AgentHome(agentID)
+	if err != nil {
+		return err
+	}
+	layout := r.Layout(agentHome)
+	if base := strings.TrimSpace(req.TemplateInstructions); base != "" {
+		if err := r.mkdirAll(filepath.Dir(layout.InstructionsPath), 0o755); err != nil {
+			return fmt.Errorf("create codex home for template instructions: %w", err)
+		}
+		if err := r.writeFile(layout.InstructionsPath, []byte(strings.TrimRight(base, "\n")+"\n"), 0o644); err != nil {
+			return fmt.Errorf("seed codex template instructions: %w", err)
+		}
+	}
+	templateRoot := codexWorkspaceTemplateRoot(agentID)
+	if err := sandboxgateway.EnsureEmbeddedWorkspace(templateRoot, layout.WorkspaceRoot); err != nil {
+		return fmt.Errorf("seed codex workspace template for agent %q: %w", req.AgentName, err)
+	}
+	if overlayRoot := strings.TrimSpace(req.WorkspaceOverlay); overlayRoot != "" {
+		if err := sandboxgateway.OverlayWorkspaceTree(overlayRoot, layout.WorkspaceRoot); err != nil {
+			return fmt.Errorf("overlay codex workspace for agent %q: %w", req.AgentName, err)
+		}
+	}
+	codexHomeDir, err := r.resolveCodexHomeDir(agentID)
+	if err != nil {
+		return fmt.Errorf("resolve codex home for agent %q: %w", req.AgentName, err)
+	}
+	if req.TemplateMemorySet {
+		memoryPath := filepath.Join(codexHomeDir, "memories", readableMemoryFileName)
+		if err := r.mkdirAll(filepath.Dir(memoryPath), 0o755); err != nil {
+			return fmt.Errorf("create codex memory directory: %w", err)
+		}
+		if err := r.writeFile(memoryPath, []byte(req.TemplateMemory), 0o644); err != nil {
+			return fmt.Errorf("seed codex template memory: %w", err)
+		}
+	}
+	if err := r.syncManagerTemplateSkills(agentID, codexHomeDir); err != nil {
+		return fmt.Errorf("sync manager codex skills for agent %q: %w", req.AgentName, err)
+	}
+	if len(req.Credentials) == 0 && len(req.PreviousCredentials) == 0 && strings.TrimSpace(req.InitShell) == "" {
+		return nil
+	}
+	credentialWorkspace, err := ResolveWorkspaceDir(agentHome, req.RuntimeOptions)
+	if err != nil {
+		return fmt.Errorf("resolve Codex workspace for Runtime credentials: %w", err)
+	}
+	initEnvironment := buildSessionEnv(SessionSpec{
+		WorkspaceDir: credentialWorkspace,
+		HomeDir:      r.hostSessionHomeDir(codexHomeDir),
+		CodexHomeDir: codexHomeDir,
+		Profile:      req.Profile,
+	})
+	if err := r.provisionWorkspaceCredentials(ctx, credentialWorkspace, initEnvironment, req.Credentials, req.PreviousCredentials, req.InitShell); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Runtime) Start(ctx context.Context, h agentruntime.Handle) (agentruntime.State, error) {
+	var sessionRestoreErr error
+	if current, err := r.Info(ctx, h); err == nil && current.State == agentruntime.StateRunning {
+		if _, restoreErr := r.sessionManager().Session(SessionHandle{RuntimeID: strings.TrimSpace(h.RuntimeID)}); restoreErr == nil {
+			return current.State, nil
+		} else {
+			sessionRestoreErr = restoreErr
+			slog.Warn("restore running codex session failed; repairing with a fresh session",
+				"runtime_id", strings.TrimSpace(h.RuntimeID),
+				"error", restoreErr,
+			)
+			if _, stopErr := r.Stop(ctx, h); stopErr != nil && !errors.Is(stopErr, sandbox.ErrNotFound) && !errors.Is(stopErr, os.ErrNotExist) {
+				return agentruntime.StateUnknown, fmt.Errorf("prepare codex session repair after restore failed (%v): %w", restoreErr, stopErr)
+			}
+		}
+	}
+
+	agentRef, err := r.resolveAgent(h)
+	if err != nil {
+		return agentruntime.StateUnknown, err
+	}
+	agentRef.Profile = agentRef.Profile.Normalized()
+	var conversationSessions map[string]string
+	var filePublishingConversations map[string]bool
+	if sessionMeta, readErr := r.readSessionMetadata(strings.TrimSpace(h.RuntimeID)); readErr == nil {
+		conversationSessions, filePublishingConversations = persistedConversationsForProfile(sessionMeta, agentRef.Profile)
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return agentruntime.StateUnknown, fmt.Errorf("read persisted codex conversations: %w", readErr)
+	}
+	session, err := r.ensureSession(ctx, SessionSpec{
+		RuntimeID:                   strings.TrimSpace(h.RuntimeID),
+		AgentID:                     strings.TrimSpace(agentRef.ID),
+		AgentName:                   strings.TrimSpace(agentRef.Name),
+		Profile:                     agentRef.Profile,
+		ConversationSessions:        conversationSessions,
+		FilePublishingConversations: filePublishingConversations,
+	}, false)
+	if err != nil {
+		if sessionRestoreErr != nil {
+			return agentruntime.StateUnknown, fmt.Errorf("repair codex session after restore failed (%v): %w", sessionRestoreErr, err)
+		}
+		return agentruntime.StateUnknown, err
+	}
+	if err := r.writeMetadata(sessionToRuntimeMetadata(session)); err != nil {
+		return agentruntime.StateUnknown, err
+	}
+	return agentruntime.StateRunning, nil
+}
+
+func (r *Runtime) Stop(ctx context.Context, h agentruntime.Handle) (agentruntime.State, error) {
+	runtimeID := strings.TrimSpace(h.RuntimeID)
+	if runtimeID == "" {
+		return agentruntime.StateUnknown, fmt.Errorf("runtime id is required")
+	}
+
+	// Stop the in-memory session before relying on metadata. A failed NFS
+	// cleanup can remove runtime.json while leaving the tracked app-server and
+	// its file descriptors alive. Returning early on missing metadata makes that
+	// state impossible to recover through a later recreate.
+	meta, metaErr := r.readRuntimeMetadata(runtimeID)
+	managerErr := r.sessionManager().Stop(ctx, SessionHandle{RuntimeID: runtimeID})
+	if managerErr != nil && !errors.Is(managerErr, os.ErrNotExist) {
+		return agentruntime.StateUnknown, managerErr
+	}
+	if metaErr != nil {
+		if !errors.Is(metaErr, os.ErrNotExist) {
+			return agentruntime.StateUnknown, metaErr
+		}
+		if managerErr == nil {
+			return agentruntime.StateStopped, nil
+		}
+		return agentruntime.StateUnknown, sandbox.ErrNotFound
+	}
+	if meta.ProcessID > 0 {
+		if err := stopProcess(meta.ProcessID); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ESRCH) {
+			return agentruntime.StateUnknown, err
+		}
+	}
+	meta.ProcessID = 0
+	meta.State = agentruntime.StateStopped
+	meta.StoppedAt = time.Now().UTC()
+	if err := r.writeMetadata(meta); err != nil {
+		return agentruntime.StateUnknown, err
+	}
+	return agentruntime.StateStopped, nil
+}
+
+func (r *Runtime) Delete(ctx context.Context, h agentruntime.Handle) error {
+	runtimeID := strings.TrimSpace(h.RuntimeID)
+	if runtimeID == "" {
+		return fmt.Errorf("runtime id is required")
+	}
+	if _, err := r.Stop(ctx, h); err != nil && !errors.Is(err, sandbox.ErrNotFound) && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stop runtime before delete: %w", err)
+	}
+	dir, err := r.runtimeDirForHandle(h)
+	if err != nil {
+		return err
+	}
+	if err := r.stopUntrackedRuntimeProcesses(ctx, runtimeID, dir); err != nil {
+		return err
+	}
+	preservedState, err := preserveRuntimeState(dir)
+	if err != nil {
+		return err
+	}
+	if preservedState != nil {
+		defer preservedState.Cleanup()
+	}
+	removeErr := r.removeRuntimeDir(ctx, runtimeID, dir)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = nil
+	}
+	restoreErr := preservedState.Restore()
+	if removeErr != nil || restoreErr != nil {
+		return errors.Join(removeErr, restoreErr)
+	}
+	return nil
+}
+
+func (r *Runtime) State(ctx context.Context, h agentruntime.Handle) (agentruntime.State, error) {
+	info, err := r.Info(ctx, h)
+	if err != nil {
+		return agentruntime.StateUnknown, err
+	}
+	return info.State, nil
+}
+
+func (r *Runtime) Info(_ context.Context, h agentruntime.Handle) (agentruntime.Info, error) {
+	// The in-process app-server owns a live session while this Runtime is
+	// running. Prefer it over runtime.json so a concurrent metadata rewrite (or
+	// delayed filesystem visibility) cannot briefly turn a healthy session into
+	// a missing runtime in the agent roster.
+	if session, err := r.sessionManager().LiveSession(SessionHandle{RuntimeID: strings.TrimSpace(h.RuntimeID)}); err == nil && session != nil && processAlive(session.ProcessID) {
+		return agentruntime.Info{
+			HandleID:  strings.TrimSpace(session.SessionID),
+			State:     agentruntime.StateRunning,
+			CreatedAt: session.CreatedAt,
+		}, nil
+	}
+
+	meta, err := r.readRuntimeMetadata(h.RuntimeID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return agentruntime.Info{}, sandbox.ErrNotFound
+		}
+		return agentruntime.Info{}, err
+	}
+	state := normalizeRuntimeState(meta.State)
+	if state == agentruntime.StateRunning && !processAlive(meta.ProcessID) {
+		if meta.ExitCode != 0 {
+			state = agentruntime.StateFailed
+		} else {
+			state = agentruntime.StateExited
+		}
+		meta.State = state
+		meta.ProcessID = 0
+		_ = r.writeMetadata(meta)
+	}
+	return agentruntime.Info{
+		HandleID:  strings.TrimSpace(meta.SessionID),
+		State:     state,
+		CreatedAt: meta.CreatedAt,
+	}, nil
+}
+
+func (r *Runtime) StreamLogs(ctx context.Context, h agentruntime.Handle, opts agentruntime.LogOptions) error {
+	logPath, err := r.stderrLogPath(h)
+	if err != nil {
+		return err
+	}
+	lines := opts.Tail
+	if lines <= 0 {
+		lines = 20
+	}
+	return streamLogFile(ctx, logPath, opts.Follow, lines, opts.Writer)
+}
+
+func (r *Runtime) sessionManager() Manager {
+	r.managerMu.Lock()
+	defer r.managerMu.Unlock()
+	if r.deps.Manager != nil {
+		return r.deps.Manager
+	}
+	manager := newAppServerManager(managerDeps{
+		BeforePrompt: r.refreshSessionMCP,
+		EventSink:    r.deps.EventSink,
+		Permission:   r.permissionBroker(),
+		UserInput:    r.userInputBroker(),
+		OpenFile:     r.openFile,
+		WriteFile:    r.writeFile,
+		ReadFile:     r.readFile,
+		OnExit: func(session *Session, exitCode int) {
+			if session == nil {
+				return
+			}
+			meta := sessionToRuntimeMetadata(session)
+			meta.ProcessID = 0
+			meta.ExitCode = exitCode
+			meta.StoppedAt = time.Now().UTC()
+			if exitCode != 0 {
+				meta.State = agentruntime.StateFailed
+			} else {
+				meta.State = agentruntime.StateExited
+			}
+			_ = writeJSONFile(r.writeFile, filepath.Join(session.RuntimeDir, runtimeFileName), meta)
+		},
+		OnConversationSessionsChange: func(session *Session, conversations map[string]string, filePublishing map[string]bool) error {
+			if session == nil {
+				return nil
+			}
+			meta := sessionToSessionMetadata(session)
+			meta.ConversationSessions = cloneConversationSessions(conversations)
+			meta.FilePublishingConversations = cloneFilePublishingConversations(filePublishing)
+			return writeJSONFile(r.writeFile, filepath.Join(session.RuntimeDir, sessionFileName), meta)
+		},
+	})
+	manager.deps.HydrateSession = func(ctx context.Context, handle SessionHandle) (*Session, error) {
+		return r.hydratePersistedSession(ctx, manager, handle)
+	}
+	r.deps.Manager = manager
+	return r.deps.Manager
+}
+
+func (r *Runtime) currentSessionManager() Manager {
+	r.managerMu.Lock()
+	defer r.managerMu.Unlock()
+	return r.deps.Manager
+}
+
+func (r *Runtime) permissionBroker() PermissionBroker {
+	if r.deps.Permission != nil {
+		return r.deps.Permission
+	}
+	r.deps.Permission = NewPermissionBroker(r.deps.EventSink)
+	return r.deps.Permission
+}
+
+func (r *Runtime) userInputBroker() UserInputBroker {
+	if r.deps.UserInput != nil {
+		return r.deps.UserInput
+	}
+	r.deps.UserInput = NewUserInputBroker(r.deps.EventSink)
+	return r.deps.UserInput
+}
+
+func (r *Runtime) ensureSession(ctx context.Context, spec SessionSpec, copyHostSkills bool) (*Session, error) {
+	runtimeID := strings.TrimSpace(spec.RuntimeID)
+	if runtimeID == "" {
+		return nil, fmt.Errorf("runtime id is required")
+	}
+	if strings.TrimSpace(spec.AgentName) == "" || strings.TrimSpace(spec.AgentID) == "" {
+		return nil, fmt.Errorf("agent name and id are required")
+	}
+	spec.AgentID = canonicalRuntimeAgentID(spec.AgentID)
+	spec.Profile = spec.Profile.Normalized()
+	spec.ConversationProfileFingerprint = conversationProfileFingerprint(spec.Profile.Provider, spec.Profile.BaseURL, spec.Profile.ModelID)
+	agentRef, err := r.resolveAgent(agentruntime.Handle{RuntimeID: runtimeID})
+	if err != nil {
+		return nil, err
+	}
+	dirs, err := r.ensureRuntimeDirs(spec.AgentID)
+	if err != nil {
+		return nil, err
+	}
+	workspaceDir, err := r.resolveWorkspaceDir(spec.AgentID, agentRef.RuntimeOptions)
+	if err != nil {
+		return nil, err
+	}
+	spec.RuntimeDir = dirs.Root
+	spec.WorkspaceDir = workspaceDir
+	spec.HomeDir = r.hostSessionHomeDir(dirs.Home)
+	spec.CodexHomeDir = dirs.CodexHome
+	spec.StderrPath = dirs.StderrLog
+	runtimeOptions, err := DecodeRuntimeOptions(agentRef.RuntimeOptions)
+	if err != nil {
+		return nil, err
+	}
+	spec.ExecutionMode = runtimeOptions.ExecutionMode
+	spec.MemoryEnabled = runtimeOptions.MemoryMode != MemoryModeDisabled
+	runtimeMCPServers, err := r.runtimeMCPServers(ctx, spec.AgentID, agentRef.MCPServers)
+	if err != nil {
+		return nil, fmt.Errorf("materialize Codex MCP servers: %w", err)
+	}
+	spec.MCPServers = runtimeMCPServers
+	spec.MCPCatalogRevision = r.agentMCPRevision(spec.AgentID)
+	manager := r.sessionManager()
+	tracker, tracksSessions := manager.(interface{ hasSession(string) bool })
+	if !tracksSessions || !tracker.hasSession(runtimeID) {
+		if err := r.stopUntrackedRuntimeProcesses(ctx, runtimeID, spec.RuntimeDir); err != nil {
+			return nil, err
+		}
+	}
+	if err := r.mkdirAll(spec.WorkspaceDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create codex workspace dir %s: %w", spec.WorkspaceDir, err)
+	}
+	if err := r.seedCodexHomeAuth(spec.CodexHomeDir, spec.Profile); err != nil {
+		return nil, err
+	}
+	if err := r.seedCodexHomeConfig(spec.CodexHomeDir, spec.WorkspaceDir, spec.Profile, agentRef.RuntimeOptions, spec.MCPServers); err != nil {
+		return nil, err
+	}
+	if copyHostSkills || spec.ExecutionMode == ExecutionModeReadOnly {
+		if err := r.seedCodexHomeSkillsForExecutionMode(spec.CodexHomeDir, spec.ExecutionMode); err != nil {
+			return nil, err
+		}
+	}
+	if err := r.seedCodexHomeWorkspaceSkills(spec.AgentID, spec.WorkspaceDir, spec.CodexHomeDir); err != nil {
+		return nil, err
+	}
+	if err := r.seedManagerTemplate(spec.AgentID, spec.CodexHomeDir); err != nil {
+		return nil, err
+	}
+	if err := r.refreshCodexHomeAgentsFile(agentruntime.Handle{RuntimeID: runtimeID}, spec.CodexHomeDir); err != nil {
+		return nil, err
+	}
+	if err := r.writeSkillStates(spec.CodexHomeDir, agentRef.SkillStates); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(spec.BinaryPath) == "" {
+		binaryPath, err := r.ensureBinary(ctx)
+		if err != nil {
+			return nil, err
+		}
+		spec.BinaryPath = binaryPath
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session, err := manager.Start(context.WithoutCancel(ctx), spec)
+	if err != nil {
+		return nil, err
+	}
+	session.ConversationProfileFingerprint = spec.ConversationProfileFingerprint
+	if err := writeJSONFile(r.writeFile, filepath.Join(spec.RuntimeDir, sessionFileName), sessionToSessionMetadata(session)); err != nil {
+		return nil, err
+	}
+	if err := writeJSONFile(r.writeFile, filepath.Join(spec.RuntimeDir, runtimeFileName), sessionToRuntimeMetadata(session)); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+func (r *Runtime) hydratePersistedSession(ctx context.Context, manager *appServerManager, handle SessionHandle) (*Session, error) {
+	if manager == nil {
+		return nil, os.ErrNotExist
+	}
+	runtimeID := strings.TrimSpace(handle.RuntimeID)
+	if runtimeID == "" {
+		return nil, fmt.Errorf("runtime id is required")
+	}
+	meta, err := r.readRuntimeMetadata(runtimeID)
+	if err != nil {
+		return nil, err
+	}
+	sessionMeta, err := r.readSessionMetadata(runtimeID)
+	if err != nil {
+		return nil, err
+	}
+	agentRef, err := r.resolveAgent(agentruntime.Handle{RuntimeID: runtimeID})
+	if err != nil {
+		return nil, err
+	}
+	agentID := canonicalRuntimeAgentID(firstNonEmpty(agentRef.ID, meta.AgentID))
+	dirs, err := r.ensureRuntimeDirs(agentID)
+	if err != nil {
+		return nil, err
+	}
+	workspaceDir, err := r.resolveWorkspaceDir(agentID, agentRef.RuntimeOptions)
+	if err != nil {
+		return nil, err
+	}
+	if meta.ProcessID > 0 && processAlive(meta.ProcessID) {
+		if err := stopProcess(meta.ProcessID); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ESRCH) {
+			return nil, err
+		}
+	}
+	binaryPath, err := r.ensureBinary(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve codex binary: %w", err)
+	}
+	spec := SessionSpec{
+		RuntimeID:                      runtimeID,
+		AgentID:                        agentID,
+		AgentName:                      firstNonEmpty(agentRef.Name, meta.AgentName),
+		BinaryPath:                     binaryPath,
+		RuntimeDir:                     dirs.Root,
+		WorkspaceDir:                   workspaceDir,
+		HomeDir:                        r.hostSessionHomeDir(dirs.Home),
+		CodexHomeDir:                   dirs.CodexHome,
+		StderrPath:                     dirs.StderrLog,
+		Profile:                        agentRef.Profile.Normalized(),
+		MCPServers:                     nil,
+		MCPCatalogRevision:             r.agentMCPRevision(agentID),
+		ExecutionMode:                  ExecutionModeStandard,
+		ConversationSessions:           cloneConversationSessions(sessionMeta.ConversationSessions),
+		FilePublishingConversations:    cloneFilePublishingConversations(sessionMeta.FilePublishingConversations),
+		ConversationProfileFingerprint: conversationProfileFingerprint(agentRef.Profile.Provider, agentRef.Profile.BaseURL, agentRef.Profile.ModelID),
+	}
+	if strings.TrimSpace(sessionMeta.ConversationProfileFingerprint) != spec.ConversationProfileFingerprint {
+		spec.ConversationSessions = nil
+		spec.FilePublishingConversations = nil
+	}
+	runtimeOptions, err := DecodeRuntimeOptions(agentRef.RuntimeOptions)
+	if err != nil {
+		return nil, err
+	}
+	spec.ExecutionMode = runtimeOptions.ExecutionMode
+	spec.MemoryEnabled = runtimeOptions.MemoryMode != MemoryModeDisabled
+	spec.MCPServers, err = r.runtimeMCPServers(ctx, agentID, agentRef.MCPServers)
+	if err != nil {
+		return nil, fmt.Errorf("materialize Codex MCP servers: %w", err)
+	}
+	if err := r.mkdirAll(spec.WorkspaceDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create codex workspace dir %s: %w", spec.WorkspaceDir, err)
+	}
+	if err := r.seedCodexHomeAuth(spec.CodexHomeDir, spec.Profile); err != nil {
+		return nil, err
+	}
+	if err := r.seedCodexHomeConfig(spec.CodexHomeDir, spec.WorkspaceDir, spec.Profile, agentRef.RuntimeOptions, spec.MCPServers); err != nil {
+		return nil, err
+	}
+	if spec.ExecutionMode == ExecutionModeReadOnly {
+		if err := r.seedCodexHomeSkillsForExecutionMode(spec.CodexHomeDir, spec.ExecutionMode); err != nil {
+			return nil, err
+		}
+	}
+	if err := r.seedCodexHomeWorkspaceSkills(spec.AgentID, spec.WorkspaceDir, spec.CodexHomeDir); err != nil {
+		return nil, err
+	}
+	if err := r.seedManagerTemplate(spec.AgentID, spec.CodexHomeDir); err != nil {
+		return nil, err
+	}
+	if err := r.refreshCodexHomeAgentsFile(agentruntime.Handle{RuntimeID: runtimeID}, spec.CodexHomeDir); err != nil {
+		return nil, err
+	}
+	if err := r.writeSkillStates(spec.CodexHomeDir, agentRef.SkillStates); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session, err := manager.Start(context.WithoutCancel(ctx), spec)
+	if err != nil {
+		return nil, err
+	}
+	if !meta.CreatedAt.IsZero() {
+		session.CreatedAt = meta.CreatedAt.UTC()
+	}
+	if err := r.writeSessionMetadata(sessionToSessionMetadata(session)); err != nil {
+		return nil, err
+	}
+	if err := r.writeMetadata(sessionToRuntimeMetadata(session)); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (r *Runtime) seedCodexHomeAuth(runtimeCodexHome string, profile agentruntime.Profile) error {
+	runtimeCodexHome = strings.TrimSpace(runtimeCodexHome)
+	if runtimeCodexHome == "" {
+		return fmt.Errorf("codex home dir is required")
+	}
+
+	runtimeAuthPath := filepath.Join(runtimeCodexHome, "auth.json")
+	profile = profile.Normalized()
+	if profile.BaseURL != "" && profile.APIKey != "" {
+		if err := r.removeAll(runtimeAuthPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove runtime codex auth %s: %w", runtimeAuthPath, err)
+		}
+		return nil
+	}
+	if _, err := r.readFile(runtimeAuthPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read runtime codex auth %s: %w", runtimeAuthPath, err)
+	}
+
+	hostAuthPath, err := hostCodexAuthPath()
+	if err != nil {
+		return nil
+	}
+	raw, err := os.ReadFile(hostAuthPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read host codex auth %s: %w", hostAuthPath, err)
+	}
+	if err := r.writeFile(runtimeAuthPath, raw, 0o600); err != nil {
+		return fmt.Errorf("seed runtime codex auth %s: %w", runtimeAuthPath, err)
+	}
+	return nil
+}
+
+func (r *Runtime) seedCodexHomeConfig(runtimeCodexHome, workspaceDir string, profile agentruntime.Profile, runtimeOptions, mcpServers map[string]any) error {
+	r.configMu.Lock()
+	defer r.configMu.Unlock()
+	runtimeCodexHome = strings.TrimSpace(runtimeCodexHome)
+	if runtimeCodexHome == "" {
+		return fmt.Errorf("codex home dir is required")
+	}
+	if err := validateCodexMCPServers(mcpServers); err != nil {
+		return err
+	}
+	configPath := filepath.Join(runtimeCodexHome, configFileName)
+	profile = profile.Normalized()
+	options, err := DecodeRuntimeOptions(runtimeOptions)
+	if err != nil {
+		return err
+	}
+	configRaw, err := r.readFile(configPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read runtime codex config %s: %w", configPath, err)
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		hostRaw, hostErr := r.hostCodexConfig()
+		if hostErr == nil {
+			configRaw = hostRaw
+		} else if !errors.Is(hostErr, os.ErrNotExist) {
+			return fmt.Errorf("read host codex config: %w", hostErr)
+		}
+	}
+	mcpServers, err = r.projectAgentMCP(profile, mcpServers, string(configRaw))
+	if err != nil {
+		return err
+	}
+
+	if profile.BaseURL != "" && profile.ModelID != "" {
+		if err := r.writeModelCatalog(runtimeCodexHome, profile); err != nil {
+			return err
+		}
+	}
+
+	rendered := configureCodexHomeConfigWithWorkspaceForRuntimeOptions(string(configRaw), profile, mcpServers, workspaceDir, options)
+	if err := r.writeFile(configPath, []byte(rendered), 0o600); err != nil {
+		return fmt.Errorf("write runtime codex config %s: %w", configPath, err)
+	}
+	return nil
+}
+
+func (r *Runtime) seedCodexHomeSkills(runtimeCodexHome string) error {
+	return r.seedCodexHomeSkillsForExecutionMode(runtimeCodexHome, ExecutionModeStandard)
+}
+
+func (r *Runtime) seedCodexHomeSkillsForExecutionMode(runtimeCodexHome, executionMode string) error {
+	runtimeCodexHome = strings.TrimSpace(runtimeCodexHome)
+	if runtimeCodexHome == "" {
+		return fmt.Errorf("codex home dir is required")
+	}
+
+	targetRoot := filepath.Join(runtimeCodexHome, "skills")
+	if executionMode == ExecutionModeReadOnly {
+		if err := r.removeAll(targetRoot); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("reset read-only runtime codex skills %s: %w", targetRoot, err)
+		}
+		if err := r.mkdirAll(targetRoot, 0o755); err != nil {
+			return fmt.Errorf("create read-only runtime codex skills %s: %w", targetRoot, err)
+		}
+		return nil
+	}
+	previousHostSkills, err := r.readHostSkillsManifest(runtimeCodexHome)
+	if err != nil {
+		return err
+	}
+
+	sourceRoot, err := hostCodexSkillsPath()
+	if err != nil {
+		return nil
+	}
+	entries, err := os.ReadDir(sourceRoot)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("read host codex skills %s: %w", sourceRoot, err)
+		}
+		entries = nil
+	}
+
+	currentHostSkills := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if name := safeSkillEntryName(entry.Name()); name != "" {
+			currentHostSkills = append(currentHostSkills, name)
+		}
+	}
+
+	if err := r.mkdirAll(targetRoot, 0o755); err != nil {
+		return fmt.Errorf("create runtime codex skills %s: %w", targetRoot, err)
+	}
+	for _, name := range previousHostSkills {
+		if err := r.removeAll(filepath.Join(targetRoot, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove previously managed host codex skill %q: %w", name, err)
+		}
+	}
+	for _, name := range currentHostSkills {
+		if err := r.removeAll(filepath.Join(targetRoot, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("refresh host codex skill %q: %w", name, err)
+		}
+	}
+
+	if len(entries) > 0 {
+		if err := r.copyDir(sourceRoot, targetRoot); err != nil {
+			return fmt.Errorf("seed runtime codex skills %s: %w", targetRoot, err)
+		}
+	}
+	manifest := hostSkillsManifest{Names: currentHostSkills}
+	if err := writeJSONFile(r.writeFile, filepath.Join(runtimeCodexHome, hostSkillsManifestName), manifest); err != nil {
+		return fmt.Errorf("write host codex skills manifest: %w", err)
+	}
+	return nil
+}
+
+type hostSkillsManifest struct {
+	Names []string `json:"names"`
+}
+
+func (r *Runtime) readHostSkillsManifest(runtimeCodexHome string) ([]string, error) {
+	var manifest hostSkillsManifest
+	err := readJSONFile(r.readFile, filepath.Join(runtimeCodexHome, hostSkillsManifestName), &manifest)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		var syntaxErr *json.SyntaxError
+		if errors.As(err, &syntaxErr) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read host codex skills manifest: %w", err)
+	}
+	names := make([]string, 0, len(manifest.Names))
+	seen := make(map[string]struct{}, len(manifest.Names))
+	for _, rawName := range manifest.Names {
+		name := safeSkillEntryName(rawName)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func safeSkillEntryName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
+		return ""
+	}
+	return name
+}
+
+func (r *Runtime) seedCodexHomeWorkspaceSkills(agentID, workspaceDir, runtimeCodexHome string) error {
+	workspaceDir = strings.TrimSpace(workspaceDir)
+	runtimeCodexHome = strings.TrimSpace(runtimeCodexHome)
+	if workspaceDir == "" || runtimeCodexHome == "" {
+		return nil
+	}
+	sourceRoot := filepath.Join(workspaceDir, "skills")
+	entries, err := os.ReadDir(sourceRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read codex workspace skills %s: %w", sourceRoot, err)
+	}
+	managerSkills := map[string]struct{}{}
+	if canonicalRuntimeAgentID(agentID) == identity.ManagerAgentID {
+		names, err := managerTemplateSkillNames()
+		if err != nil {
+			return err
+		}
+		managerSkills = make(map[string]struct{}, len(names))
+		for _, name := range names {
+			managerSkills[name] = struct{}{}
+		}
+	}
+	targetRoot := filepath.Join(runtimeCodexHome, "skills")
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if name == "" {
+			continue
+		}
+		source := filepath.Join(sourceRoot, name)
+		target := filepath.Join(targetRoot, name)
+		if _, isManagerSkill := managerSkills[name]; isManagerSkill {
+			if _, err := r.stat(target); err == nil {
+				continue
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("inspect manager codex workspace skill %q: %w", name, err)
+			}
+		}
+		if err := r.removeAll(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove codex workspace skill %q: %w", name, err)
+		}
+		if err := r.copyDir(source, target); err != nil {
+			return fmt.Errorf("seed codex workspace skill %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func codexWorkspaceTemplateRoot(agentID string) string {
+	if canonicalRuntimeAgentID(agentID) == identity.ManagerAgentID {
+		return templateembed.CodexManagerRoot
+	}
+	return templateembed.CodexWorkerRoot
+}
+
+func (r *Runtime) seedManagerTemplate(agentID, runtimeCodexHome string) error {
+	if canonicalRuntimeAgentID(agentID) != identity.ManagerAgentID {
+		return nil
+	}
+	runtimeCodexHome = strings.TrimSpace(runtimeCodexHome)
+	if runtimeCodexHome == "" {
+		return fmt.Errorf("codex home dir is required")
+	}
+
+	source := templateembed.FS()
+	if err := r.copyEmbeddedDir(source, pathpkg.Join(templateembed.CodexManagerRoot, templateembed.InstructionsDirName), runtimeCodexHome); err != nil {
+		return fmt.Errorf("seed manager codex template %s: %w", runtimeCodexHome, err)
+	}
+	return r.syncManagerTemplateSkills(agentID, runtimeCodexHome)
+}
+
+// syncManagerTemplateSkills replaces every CSGClaw-owned Manager skill with
+// the version embedded in the running binary. Removing each directory first
+// also drops files that disappeared from newer skill versions while leaving
+// custom skills with other names untouched.
+func (r *Runtime) syncManagerTemplateSkills(agentID, runtimeCodexHome string) error {
+	if canonicalRuntimeAgentID(agentID) != identity.ManagerAgentID {
+		return nil
+	}
+	runtimeCodexHome = strings.TrimSpace(runtimeCodexHome)
+	if runtimeCodexHome == "" {
+		return fmt.Errorf("codex home dir is required")
+	}
+
+	skillNames, err := managerTemplateSkillNames()
+	if err != nil {
+		return err
+	}
+	source := templateembed.FS()
+	sourceRoot := pathpkg.Join(templateembed.CodexManagerRoot, templateembed.SkillsDirName)
+	targetRoot := filepath.Join(runtimeCodexHome, "skills")
+	for _, name := range []string{"basics", "agent-teams"} {
+		if err := r.removeAll(filepath.Join(targetRoot, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove legacy manager codex skill %q: %w", name, err)
+		}
+	}
+	for _, name := range skillNames {
+		target := filepath.Join(targetRoot, name)
+		if err := r.removeAll(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove manager codex template skill %q: %w", name, err)
+		}
+		if err := r.copyEmbeddedDir(source, pathpkg.Join(sourceRoot, name), target); err != nil {
+			return fmt.Errorf("sync manager codex template skill %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func managerTemplateSkillNames() ([]string, error) {
+	skillsRoot := pathpkg.Join(templateembed.CodexManagerRoot, templateembed.SkillsDirName)
+	entries, err := fs.ReadDir(templateembed.FS(), skillsRoot)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read manager codex template skills: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func (r *Runtime) writeModelCatalog(runtimeCodexHome string, profile agentruntime.Profile) error {
+	catalogPath := filepath.Join(runtimeCodexHome, modelCatalogFileName)
+	body, err := json.MarshalIndent(codexmodel.Catalog(codexmodel.Profile{
+		Metadata:        profile.ModelMetadata,
+		Provider:        profile.Provider,
+		ModelID:         profile.ModelID,
+		ReasoningEffort: profile.ReasoningEffort,
+	}), "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode runtime codex model catalog: %w", err)
+	}
+	body = append(body, '\n')
+	if err := r.writeFile(catalogPath, body, 0o600); err != nil {
+		return fmt.Errorf("write runtime codex model catalog %s: %w", catalogPath, err)
+	}
+	return nil
+}
+
+func (r *Runtime) ensureBinary(ctx context.Context) (string, error) {
+	if r.deps.BinaryProvider == nil {
+		return "", fmt.Errorf("codex binary provider is required")
+	}
+	return r.deps.BinaryProvider.Ensure(ctx)
+}
+
+func (r *Runtime) CheckAvailability(ctx context.Context) error {
+	_, err := r.ensureBinary(ctx)
+	return err
+}
+
+func (r *Runtime) ensureRuntimeHome(agentID string) error {
+	_, err := r.ensureRuntimeDirs(agentID)
+	return err
+}
+
+func (r *Runtime) hostSessionHomeDir(fallback string) string {
+	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
+		return home
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return home
+	}
+	return fallback
+}
+
+func (r *Runtime) ensureRuntimeDirs(agentID string) (runtimeDirs, error) {
+	root, err := r.runtimeDirForAgent(agentID)
+	if err != nil {
+		return runtimeDirs{}, err
+	}
+	dirs := runtimeDirs{
+		Root:      root,
+		Workspace: filepath.Join(root, workspaceDirName),
+		Home:      filepath.Join(root, homeDirName),
+		CodexHome: filepath.Join(root, homeDirName),
+		StderrLog: filepath.Join(root, homeDirName, stderrLogFileName),
+	}
+	for _, path := range []string{dirs.Root, dirs.Workspace, dirs.Home} {
+		if err := r.mkdirAll(path, 0o755); err != nil {
+			return runtimeDirs{}, fmt.Errorf("create codex runtime dir %s: %w", path, err)
+		}
+	}
+	return dirs, nil
+}
+
+func (r *Runtime) runtimeDirForHandle(h agentruntime.Handle) (string, error) {
+	agentRef, err := r.resolveAgent(h)
+	if err != nil {
+		return "", err
+	}
+	return r.runtimeDirForAgent(agentRef.ID)
+}
+
+func (r *Runtime) runtimeDirForAgent(agentID string) (string, error) {
+	if r.deps.AgentHome == nil {
+		return "", fmt.Errorf("agent home resolver is required")
+	}
+	agentHome, err := r.deps.AgentHome(canonicalRuntimeAgentID(agentID))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(agentHome, filepath.FromSlash(hostStateDirName)), nil
+}
+
+func (r *Runtime) stderrLogPath(h agentruntime.Handle) (string, error) {
+	agentRef, err := r.resolveAgent(h)
+	if err != nil {
+		return "", err
+	}
+	if r.deps.AgentHome == nil {
+		return "", fmt.Errorf("agent home resolver is required")
+	}
+	agentHome, err := r.deps.AgentHome(canonicalRuntimeAgentID(agentRef.ID))
+	if err != nil {
+		return "", err
+	}
+	layout := r.Layout(agentHome)
+	if len(layout.HostLogPaths) == 0 {
+		return "", fmt.Errorf("codex runtime host log path is required")
+	}
+	return layout.HostLogPaths[0], nil
+}
+
+func (r *Runtime) resolveAgent(h agentruntime.Handle) (AgentRef, error) {
+	if r.deps.ResolveAgent == nil {
+		return AgentRef{}, fmt.Errorf("agent resolver is required")
+	}
+	agentRef, err := r.deps.ResolveAgent(h)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return AgentRef{}, sandbox.ErrNotFound
+		}
+		return AgentRef{}, err
+	}
+	if strings.TrimSpace(agentRef.Name) == "" || strings.TrimSpace(agentRef.ID) == "" {
+		return AgentRef{}, fmt.Errorf("resolved agent is incomplete")
+	}
+	agentRef.ID = canonicalRuntimeAgentID(agentRef.ID)
+	return agentRef, nil
+}
+
+func (r *Runtime) RefreshCodexHomeAgentsFile(_ context.Context, h agentruntime.Handle) error {
+	agentRef, err := r.resolveAgent(h)
+	if err != nil {
+		return err
+	}
+	codexHomeDir, err := r.resolveCodexHomeDir(agentRef.ID)
+	if err != nil {
+		return err
+	}
+	return r.refreshCodexHomeAgentsFile(h, codexHomeDir)
+}
+
+func (r *Runtime) resolveCodexHomeDir(agentID string) (string, error) {
+	dirs, err := r.ensureRuntimeDirs(agentID)
+	if err != nil {
+		return "", err
+	}
+	return dirs.CodexHome, nil
+}
+
+func (r *Runtime) refreshCodexHomeAgentsFile(h agentruntime.Handle, codexHomeDir string) error {
+	fragments, err := managedExtensionInstructions(codexHomeDir)
+	if err != nil {
+		return err
+	}
+	return r.refreshCodexHomeAgentsFileWithFragments(h, codexHomeDir, fragments)
+}
+
+func (r *Runtime) refreshCodexHomeAgentsFileWithFragments(h agentruntime.Handle, codexHomeDir string, fragments []string) error {
+	codexHomeDir = strings.TrimSpace(codexHomeDir)
+	if codexHomeDir == "" {
+		return fmt.Errorf("codex home dir is required")
+	}
+	if err := r.mkdirAll(codexHomeDir, 0o755); err != nil {
+		return fmt.Errorf("create codex home dir %s: %w", codexHomeDir, err)
+	}
+	agentRef, err := r.resolveAgent(h)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(codexHomeDir, "AGENTS.md")
+	instructions := agentRef.Instructions
+	if IsReadOnlyExecutionMode(agentRef.RuntimeOptions) {
+		instructions = strings.TrimSpace(instructions + "\n\n" + readOnlyRuntimeInstructions)
+	}
+	block := runtimeinstructions.RenderRuntimeAgentsInstructionsBlockWithOptions(agentRef.ID, instructions, runtimeinstructions.RuntimeManagedInstructionsOptions{
+		AgentMCP:   strings.TrimSpace(agentRef.Profile.Env[agentAccessTokenEnv]) != "",
+		Extensions: fragments,
+		CLIPath:    agentRef.Profile.Env["CSGCLAW_CLI"],
+	})
+	current, err := r.readFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read codex home AGENTS.md %s: %w", path, err)
+	}
+	merged := mergeAgentsInstructionsBlock(string(current), block)
+	if err == nil && string(current) == merged {
+		return nil
+	}
+	if err := r.writeFile(path, []byte(merged), 0o644); err != nil {
+		return fmt.Errorf("write codex home AGENTS.md %s: %w", path, err)
+	}
+	return nil
+}
+
+func (r *Runtime) SyncWorkspaceAgentsFile(ctx context.Context, h agentruntime.Handle, previousRuntimeOptions map[string]any) error {
+	_ = previousRuntimeOptions
+	return r.RefreshCodexHomeAgentsFile(ctx, h)
+}
+
+func mergeAgentsInstructionsBlock(current, block string) string {
+	start, end := runtimeinstructions.AgentsInstructionsBlockMarkers()
+	current = strings.ReplaceAll(current, "\r\n", "\n")
+	block = strings.TrimRight(strings.ReplaceAll(block, "\r\n", "\n"), "\n")
+
+	if replaced, ok := replaceAgentsInstructionsBlock(current, start, end, block); ok {
+		return replaced
+	}
+	if strings.TrimSpace(current) == "" {
+		return block + "\n"
+	}
+	return joinAgentsInstructionsSections(current, block, "")
+}
+
+func replaceAgentsInstructionsBlock(current, start, end, block string) (string, bool) {
+	startIdx := strings.Index(current, start)
+	if startIdx < 0 {
+		return "", false
+	}
+	endIdx := strings.Index(current[startIdx:], end)
+	if endIdx < 0 {
+		return joinAgentsInstructionsSections(current[:startIdx], block, ""), true
+	}
+	endPos := startIdx + endIdx + len(end)
+	prefix := current[:startIdx]
+	suffix := current[endPos:]
+	return joinAgentsInstructionsSections(prefix, block, suffix), true
+}
+
+func removeAgentsInstructionsBlock(current string) (string, bool) {
+	start, end := runtimeinstructions.AgentsInstructionsBlockMarkers()
+	current = strings.ReplaceAll(current, "\r\n", "\n")
+	startIdx := strings.Index(current, start)
+	if startIdx < 0 {
+		return "", false
+	}
+	endIdx := strings.Index(current[startIdx:], end)
+	if endIdx < 0 {
+		return joinAgentsInstructionsSections(current[:startIdx]), true
+	}
+	endPos := startIdx + endIdx + len(end)
+	return joinAgentsInstructionsSections(current[:startIdx], current[endPos:]), true
+}
+
+func joinAgentsInstructionsSections(parts ...string) string {
+	sections := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(strings.ReplaceAll(part, "\r\n", "\n"))
+		if part == "" {
+			continue
+		}
+		sections = append(sections, part)
+	}
+	if len(sections) == 0 {
+		return ""
+	}
+	return strings.Join(sections, "\n\n") + "\n"
+}
+
+func (r *Runtime) readRuntimeMetadata(runtimeID string) (runtimeMetadata, error) {
+	path, err := r.runtimeMetadataPath(runtimeID)
+	if err != nil {
+		return runtimeMetadata{}, err
+	}
+	var meta runtimeMetadata
+	if err := readJSONFile(r.readFile, path, &meta); err != nil {
+		return runtimeMetadata{}, err
+	}
+	return normalizeRuntimeMetadata(meta), nil
+}
+
+func (r *Runtime) readSessionMetadata(runtimeID string) (sessionMetadata, error) {
+	path, err := r.sessionMetadataPath(runtimeID)
+	if err != nil {
+		return sessionMetadata{}, err
+	}
+	var meta sessionMetadata
+	if err := readJSONFile(r.readFile, path, &meta); err != nil {
+		return sessionMetadata{}, err
+	}
+	// Native dynamic tools are persisted at thread creation and cannot be added
+	// by thread/resume. Reuse the existing capability-upgrade path for older sets.
+	if meta.DynamicToolsVersion != engineDynamicToolsVersion {
+		meta.FilePublishingConversations = nil
+	}
+	return normalizeSessionMetadata(meta), nil
+}
+
+func (r *Runtime) writeMetadata(meta runtimeMetadata) error {
+	path, err := r.runtimeMetadataPath(meta.RuntimeID)
+	if err != nil {
+		return err
+	}
+	meta = normalizeRuntimeMetadata(meta)
+	return writeJSONFile(r.writeFile, path, meta)
+}
+
+func (r *Runtime) writeSessionMetadata(meta sessionMetadata) error {
+	path, err := r.sessionMetadataPath(meta.RuntimeID)
+	if err != nil {
+		return err
+	}
+	meta = normalizeSessionMetadata(meta)
+	return writeJSONFile(r.writeFile, path, meta)
+}
+
+func (r *Runtime) runtimeMetadataPath(runtimeID string) (string, error) {
+	root, err := r.runtimeDirForHandle(agentruntime.Handle{RuntimeID: strings.TrimSpace(runtimeID)})
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, runtimeFileName), nil
+}
+
+func (r *Runtime) sessionMetadataPath(runtimeID string) (string, error) {
+	root, err := r.runtimeDirForHandle(agentruntime.Handle{RuntimeID: strings.TrimSpace(runtimeID)})
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, sessionFileName), nil
+}
+
+func (r *Runtime) mkdirAll(path string, mode os.FileMode) error {
+	if r.deps.MkdirAll != nil {
+		return r.deps.MkdirAll(path, mode)
+	}
+	return os.MkdirAll(path, mode)
+}
+
+func (r *Runtime) readFile(path string) ([]byte, error) {
+	if r.deps.ReadFile != nil {
+		return r.deps.ReadFile(path)
+	}
+	return os.ReadFile(path)
+}
+
+func (r *Runtime) stat(path string) (os.FileInfo, error) {
+	if r.deps.Stat != nil {
+		return r.deps.Stat(path)
+	}
+	return os.Stat(path)
+}
+
+func (r *Runtime) writeFile(path string, data []byte, mode os.FileMode) error {
+	if r.deps.WriteFile != nil {
+		return r.deps.WriteFile(path, data, mode)
+	}
+	return os.WriteFile(path, data, mode)
+}
+
+func (r *Runtime) removeAll(path string) error {
+	if r.deps.RemoveAll != nil {
+		return r.deps.RemoveAll(path)
+	}
+	return os.RemoveAll(path)
+}
+
+func (r *Runtime) stopUntrackedRuntimeProcesses(ctx context.Context, runtimeID, runtimeDir string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stop := stopRuntimeProcessesUsingDir
+	if r != nil && r.deps.StopRuntimeProcesses != nil {
+		stop = r.deps.StopRuntimeProcesses
+	}
+	pids, err := stop(runtimeDir)
+	if err != nil {
+		return fmt.Errorf("stop untracked codex processes for runtime %q: %w", runtimeID, err)
+	}
+	if len(pids) > 0 {
+		slog.InfoContext(ctx, "stopped untracked codex runtime processes",
+			"runtime_id", runtimeID,
+			"runtime_dir", runtimeDir,
+			"process_ids", pids,
+		)
+	}
+	return nil
+}
+
+func (r *Runtime) removeRuntimeDir(ctx context.Context, runtimeID, path string) error {
+	startedAt := time.Now()
+	for attempt := 1; attempt <= runtimeDirRemoveTries; attempt++ {
+		err := r.removeAll(path)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			if attempt > 1 {
+				slog.InfoContext(ctx, "codex runtime directory removal recovered after retry",
+					"runtime_id", runtimeID,
+					"runtime_dir", path,
+					"attempts", attempt,
+					"elapsed", time.Since(startedAt).Round(time.Millisecond),
+				)
+			}
+			return nil
+		}
+		if !isTransientRuntimeDirRemoveError(err) || attempt == runtimeDirRemoveTries {
+			return runtimeDirRemovalFailure(ctx, runtimeID, path, attempt, startedAt, err)
+		}
+
+		delay := runtimeDirRemoveInitialDelay << (attempt - 1)
+		if delay > runtimeDirRemoveMaxDelay {
+			delay = runtimeDirRemoveMaxDelay
+		}
+		if attempt == 1 {
+			logRuntimeDirRemovalBlocked(ctx, runtimeID, path, attempt, delay, err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return runtimeDirRemovalFailure(ctx, runtimeID, path, attempt, startedAt, errors.Join(ctx.Err(), err))
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func isTransientRuntimeDirRemoveError(err error) bool {
+	if errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.ENOTEMPTY) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "being used by another process") ||
+		strings.Contains(msg, "the process cannot access the file") ||
+		strings.Contains(msg, "access is denied")
+}
+
+type runtimeDirRemovalDiagnostics struct {
+	FilesystemType            string
+	FilesystemInspectionError string
+	RemainingEntries          []string
+	RemainingEntriesTruncated bool
+	DirectoryInspectionError  string
+}
+
+type runtimeDirRemovalErrorDetails struct {
+	Operation string
+	Path      string
+	Errno     string
+	ErrnoCode int64
+}
+
+func logRuntimeDirRemovalBlocked(ctx context.Context, runtimeID, path string, attempt int, retryDelay time.Duration, err error) {
+	diagnostics := inspectRuntimeDirRemoval(path)
+	details := inspectRuntimeDirRemovalError(err)
+	slog.LogAttrs(ctx, slog.LevelWarn, "codex runtime directory removal blocked; retrying",
+		slog.String("runtime_id", runtimeID),
+		slog.String("runtime_dir", path),
+		slog.Int("attempt", attempt),
+		slog.Int("max_attempts", runtimeDirRemoveTries),
+		slog.Duration("retry_delay", retryDelay),
+		slog.Any("error", err),
+		slog.String("error_operation", details.Operation),
+		slog.String("error_path", details.Path),
+		slog.String("errno", details.Errno),
+		slog.Int64("errno_code", details.ErrnoCode),
+		slog.String("filesystem_type", diagnostics.FilesystemType),
+		slog.String("filesystem_inspection_error", diagnostics.FilesystemInspectionError),
+		slog.Any("remaining_entries", diagnostics.RemainingEntries),
+		slog.Bool("remaining_entries_truncated", diagnostics.RemainingEntriesTruncated),
+		slog.String("directory_inspection_error", diagnostics.DirectoryInspectionError),
+	)
+}
+
+func runtimeDirRemovalFailure(ctx context.Context, runtimeID, path string, attempts int, startedAt time.Time, err error) error {
+	diagnostics := inspectRuntimeDirRemoval(path)
+	details := inspectRuntimeDirRemovalError(err)
+	elapsed := time.Since(startedAt).Round(time.Millisecond)
+	slog.LogAttrs(ctx, slog.LevelError, "codex runtime directory removal failed",
+		slog.String("runtime_id", runtimeID),
+		slog.String("runtime_dir", path),
+		slog.Int("attempts", attempts),
+		slog.Duration("elapsed", elapsed),
+		slog.Any("error", err),
+		slog.String("error_operation", details.Operation),
+		slog.String("error_path", details.Path),
+		slog.String("errno", details.Errno),
+		slog.Int64("errno_code", details.ErrnoCode),
+		slog.String("filesystem_type", diagnostics.FilesystemType),
+		slog.String("filesystem_inspection_error", diagnostics.FilesystemInspectionError),
+		slog.Any("remaining_entries", diagnostics.RemainingEntries),
+		slog.Bool("remaining_entries_truncated", diagnostics.RemainingEntriesTruncated),
+		slog.String("directory_inspection_error", diagnostics.DirectoryInspectionError),
+	)
+	return fmt.Errorf(
+		"remove codex runtime directory %q after %d attempts over %s: %w; diagnostics: filesystem_type=%q errno=%q error_path=%q remaining_entries=%q remaining_entries_truncated=%t filesystem_inspection_error=%q directory_inspection_error=%q",
+		path,
+		attempts,
+		elapsed,
+		err,
+		diagnostics.FilesystemType,
+		details.Errno,
+		details.Path,
+		diagnostics.RemainingEntries,
+		diagnostics.RemainingEntriesTruncated,
+		diagnostics.FilesystemInspectionError,
+		diagnostics.DirectoryInspectionError,
+	)
+}
+
+func inspectRuntimeDirRemoval(path string) runtimeDirRemovalDiagnostics {
+	diagnostics := runtimeDirRemovalDiagnostics{}
+	diagnostics.FilesystemType, diagnostics.FilesystemInspectionError = runtimeDirFilesystemType(path)
+	walkErr := filepath.WalkDir(path, func(entryPath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entryPath == path {
+			return nil
+		}
+		relative, err := filepath.Rel(path, entryPath)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		if entry.IsDir() {
+			relative += "/"
+		}
+		diagnostics.RemainingEntries = append(diagnostics.RemainingEntries, relative)
+		if len(diagnostics.RemainingEntries) >= runtimeDirRemovalEntryLimit {
+			diagnostics.RemainingEntriesTruncated = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, os.ErrNotExist) {
+		diagnostics.DirectoryInspectionError = walkErr.Error()
+	}
+	return diagnostics
+}
+
+func inspectRuntimeDirRemovalError(err error) runtimeDirRemovalErrorDetails {
+	details := runtimeDirRemovalErrorDetails{}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		details.Operation = pathErr.Op
+		details.Path = pathErr.Path
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		details.ErrnoCode = int64(errno)
+		switch errno {
+		case syscall.ENOTEMPTY:
+			details.Errno = "ENOTEMPTY"
+		case syscall.EBUSY:
+			details.Errno = "EBUSY"
+		case syscall.EACCES:
+			details.Errno = "EACCES"
+		case syscall.EPERM:
+			details.Errno = "EPERM"
+		default:
+			details.Errno = errno.Error()
+		}
+	}
+	return details
+}
+
+func (r *Runtime) openFile(path string, flag int, mode os.FileMode) (*os.File, error) {
+	if r.deps.OpenFile != nil {
+		return r.deps.OpenFile(path, flag, mode)
+	}
+	return os.OpenFile(path, flag, mode)
+}
+
+func (r *Runtime) copyDir(srcRoot, dstRoot string) error {
+	srcRoot = strings.TrimSpace(srcRoot)
+	dstRoot = strings.TrimSpace(dstRoot)
+	if srcRoot == "" || dstRoot == "" {
+		return fmt.Errorf("source and destination roots are required")
+	}
+	if err := filepath.WalkDir(srcRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return r.mkdirAll(dstRoot, 0o755)
+		}
+		dstPath := filepath.Join(dstRoot, rel)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return r.mkdirAll(dstPath, info.Mode().Perm())
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := r.mkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return err
+		}
+		return r.writeFile(dstPath, data, info.Mode().Perm())
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Runtime) copyEmbeddedDir(source fs.FS, srcRoot, dstRoot string) error {
+	srcRoot = pathpkg.Clean(strings.TrimSpace(srcRoot))
+	dstRoot = strings.TrimSpace(dstRoot)
+	if source == nil || srcRoot == "" || srcRoot == "." || dstRoot == "" {
+		return fmt.Errorf("source and destination roots are required")
+	}
+	return fs.WalkDir(source, srcRoot, func(srcPath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel := "."
+		if srcPath != srcRoot {
+			rel = strings.TrimPrefix(srcPath, srcRoot+"/")
+		}
+		dstPath := dstRoot
+		if rel != "." {
+			dstPath = filepath.Join(dstRoot, filepath.FromSlash(rel))
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return r.mkdirAll(dstPath, writableEmbeddedDirMode(info.Mode()))
+		}
+		data, err := fs.ReadFile(source, srcPath)
+		if err != nil {
+			return err
+		}
+		if err := r.mkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return err
+		}
+		return r.writeFile(dstPath, data, writableEmbeddedFileMode(info.Mode()))
+	})
+}
+
+func writableEmbeddedDirMode(mode os.FileMode) os.FileMode {
+	mode &= os.ModePerm
+	if mode == 0 {
+		return 0o755
+	}
+	return mode | 0o700
+}
+
+func writableEmbeddedFileMode(mode os.FileMode) os.FileMode {
+	mode &= os.ModePerm
+	if mode == 0 {
+		return 0o644
+	}
+	return mode | 0o600
+}
+
+func hostCodexAuthPath() (string, error) {
+	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
+		return filepath.Join(home, "auth.json"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codex", "auth.json"), nil
+}
+
+func hostCodexSkillsPath() (string, error) {
+	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
+		return filepath.Join(home, "skills"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codex", "skills"), nil
+}
+
+type runtimeDirs struct {
+	Root      string
+	Workspace string
+	Home      string
+	CodexHome string
+	StderrLog string
+}
+
+type runtimeMetadata struct {
+	RuntimeID  string             `json:"runtime_id"`
+	AgentID    string             `json:"agent_id"`
+	AgentName  string             `json:"agent_name"`
+	BinaryPath string             `json:"binary_path"`
+	SessionID  string             `json:"session_id,omitempty"`
+	ProcessID  int                `json:"pid,omitempty"`
+	State      agentruntime.State `json:"state,omitempty"`
+	CreatedAt  time.Time          `json:"created_at,omitempty"`
+	StartedAt  time.Time          `json:"started_at,omitempty"`
+	StoppedAt  time.Time          `json:"stopped_at,omitempty"`
+	ExitCode   int                `json:"exit_code,omitempty"`
+}
+
+// Increment whenever the engine-facing dynamic tool set or schema changes.
+// Persisted Codex threads cannot acquire new dynamic tools through thread/resume,
+// so an older version must rotate to a fresh thread on the next conversation turn.
+const engineDynamicToolsVersion = 5
+
+type sessionMetadata struct {
+	DynamicToolsVersion            int               `json:"dynamic_tools_version,omitempty"`
+	RuntimeID                      string            `json:"runtime_id"`
+	SessionID                      string            `json:"session_id"`
+	WorkspaceDir                   string            `json:"workspace_dir"`
+	HomeDir                        string            `json:"home_dir"`
+	CodexHomeDir                   string            `json:"codex_home_dir"`
+	StartedAt                      time.Time         `json:"started_at,omitempty"`
+	ConversationSessions           map[string]string `json:"conversation_sessions,omitempty"`
+	FilePublishingConversations    map[string]bool   `json:"file_publishing_conversations,omitempty"`
+	ConversationProfileFingerprint string            `json:"conversation_profile_fingerprint,omitempty"`
+}
+
+func sessionToRuntimeMetadata(session *Session) runtimeMetadata {
+	return normalizeRuntimeMetadata(runtimeMetadata{
+		RuntimeID:  session.RuntimeID,
+		AgentID:    session.AgentID,
+		AgentName:  session.AgentName,
+		BinaryPath: session.BinaryPath,
+		SessionID:  session.SessionID,
+		ProcessID:  session.ProcessID,
+		State:      agentruntime.StateRunning,
+		CreatedAt:  session.CreatedAt,
+		StartedAt:  session.StartedAt,
+	})
+}
+
+func sessionToSessionMetadata(session *Session) sessionMetadata {
+	return normalizeSessionMetadata(sessionMetadata{
+		DynamicToolsVersion:            engineDynamicToolsVersion,
+		RuntimeID:                      session.RuntimeID,
+		SessionID:                      session.SessionID,
+		WorkspaceDir:                   session.WorkspaceDir,
+		HomeDir:                        session.HomeDir,
+		CodexHomeDir:                   session.CodexHomeDir,
+		StartedAt:                      session.StartedAt,
+		ConversationSessions:           cloneConversationSessions(session.ConversationSessions),
+		ConversationProfileFingerprint: strings.TrimSpace(session.ConversationProfileFingerprint),
+		FilePublishingConversations: cloneFilePublishingConversations(
+			session.FilePublishingConversations,
+		),
+	})
+}
+
+func cloneConversationSessions(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func persistedConversationsForProfile(meta sessionMetadata, profile agentruntime.Profile) (map[string]string, map[string]bool) {
+	fingerprint := conversationProfileFingerprint(profile.Provider, profile.BaseURL, profile.ModelID)
+	if strings.TrimSpace(meta.ConversationProfileFingerprint) != fingerprint {
+		return nil, nil
+	}
+	return cloneConversationSessions(meta.ConversationSessions), cloneFilePublishingConversations(meta.FilePublishingConversations)
+}
+
+func conversationProfileFingerprint(provider, baseURL, modelID string) string {
+	identity := strings.TrimSpace(provider) + "\x00" +
+		strings.TrimRight(strings.TrimSpace(baseURL), "/") + "\x00" +
+		strings.TrimSpace(modelID)
+	sum := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func cloneFilePublishingConversations(in map[string]bool) map[string]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(in))
+	for key, enabled := range in {
+		key = strings.TrimSpace(key)
+		if key != "" && enabled {
+			out[key] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeRuntimeMetadata(meta runtimeMetadata) runtimeMetadata {
+	meta.RuntimeID = strings.TrimSpace(meta.RuntimeID)
+	meta.AgentID = strings.TrimSpace(meta.AgentID)
+	meta.AgentName = strings.TrimSpace(meta.AgentName)
+	meta.BinaryPath = strings.TrimSpace(meta.BinaryPath)
+	meta.SessionID = strings.TrimSpace(meta.SessionID)
+	meta.State = normalizeRuntimeState(meta.State)
+	if !meta.CreatedAt.IsZero() {
+		meta.CreatedAt = meta.CreatedAt.UTC()
+	}
+	if !meta.StartedAt.IsZero() {
+		meta.StartedAt = meta.StartedAt.UTC()
+	}
+	if !meta.StoppedAt.IsZero() {
+		meta.StoppedAt = meta.StoppedAt.UTC()
+	}
+	return meta
+}
+
+func normalizeSessionMetadata(meta sessionMetadata) sessionMetadata {
+	meta.RuntimeID = strings.TrimSpace(meta.RuntimeID)
+	meta.SessionID = strings.TrimSpace(meta.SessionID)
+	meta.WorkspaceDir = strings.TrimSpace(meta.WorkspaceDir)
+	meta.HomeDir = strings.TrimSpace(meta.HomeDir)
+	meta.CodexHomeDir = strings.TrimSpace(meta.CodexHomeDir)
+	meta.ConversationSessions = cloneConversationSessions(meta.ConversationSessions)
+	meta.FilePublishingConversations = cloneFilePublishingConversations(meta.FilePublishingConversations)
+	meta.ConversationProfileFingerprint = strings.TrimSpace(meta.ConversationProfileFingerprint)
+	if !meta.StartedAt.IsZero() {
+		meta.StartedAt = meta.StartedAt.UTC()
+	}
+	return meta
+}
+
+func normalizeRuntimeState(state agentruntime.State) agentruntime.State {
+	switch state {
+	case agentruntime.StateCreated, agentruntime.StateRunning, agentruntime.StateStopped, agentruntime.StateExited, agentruntime.StateFailed:
+		return state
+	default:
+		return agentruntime.StateUnknown
+	}
+}
+
+func processAlive(pid int) bool {
+	return processAlivePID(pid)
+}
+
+func stopProcess(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	// Stopping the tracked app-server can race with the process exiting after
+	// its stdin is closed. On Windows, os.FindProcess opens a process handle and
+	// returns ERROR_INVALID_PARAMETER once that PID no longer exists. Treat an
+	// already-exited process as a successful, idempotent stop.
+	if !processAlive(pid) {
+		return nil
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		if !processAlive(pid) {
+			return nil
+		}
+		return err
+	}
+	_ = proc.Signal(os.Interrupt)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return stopProcessTree(pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := stopProcessTree(pid); err != nil {
+		return err
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := proc.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		if !processAlive(pid) {
+			return nil
+		}
+		return err
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("process %d is still running after interrupt and kill attempts", pid)
+}
+
+func readJSONFile(readFile func(string) ([]byte, error), path string, dst any) error {
+	data, err := readFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, dst)
+}
+
+func writeJSONFile(writeFile func(string, []byte, os.FileMode) error, path string, payload any) error {
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return writeFile(path, data, 0o600)
+}
+
+type managerDeps struct {
+	BeforePrompt                 func(context.Context, SessionHandle) error
+	EventSink                    SessionEventSink
+	Permission                   PermissionBroker
+	UserInput                    UserInputBroker
+	OpenFile                     func(string, int, os.FileMode) (*os.File, error)
+	WriteFile                    func(string, []byte, os.FileMode) error
+	ReadFile                     func(string) ([]byte, error)
+	OnExit                       func(*Session, int)
+	HydrateSession               func(context.Context, SessionHandle) (*Session, error)
+	OnConversationSessionsChange func(*Session, map[string]string, map[string]bool) error
+}

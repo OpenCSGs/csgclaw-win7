@@ -1,0 +1,521 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { emptyAuthStatus } from "@/models/auth";
+import { defaultAuthEnvironmentDraft } from "@/models/authEnvironment";
+import { WorkspacePaneTypes, WorkspaceTabs } from "@/models/routing";
+import { WorkspaceSidebar } from "@/pages/WorkspacePage/components/WorkspaceSidebar";
+import type { WorkspaceSidebarProps } from "@/pages/WorkspacePage/components/WorkspaceSidebar/types";
+import type { TranslateFn } from "@/models/conversations";
+
+const labels: Record<string, string> = {
+  activeNow: "active",
+  agentsTab: "Agents",
+  appearanceSettings: "Appearance",
+  channelsSection: "Rooms",
+  collapseSidebar: "Collapse sidebar",
+  computerAgentsSection: "Agents",
+  computerOverview: "Computer overview",
+  computersSection: "Computers",
+  configSettingsMenu: "Configuration",
+  createRoom: "Create room",
+  directMessagesSection: "Direct messages",
+  expandSidebar: "Expand sidebar",
+  humanSection: "Human",
+  localAgentConsole: "Local agent console",
+  messagesTab: "Messages",
+  modelProviderAdd: "Add model provider",
+  noNotificationBots: "No notification bots yet",
+  noTeams: "No teams yet.",
+  normalTasksTab: "Tasks",
+  notificationsSection: "Notifications",
+  resourcesModelProvidersSection: "Models",
+  resourcesKnowledgeBasesLabel: "Knowledge bases",
+  resourcesKnowledgeBaseAdded: "Added to MCP",
+  resourcesSkillsLabel: "Skills",
+  resourcesMCPLabel: "MCP",
+  resourcesTab: "Resources",
+  resourcesTemplatesSection: "Templates",
+  scheduledTasksTab: "Scheduled",
+  scheduledTaskCreate: "New scheduled task",
+  settings: "Settings",
+  tasksTab: "Tasks",
+  teamsSection: "Teams",
+  themeDark: "Dark",
+  themeLight: "Light",
+  workspaceSearchNoResults: "No matching results.",
+  workspaceSearchPlaceholder: "Search",
+};
+
+const t: TranslateFn = (key, params) => {
+  const label = labels[key] ?? key;
+  if (!params) {
+    return label;
+  }
+  return Object.entries(params).reduce(
+    (current, [paramKey, value]) => current.replace(`{${paramKey}}`, String(value)),
+    label,
+  );
+};
+
+function renderSidebar(overrides: Partial<WorkspaceSidebarProps> = {}) {
+  const props: WorkspaceSidebarProps = {
+    activePane: { type: WorkspacePaneTypes.hub, id: "hub", resourceType: "template" },
+    activeThreadRootID: "",
+    activeTaskBoardView: "tasks",
+    agentItems: [],
+    agentsError: "",
+    appVersion: "0.0.0",
+    authBusy: false,
+    authLoggingOut: false,
+    authEnvironment: defaultAuthEnvironmentDraft(),
+    authError: "",
+    authPending: false,
+    authStatus: emptyAuthStatus(),
+    channels: [],
+    collapsedWorkspaceGroups: {},
+    currentUserID: "user-1",
+    currentWorkspaceLabel: "Resources",
+    directMessages: [],
+    hub: {
+      loaded: true,
+      listError: "",
+      selectedHubResourceType: "template",
+      selectedHubSkillName: "",
+      selectedHubTemplateId: "",
+      skills: [{ name: "shell", description: "Shell helpers" }],
+      skillsError: "",
+      templates: [{ id: "worker-template", name: "Worker Template", role: "worker" }],
+      uploadBusy: false,
+      uploadError: "",
+    } as unknown as WorkspaceSidebarProps["hub"],
+    isSidebarCollapsed: false,
+    locale: "en",
+    modelProviders: {
+      builtinProviders: [],
+      customProviders: [],
+      providers: [
+        {
+          builtin: true,
+          display_name: "OpenAI",
+          id: "openai",
+          kind: "openai",
+          models: ["gpt-4.1"],
+          preset: "openai",
+          status: "connected",
+        },
+      ],
+    },
+    modelProvidersLoaded: true,
+    notificationAgentItems: [],
+    onCollapseSidebar: vi.fn(),
+    onAuthEnvironmentChange: vi.fn(),
+    onCreateAgent: vi.fn(),
+    onCreateModelProvider: vi.fn(),
+    onCreateNotificationParticipant: vi.fn(),
+    onCreateRoom: vi.fn(),
+    onCreateTeam: vi.fn(),
+    onExpandSidebar: vi.fn(),
+    onLocaleChange: vi.fn(),
+    onLogin: vi.fn(),
+    onLogout: vi.fn(),
+    onOpenConfigSettings: vi.fn(),
+    onOpenSettings: vi.fn(),
+    onOpenCreateScheduledTask: vi.fn(),
+    onOpenCreateTask: vi.fn(),
+    onOpenCreateTeam: vi.fn(),
+    onOpenUpgrade: vi.fn(),
+    onRefreshUpgradeStatus: vi.fn().mockResolvedValue(null),
+    onUpgradeChannelChange: vi.fn(),
+    onPreviewUser: vi.fn(),
+    onSelectAgent: vi.fn(),
+    onSelectComputer: vi.fn(),
+    onSelectConversation: vi.fn(),
+    onSelectHub: vi.fn(),
+    onSelectHubSkill: vi.fn(),
+    onSelectHubTemplate: vi.fn(),
+    onSelectModelProvider: vi.fn(),
+    onSelectHuman: vi.fn(),
+    onSelectNotificationSection: vi.fn(),
+    onSelectTask: vi.fn(),
+    onSelectTaskBoardView: vi.fn(),
+    onSelectTeam: vi.fn(),
+    onSelectTeamSection: vi.fn(),
+    onSelectThread: vi.fn(),
+    onThemeChange: vi.fn(),
+    onToggleWorkspaceGroup: vi.fn(),
+    onViewTaskDetails: vi.fn(),
+    onWorkspaceTabChange: vi.fn(),
+    planningTaskID: "",
+    roomCount: 0,
+    runningAgentCount: 0,
+    scheduledTaskCount: 0,
+    showHubNewBadge: false,
+    showUpgradeControls: false,
+    suppressUpgradeIssue: false,
+    taskCount: 0,
+    taskItems: [],
+    teamActionBusy: false,
+    teamActionError: "",
+    teams: [],
+    t,
+    theme: "light",
+    threadCount: 0,
+    threadGroups: [],
+    upgradeBusy: false,
+    upgradeChannelBusy: false,
+    upgradeChannelError: "",
+    upgradeChannelLocked: false,
+    upgradeError: "",
+    upgradePhase: "idle",
+    upgradeStatus: null,
+    usersById: new Map([["user-1", { id: "user-1", name: "User One" }]]),
+    workerAgentItems: [],
+    workspaceTab: WorkspaceTabs.hub,
+    ...overrides,
+  };
+
+  return {
+    props,
+    ...render(<WorkspaceSidebar {...props} />),
+  };
+}
+
+describe("WorkspaceSidebar", () => {
+  it("keeps room creation only in the Rooms section", () => {
+    const onCreateRoom = vi.fn();
+
+    renderSidebar({
+      activePane: { type: WorkspacePaneTypes.conversation, id: "" },
+      currentWorkspaceLabel: "Messages",
+      onCreateRoom,
+      workspaceTab: WorkspaceTabs.messages,
+    });
+
+    const createRoomButtons = screen.getAllByRole("button", { name: "Create room" });
+    expect(createRoomButtons).toHaveLength(1);
+    expect(createRoomButtons[0].parentElement).toHaveAttribute("data-tooltip", "Create room");
+
+    fireEvent.click(createRoomButtons[0]);
+    expect(onCreateRoom).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens unified connectors when the MCP list is empty", () => {
+    const onSelectApps = vi.fn();
+
+    renderSidebar({
+      hub: {
+        loaded: true,
+        listError: "",
+        mcpServers: [],
+        selectedHubResourceType: "skill",
+        selectedHubSkillName: "shell",
+        selectedHubTemplateId: "",
+        skills: [{ name: "shell", description: "Shell helpers" }],
+        skillsError: "",
+        templates: [],
+        uploadBusy: false,
+        uploadError: "",
+      } as unknown as WorkspaceSidebarProps["hub"],
+      onSelectApps,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "agentAppsTab" }));
+
+    expect(onSelectApps).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses resource navigation without duplicating the main resource list", () => {
+    const onToggleWorkspaceGroup = vi.fn();
+    const onSelectModelProvider = vi.fn();
+
+    const { props } = renderSidebar({
+      collapsedWorkspaceGroups: { models: true },
+      onSelectModelProvider,
+      onToggleWorkspaceGroup,
+    });
+
+    expect(document.querySelector('[data-workspace-section="hub-templates"]')).not.toBeInTheDocument();
+    expect(document.querySelector('[data-workspace-section="models"]')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Models" }));
+
+    expect(onSelectModelProvider).toHaveBeenCalledWith(props.modelProviders?.providers[0]);
+    expect(document.querySelector('[data-workspace-section="models"]')).not.toBeInTheDocument();
+    expect(onToggleWorkspaceGroup).toHaveBeenCalledWith("models");
+  });
+
+  it("opens the knowledge base list from the resource rail", () => {
+    const knowledgeBase = {
+      availability: "available" as const,
+      configuredMCPName: "kb-investment",
+      contentID: "kb-investment",
+      description: "Investment knowledge base",
+      id: "143",
+      name: "Investment handbook",
+    };
+    const onSelectKnowledgeBase = vi.fn();
+
+    renderSidebar({
+      activePane: { type: WorkspacePaneTypes.hub, id: "143", resourceType: "knowledge" },
+      hub: {
+        loaded: true,
+        listError: "",
+        knowledgeBases: {
+          copyBusyID: "",
+          copyError: "",
+          discoveryHasMore: false,
+          discoveryItems: [],
+          discoveryLoadError: "",
+          discoveryLoading: false,
+          discoveryLoadingMore: false,
+          discoveryLoadMore: vi.fn(),
+          discoveryRefetch: vi.fn(),
+          items: [knowledgeBase],
+          loadError: "",
+          loading: false,
+          loginRequired: false,
+          requestMCPConfig: vi.fn(),
+          search: "",
+          setSearch: vi.fn(),
+        },
+        mcpServers: [],
+        selectedHubResourceType: "knowledge",
+        selectedKnowledgeBaseID: "143",
+        selectedHubSkillName: "",
+        selectedHubTemplateId: "",
+        skills: [],
+        skillsError: "",
+        templates: [],
+        uploadBusy: false,
+        uploadError: "",
+      } as unknown as WorkspaceSidebarProps["hub"],
+      onSelectKnowledgeBase,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Knowledge bases" }));
+
+    expect(onSelectKnowledgeBase).toHaveBeenCalledWith(null);
+    expect(screen.queryByText("Investment knowledge base")).not.toBeInTheDocument();
+    expect(screen.queryByText("Added to MCP")).not.toBeInTheDocument();
+  });
+
+  it("keeps knowledge base search and rows in the main resource page", () => {
+    renderSidebar({
+      activePane: { type: WorkspacePaneTypes.hub, id: "143", resourceType: "knowledge" },
+      hub: {
+        loaded: true,
+        listError: "",
+        knowledgeBases: {
+          copyBusyID: "",
+          copyError: "",
+          discoveryHasMore: false,
+          discoveryItems: [],
+          discoveryLoadError: "",
+          discoveryLoading: false,
+          discoveryLoadingMore: false,
+          discoveryLoadMore: vi.fn(),
+          discoveryRefetch: vi.fn(),
+          items: [
+            {
+              availability: "available",
+              configuredMCPName: "kb-investment",
+              contentID: "kb-investment",
+              description: "Investment knowledge base",
+              id: "143",
+              name: "招商知识库",
+            },
+            {
+              availability: "available",
+              configuredMCPName: "kb-tourism",
+              contentID: "kb-tourism",
+              description: "Travel guides",
+              id: "144",
+              name: "旅游知识库",
+            },
+          ],
+          loadError: "",
+          loading: false,
+          loginRequired: false,
+          requestMCPConfig: vi.fn(),
+          search: "",
+          setSearch: vi.fn(),
+        },
+        mcpServers: [],
+        selectedHubResourceType: "knowledge",
+        selectedKnowledgeBaseID: "143",
+        selectedHubSkillName: "",
+        selectedHubTemplateId: "",
+        skills: [],
+        skillsError: "",
+        templates: [],
+        uploadBusy: false,
+        uploadError: "",
+      } as unknown as WorkspaceSidebarProps["hub"],
+    });
+
+    expect(screen.queryByRole("searchbox", { name: "Search" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Knowledge bases" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /招商知识库/ })).not.toBeInTheDocument();
+  });
+
+  it("omits counts from resource navigation items", () => {
+    renderSidebar({
+      hub: {
+        loaded: true,
+        listError: "",
+        selectedHubResourceType: "template",
+        selectedHubSkillName: "",
+        selectedHubTemplateId: "",
+        skills: [
+          { name: "shell", description: "Shell helpers" },
+          { name: "review", description: "Review helpers" },
+          { name: "ship", description: "Release helpers" },
+        ],
+        skillsError: "",
+        templates: [
+          { id: "worker-template", name: "Worker Template", role: "worker" },
+          { id: "manager-template", name: "Manager Template", role: "manager" },
+        ],
+        uploadBusy: false,
+        uploadError: "",
+      } as unknown as WorkspaceSidebarProps["hub"],
+      modelProviders: {
+        builtinProviders: [],
+        customProviders: [],
+        providers: [
+          {
+            builtin: true,
+            display_name: "OpenAI",
+            id: "openai",
+            kind: "openai",
+            models: ["gpt-4.1"],
+            preset: "openai",
+            status: "connected",
+          },
+          {
+            builtin: true,
+            display_name: "Claude Code",
+            id: "claude-code",
+            kind: "anthropic",
+            models: ["claude-sonnet-4"],
+            preset: "custom",
+            status: "connected",
+          },
+          {
+            builtin: false,
+            display_name: "Local",
+            id: "local",
+            kind: "openai-compatible",
+            models: ["local-model"],
+            preset: "custom",
+            status: "connected",
+          },
+          {
+            builtin: false,
+            display_name: "Test",
+            id: "test",
+            kind: "openai-compatible",
+            models: [],
+            preset: "custom",
+            status: "disconnected",
+          },
+        ],
+      },
+    });
+
+    expect(screen.getByRole("button", { name: "Templates" })).toHaveTextContent("Templates");
+    expect(screen.getByRole("button", { name: "Templates" })).not.toHaveTextContent("2");
+    expect(screen.getByRole("button", { name: "Skills" })).not.toHaveTextContent("3");
+    expect(screen.getByRole("button", { name: "Models" })).not.toHaveTextContent("4");
+  });
+
+  it("keeps the contextual sidebar visible when the primary rail is collapsed", () => {
+    renderSidebar({
+      isSidebarCollapsed: true,
+      workspaceTab: WorkspaceTabs.agents,
+      activePane: { type: WorkspacePaneTypes.agent, id: "" },
+    });
+
+    const searchInput = screen.getByRole("searchbox", { name: "Search" });
+    const contextAside = searchInput.closest("aside");
+
+    expect(searchInput).toBeInTheDocument();
+    expect(contextAside).not.toHaveAttribute("aria-hidden");
+    expect(contextAside).not.toHaveAttribute("inert");
+  });
+
+  it("opens the scheduled task view from the task navigation", () => {
+    const onSelectTask = vi.fn();
+    const onSelectTaskBoardView = vi.fn();
+
+    renderSidebar({
+      activePane: { type: WorkspacePaneTypes.task, id: "" },
+      activeTaskBoardView: "scheduled",
+      currentWorkspaceLabel: "Task overview",
+      onSelectTask,
+      onSelectTaskBoardView,
+      scheduledTaskCount: 2,
+      workspaceTab: WorkspaceTabs.tasks,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Scheduled" }));
+
+    expect(onSelectTaskBoardView).toHaveBeenCalledWith("scheduled");
+    expect(onSelectTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the selected Human section as entity rows without a nested Human group", () => {
+    renderSidebar({
+      activePane: { type: WorkspacePaneTypes.human, id: "user-1" },
+      currentWorkspaceLabel: "Human",
+      workspaceTab: WorkspaceTabs.agents,
+    });
+
+    expect(document.querySelector('[data-workspace-section="humans"]')).toBeInTheDocument();
+    expect(document.querySelector('button[aria-controls="workspace-group-items-humans"]')).not.toBeInTheDocument();
+    expect(screen.getByText("User One")).toBeInTheDocument();
+  });
+
+  it("opens the notification section when there are no notification bots", () => {
+    const onSelectAgent = vi.fn();
+    const onSelectNotificationSection = vi.fn();
+
+    renderSidebar({
+      onSelectAgent,
+      onSelectNotificationSection,
+      workspaceTab: WorkspaceTabs.agents,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Notifications" }));
+
+    expect(onSelectNotificationSection).toHaveBeenCalledTimes(1);
+    expect(onSelectAgent).not.toHaveBeenCalled();
+  });
+
+  it("opens the team section when there are no teams", () => {
+    const onSelectTeam = vi.fn();
+    const onSelectTeamSection = vi.fn();
+
+    renderSidebar({
+      onSelectTeam,
+      onSelectTeamSection,
+      workspaceTab: WorkspaceTabs.agents,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Teams" }));
+
+    expect(onSelectTeamSection).toHaveBeenCalledTimes(1);
+    expect(onSelectTeam).not.toHaveBeenCalled();
+  });
+
+  it("opens the settings page from the bottom settings entry without changing workspace tabs", () => {
+    const onOpenSettings = vi.fn();
+    const onWorkspaceTabChange = vi.fn();
+
+    renderSidebar({ onOpenSettings, onWorkspaceTabChange });
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    expect(onWorkspaceTabChange).not.toHaveBeenCalled();
+  });
+});

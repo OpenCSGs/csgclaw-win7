@@ -1,0 +1,100 @@
+import { lazy, Suspense } from "react";
+import type { ComponentType, ReactElement } from "react";
+import { createHashRouter, RouterProvider } from "react-router-dom";
+import type { RouteObject } from "react-router-dom";
+import { WorkspacePage } from "@/pages/WorkspacePage/WorkspacePage";
+import { loadRouteModule } from "./loadRouteModule";
+
+const AppsPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/AppsPage/AppsPage").then((module) => ({ default: module.AppsPage }))),
+);
+
+const AgentPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/AgentPage").then((module) => ({ default: module.AgentPage }))),
+);
+const ComputerPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/ComputerPage").then((module) => ({ default: module.ComputerPage }))),
+);
+const ConversationPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/ConversationPage").then((module) => ({ default: module.ConversationPage }))),
+);
+const HubPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/HubPage").then((module) => ({ default: module.HubPage }))),
+);
+const HumanPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/HumanPage").then((module) => ({ default: module.HumanPage }))),
+);
+const ModelProviderPage = lazy(() =>
+  loadRouteModule(() =>
+    import("@/pages/ModelProviderPage/ModelProviderPage").then((module) => ({ default: module.ModelProviderPage })),
+  ),
+);
+const SettingsPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/SettingsPage").then((module) => ({ default: module.SettingsPage }))),
+);
+const SessionDemoPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/SessionDemoPage").then((module) => ({ default: module.SessionDemoPage }))),
+);
+const TeamPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/TeamPage").then((module) => ({ default: module.TeamPage }))),
+);
+const TasksPage = lazy(() =>
+  loadRouteModule(() => import("@/pages/TasksPage").then((module) => ({ default: module.TasksPage }))),
+);
+
+function routeElement(Page: ComponentType): ReactElement {
+  return (
+    <Suspense fallback={null}>
+      <Page />
+    </Suspense>
+  );
+}
+
+const routes: RouteObject[] = [
+  { path: "/session-demo", element: routeElement(SessionDemoPage) },
+  {
+    path: "/",
+    element: <WorkspacePage />,
+    children: [
+      { index: true, element: routeElement(ConversationPage) },
+      { path: "computer", element: routeElement(ComputerPage) },
+      { path: "notifications", element: routeElement(AgentPage) },
+      { path: "agents/:agentId", element: routeElement(AgentPage) },
+      { path: "agent/:agentId", element: routeElement(AgentPage) },
+      { path: "models/:providerId", element: routeElement(ModelProviderPage) },
+      { path: "model/:providerId", element: routeElement(ModelProviderPage) },
+      { path: "humans/:humanId", element: routeElement(HumanPage) },
+      { path: "human/:humanId", element: routeElement(HumanPage) },
+      { path: "teams", element: routeElement(TeamPage) },
+      { path: "teams/:teamId", element: routeElement(TeamPage) },
+      { path: "team/:teamId", element: routeElement(TeamPage) },
+      { path: "connectors", element: routeElement(AppsPage) },
+      { path: "connectors/:resourceId", element: routeElement(AppsPage) },
+      { path: "resources", element: routeElement(HubPage) },
+      { path: "hub", element: routeElement(HubPage) },
+      { path: "templates/:templateId", element: routeElement(HubPage) },
+      { path: "skills/:skillName", element: routeElement(HubPage) },
+      { path: "mcp-servers/:mcpName", element: routeElement(HubPage) },
+      { path: "knowledge-bases", element: routeElement(HubPage) },
+      { path: "knowledge-bases/:knowledgeBaseId", element: routeElement(HubPage) },
+      { path: "tasks", element: routeElement(TasksPage) },
+      { path: "tasks/:taskId", element: routeElement(TasksPage) },
+      { path: "settings", element: routeElement(SettingsPage) },
+      { path: "rooms/:conversationId", element: routeElement(ConversationPage) },
+      { path: "room/:conversationId", element: routeElement(ConversationPage) },
+      { path: "channels/:conversationId", element: routeElement(ConversationPage) },
+      { path: "channel/:conversationId", element: routeElement(ConversationPage) },
+      { path: "dms/:conversationId", element: routeElement(ConversationPage) },
+      { path: "dm/:conversationId", element: routeElement(ConversationPage) },
+      { path: "conversations/:conversationId", element: routeElement(ConversationPage) },
+      { path: "conversation/:conversationId", element: routeElement(ConversationPage) },
+      { path: "*", element: routeElement(ConversationPage) },
+    ],
+  },
+];
+
+const router = createHashRouter(routes);
+
+export function AppRouter(): ReactElement {
+  return <RouterProvider router={router} />;
+}

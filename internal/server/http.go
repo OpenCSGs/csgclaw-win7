@@ -1,0 +1,273 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"time"
+
+	"csgclaw/internal/agentengine"
+	"csgclaw/internal/agentsession"
+	"csgclaw/internal/agenttask"
+	"csgclaw/internal/api"
+	"csgclaw/internal/channel/feishu"
+	"csgclaw/internal/connectors"
+	"csgclaw/internal/im"
+	"csgclaw/internal/llm"
+	"csgclaw/internal/mcp"
+	"csgclaw/internal/participant"
+	"csgclaw/internal/runtimecatalog"
+	"csgclaw/internal/scheduledtask"
+	"csgclaw/internal/team"
+	hub "csgclaw/internal/template"
+	"csgclaw/internal/upgrade"
+	"csgclaw/internal/worklease"
+	"github.com/go-chi/chi/v5"
+)
+
+type Options struct {
+	ListenAddr         string
+	Listener           net.Listener
+	SandboxListener    net.Listener
+	AgentServices      api.AgentServices
+	RuntimeCloser      io.Closer
+	Hub                *hub.Service
+	MCP                *mcp.Service
+	Participant        *participant.Service
+	IM                 *im.Service
+	IMBus              *im.Bus
+	WorkReporter       worklease.ParticipantWorkReporter
+	WorkBus            *worklease.Bus
+	WorkControlBus     *worklease.ControlBus
+	ParticipantBridge  *im.ParticipantBridge
+	Feishu             *feishu.Service
+	LLM                *llm.Service
+	Team               *team.Service
+	AgentTask          *agenttask.Service
+	ScheduledTask      *scheduledtask.Service
+	Connectors         *connectors.Service
+	AgentRuntimes      *runtimecatalog.Service
+	TeamAdapters       *team.AdapterRegistry
+	Upgrade            *upgrade.Manager
+	ActivityDecider    api.ActivityDecider
+	UserInputResponder api.UserInputResponder
+	AgentEngine        agentengine.Interface
+	ChannelBindings    api.ChannelBindingReconciler
+	SessionBindings    *agentsession.Store
+	ConfigPath         string
+	AppsStatePath      string
+	AccessToken        string
+	NoAuth             bool
+	AdvertiseBaseURL   string
+	InternalBaseURL    string
+	Desktop            *DesktopOptions
+	Context            context.Context
+	OnReady            func(h *api.Handler, router chi.Router)
+	BeforeShutdown     func(context.Context) error
+}
+
+func newHandler(opts Options) *api.Handler {
+	handler := api.NewHandlerWithAuth(opts.AgentServices, opts.AgentEngine, opts.IM, opts.IMBus, opts.ParticipantBridge, opts.Feishu, opts.LLM, opts.AccessToken, opts.NoAuth)
+	handler.SetParticipantService(opts.Participant)
+	handler.SetParticipantWorkService(opts.WorkReporter, opts.WorkBus, opts.WorkControlBus)
+	handler.SetHubService(opts.Hub)
+	handler.SetMCPService(opts.MCP)
+	handler.SetTeamService(opts.Team)
+	handler.SetAgentTaskService(opts.AgentTask)
+	if opts.AgentTask != nil {
+		handler.SetRoomTaskCore(opts.AgentTask.Core())
+	}
+	handler.SetScheduledTaskService(opts.ScheduledTask)
+	handler.SetConnectorService(opts.Connectors)
+	handler.SetAgentRuntimeService(opts.AgentRuntimes)
+	if opts.TeamAdapters != nil {
+		handler.SetTeamAdapterRegistry(opts.TeamAdapters)
+	}
+	handler.SetUpgradeManager(opts.Upgrade)
+	handler.SetActivityDecider(opts.ActivityDecider)
+	handler.SetUserInputResponder(opts.UserInputResponder)
+	handler.SetAgentEngine(opts.AgentEngine, opts.SessionBindings)
+	handler.SetChannelBindingReconciler(opts.ChannelBindings)
+	handler.SetUpgradeConfigPath(opts.ConfigPath)
+	handler.SetConfigPath(opts.ConfigPath)
+	handler.SetAdvertiseBaseURL(opts.AdvertiseBaseURL)
+	handler.SetInternalBaseURL(opts.InternalBaseURL)
+	if opts.Desktop != nil {
+		handler.SetRuntimeDistribution("electron")
+		handler.SetDesktopSessionToken(opts.Desktop.SessionToken)
+	}
+	return handler
+}
+
+func Run(opts Options) error {
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
+	runCtx, cancelRun := context.WithCancel(opts.Context)
+	defer cancelRun()
+	streamCtx, cancelStreams := context.WithCancel(context.Background())
+	defer cancelStreams()
+
+	listener := opts.Listener
+	if listener == nil {
+		var err error
+		listener, err = net.Listen("tcp", opts.ListenAddr)
+		if err != nil {
+			return err
+		}
+	}
+
+	handler := newHandler(opts)
+	if opts.AppsStatePath != "" {
+		if err := handler.EnableConnectors(opts.AppsStatePath); err != nil {
+			_ = listener.Close()
+			return fmt.Errorf("initialize Apps: %w", err)
+		}
+		defer handler.CloseConnectors()
+	}
+	handler.SetEventStreamShutdown(streamCtx.Done())
+	if err := handler.RecoverRoomTasks(); err != nil {
+		return fmt.Errorf("recover room tasks: %w", err)
+	}
+	if err := handler.RecoverVideoGenerations(runCtx); err != nil {
+		return fmt.Errorf("recover video generations: %w", err)
+	}
+	router := handler.Routes()
+	router.Handle("/*", uiFallbackHandler())
+
+	var rootHandler http.Handler = router
+	type serverEndpoint struct {
+		server   *http.Server
+		listener net.Listener
+	}
+	endpoints := make([]serverEndpoint, 0, 2)
+	if opts.Desktop != nil {
+		var err error
+		rootHandler, err = desktopRendererSecurityHandler(rootHandler, listener.Addr(), *opts.Desktop)
+		if err != nil {
+			_ = listener.Close()
+			if opts.SandboxListener != nil {
+				_ = opts.SandboxListener.Close()
+			}
+			return err
+		}
+		if opts.SandboxListener == nil {
+			_ = listener.Close()
+			return fmt.Errorf("desktop sandbox listener is required")
+		}
+		sandboxOptions := *opts.Desktop
+		sandboxOptions.ValidateAgentAccessToken = handler.ValidateAgentAccessToken
+		sandboxHandler, err := desktopSandboxSecurityHandler(router, opts.SandboxListener.Addr(), sandboxOptions)
+		if err != nil {
+			_ = listener.Close()
+			_ = opts.SandboxListener.Close()
+			return err
+		}
+		endpoints = append(endpoints, serverEndpoint{
+			server:   newHTTPServer(opts.SandboxListener.Addr().String(), sandboxHandler),
+			listener: opts.SandboxListener,
+		})
+	} else if opts.SandboxListener != nil {
+		_ = listener.Close()
+		_ = opts.SandboxListener.Close()
+		return fmt.Errorf("sandbox listener requires desktop options")
+	}
+
+	endpoints = append([]serverEndpoint{{
+		server:   newHTTPServer(listener.Addr().String(), rootHandler),
+		listener: listener,
+	}}, endpoints...)
+
+	if opts.IMBus != nil && opts.ParticipantBridge != nil {
+		events, cancel := opts.IMBus.Subscribe()
+		defer cancel()
+
+		go func() {
+			for {
+				select {
+				case <-opts.Context.Done():
+					return
+				case evt, ok := <-events:
+					if !ok {
+						return
+					}
+					handler.PublishParticipantEvent(evt)
+				}
+			}
+		}()
+	}
+
+	if opts.Upgrade != nil && opts.Desktop == nil {
+		go opts.Upgrade.Start(opts.Context)
+	}
+	if opts.ScheduledTask != nil {
+		go opts.ScheduledTask.Start(opts.Context)
+	}
+
+	shutdownDone := make(chan struct{})
+	var shutdownErr error
+	go func() {
+		<-runCtx.Done()
+		if opts.BeforeShutdown != nil {
+			hookCtx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+			shutdownErr = opts.BeforeShutdown(hookCtx)
+			cancel()
+		}
+		// Keep event subscriptions available to the shutdown hook, then end
+		// them while ordinary requests retain their HTTP shutdown grace period.
+		cancelStreams()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, endpoint := range endpoints {
+			_ = endpoint.server.Shutdown(shutdownCtx)
+		}
+		close(shutdownDone)
+	}()
+
+	errCh := make(chan error, len(endpoints))
+	for _, endpoint := range endpoints {
+		go func(endpoint serverEndpoint) {
+			err := endpoint.server.Serve(endpoint.listener)
+			if err == http.ErrServerClosed {
+				err = nil
+			}
+			errCh <- err
+		}(endpoint)
+	}
+
+	if opts.OnReady != nil {
+		go opts.OnReady(handler, router)
+	}
+	if opts.AppsStatePath != "" {
+		go handler.RestoreConnectors(runCtx)
+	}
+
+	firstErr := <-errCh
+	cancelRun()
+	<-shutdownDone
+	for range len(endpoints) - 1 {
+		if err := <-errCh; firstErr == nil && err != nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr != nil {
+		return errors.Join(firstErr, shutdownErr)
+	}
+	if opts.RuntimeCloser != nil {
+		return errors.Join(shutdownErr, opts.RuntimeCloser.Close())
+	}
+	return shutdownErr
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           accessLog(slog.Default(), handler),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}

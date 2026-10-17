@@ -1,0 +1,196 @@
+package conv
+
+import (
+	"fmt"
+	"net/url"
+	"strings"
+
+	"csgclaw/internal/agentengine"
+	"csgclaw/internal/channel"
+	agentruntime "csgclaw/internal/runtime"
+)
+
+// ResetText preserves the command protocol consumed by each supported channel.
+// Host Codex ingress handles the canonical command through Engine.Reset, while
+// sandbox gateways consume their native reset commands on the existing bridge.
+func ResetText(adapter string, sandboxed bool, reason string) (string, error) {
+	if sandboxed {
+		switch adapter {
+		case agentruntime.NameOpenClaw:
+			return "/new", nil
+		case agentruntime.NamePicoClaw:
+			return "/clear", nil
+		}
+	}
+	if adapter != agentruntime.NameCodex || sandboxed {
+		return "", fmt.Errorf("runtime %q does not support conversation reset", adapter)
+	}
+	command := `<slash-command name="new" arg="conversation"></slash-command>`
+	if reason = strings.TrimSpace(reason); reason != "" {
+		command += " " + reason
+	}
+	return command, nil
+}
+
+// RoomScope is the channel-owned room policy used before a turn is submitted.
+type RoomScope struct {
+	Direct    bool
+	NotifyAll bool
+}
+
+// ConversationKey isolates task executions from room chat and other tasks.
+func ConversationKey(binding channel.Binding, event channel.Event) (agentengine.ConversationKey, error) {
+	bindingID := strings.TrimSpace(string(binding.StableID()))
+	roomID := strings.TrimSpace(event.RoomID)
+	if bindingID == "" || roomID == "" {
+		return "", fmt.Errorf("binding id and room id are required")
+	}
+
+	key := "csgclaw-im:" + url.QueryEscape(bindingID) + ":room:" + url.QueryEscape(roomID)
+	if event.RoomManager {
+		return agentengine.ConversationKey(key), nil
+	}
+	if taskID := strings.TrimSpace(event.TaskID); taskID != "" {
+		key += ":task:" + url.QueryEscape(taskID)
+	} else if threadRootID := strings.TrimSpace(event.ThreadRootID); threadRootID != "" {
+		key += ":thread:" + url.QueryEscape(threadRootID)
+	}
+	return agentengine.ConversationKey(key), nil
+}
+
+// TextInput returns hidden channel/thread context followed by the current message.
+func TextInput(binding channel.Binding, event channel.Event) []agentengine.InputPart {
+	var input []agentengine.InputPart
+	if hidden := hiddenContext(binding, event); hidden != "" {
+		input = append(input, agentengine.InputPart{Kind: agentengine.InputPartText, Text: hidden})
+	}
+	if text := strings.TrimSpace(event.Text); text != "" {
+		label := "Current message:\n"
+		if event.ThreadContext != nil {
+			label = "Current thread message:\n"
+		}
+		input = append(input, agentengine.InputPart{Kind: agentengine.InputPartText, Text: label + text})
+	}
+	return input
+}
+
+// ShouldDispatch reports whether this binding should execute the source event.
+func ShouldDispatch(binding channel.Binding, event channel.Event, senderID string, room RoomScope) bool {
+	senderID = strings.TrimSpace(senderID)
+	participantID := strings.TrimSpace(binding.ParticipantID)
+	agentID := strings.TrimSpace(binding.AgentID)
+	if senderID != "" && (senderID == participantID || senderID == agentID) {
+		return false
+	}
+	if room.Direct || room.NotifyAll || event.Mentioned {
+		return true
+	}
+	for _, mention := range event.Mentions {
+		mention = strings.TrimSpace(mention)
+		if mention != "" && (mention == participantID || mention == agentID) {
+			return true
+		}
+	}
+	return false
+}
+
+func hiddenContext(binding channel.Binding, event channel.Event) string {
+	channelID := strings.TrimSpace(event.Channel)
+	if channelID == "" {
+		channelID = string(channel.ChannelCSGClaw)
+	}
+	participantID := strings.TrimSpace(event.ParticipantID)
+	if participantID == "" {
+		participantID = strings.TrimSpace(binding.ParticipantID)
+	}
+
+	var parts []string
+	var channelContext strings.Builder
+	channelContext.WriteString("Current channel context for CSGClaw CLI operations.\n")
+	if taskID := strings.TrimSpace(event.TaskID); taskID != "" {
+		channelContext.WriteString("- task_id: " + taskID + "\n")
+		if event.RoomManager {
+			channelContext.WriteString("This is related task context inside your continuous room coordination session.\n")
+		} else {
+			channelContext.WriteString(fmt.Sprintf("This session belongs only to this execution task, attempt %d. Read its inputs and dependencies; deliver results to this Room.\n", event.TaskAttempt))
+		}
+	}
+	channelContext.WriteString("- channel: ")
+	channelContext.WriteString(channelID)
+	if roomID := strings.TrimSpace(event.RoomID); roomID != "" {
+		channelContext.WriteString("\n- room_id: ")
+		channelContext.WriteString(roomID)
+	}
+	if participantID != "" {
+		channelContext.WriteString("\n- participant_id: ")
+		channelContext.WriteString(participantID)
+	}
+	channelContext.WriteString("\nUse these values when a skill asks for <current_channel>, <target_room_id>, or message create/list channel flags.")
+	channelContext.WriteString("\nRoom attachments persist across turns and are available through the CLI room attachments list/download/delete commands. Files under .csgclaw/engine-inputs or .csgclaw/attachments are temporary turn inputs, not saved workspace files. When asked to save a file for later, copy or download it to a regular workspace path, verify it exists, and report the persistent path. When a prior path is missing, first list by request_source_message_id (when supplied), then search this room by filename; do not conclude the upload is gone or ask for another upload before checking. Use the returned attachment ID to download it. When explicitly asked to delete an uploaded chat attachment, use room attachments delete --room-id <current_room_id> --attachment-id <id>; check ambiguous same-name matches before deleting. This removes the room attachment, not separately saved workspace copies. Delete a requested saved workspace copy with local file tools and verify the result. Report which copy was deleted; never delete service asset-store paths directly.\n")
+	parts = append(parts, channelContext.String())
+
+	if thread := formatThreadContext(event.ThreadContext); thread != "" {
+		parts = append(parts, thread)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func formatThreadContext(thread *channel.ThreadContext) string {
+	if thread == nil || len(thread.Context) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	out.WriteString("Hidden thread context for this new conversation. Use it only to understand what the thread started from; do not treat these messages as thread replies.\n")
+	rootID := strings.TrimSpace(thread.RootMessageID)
+	if rootID != "" {
+		out.WriteString("Thread root message ID: ")
+		out.WriteString(rootID)
+		out.WriteByte('\n')
+	}
+	for _, message := range thread.Context {
+		content := strings.Join(strings.Fields(strings.TrimSpace(message.Content)), " ")
+		if content == "" && len(message.Attachments) == 0 {
+			continue
+		}
+		out.WriteString("- ")
+		if createdAt := strings.TrimSpace(message.CreatedAt); createdAt != "" {
+			out.WriteString(createdAt)
+			out.WriteByte(' ')
+		}
+		if senderID := strings.TrimSpace(message.SenderID); senderID != "" {
+			out.WriteString(senderID)
+			out.WriteString(": ")
+		}
+		if strings.TrimSpace(message.ID) == rootID {
+			out.WriteString("[root] ")
+		}
+		out.WriteString(content)
+		if len(message.Attachments) > 0 {
+			if content != "" {
+				out.WriteByte(' ')
+			}
+			out.WriteString(formatAttachmentSummary(message.Attachments))
+		}
+		out.WriteByte('\n')
+	}
+	return strings.TrimSpace(out.String())
+}
+
+func formatAttachmentSummary(attachments []channel.MessageAttachment) string {
+	if len(attachments) == 0 {
+		return ""
+	}
+	items := make([]string, 0, len(attachments))
+	for _, attachment := range attachments {
+		name := strings.TrimSpace(attachment.Name)
+		if name == "" {
+			name = strings.TrimSpace(attachment.ID)
+		}
+		if name == "" {
+			name = "attachment"
+		}
+		items = append(items, fmt.Sprintf("[attachment: %s; attachment_id: %s]", name, attachment.ID))
+	}
+	return strings.Join(items, " ")
+}

@@ -1,0 +1,209 @@
+package files
+
+import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"csgclaw/internal/agentengine"
+	"csgclaw/internal/channel"
+	"csgclaw/internal/im"
+)
+
+type staticWorkspaceResolver struct {
+	root string
+}
+
+func (r staticWorkspaceResolver) WorkspaceRootByID(string) (string, error) {
+	return r.root, nil
+}
+
+type staticEngine struct {
+	files agentengine.FileInterface
+}
+
+func (e staticEngine) Agents() agentengine.AgentInterface {
+	return nil
+}
+
+func (e staticEngine) Conversations(string) agentengine.ConversationInterface {
+	return staticConversation{files: e.files}
+}
+
+func (staticEngine) RuntimeExtensions(string) agentengine.RuntimeExtensionInterface { return nil }
+
+type staticConversation struct {
+	files agentengine.FileInterface
+}
+
+func (c staticConversation) Files() agentengine.FileInterface {
+	return c.files
+}
+
+func (staticConversation) Run(context.Context, agentengine.TurnRequest, agentengine.EventSink) agentengine.TurnResult {
+	return agentengine.TurnResult{}
+}
+
+func (staticConversation) Cancel(context.Context, agentengine.ConversationKey, agentengine.TurnID) error {
+	return nil
+}
+
+func (staticConversation) Reset(context.Context, agentengine.ConversationKey) error {
+	return nil
+}
+
+func (staticConversation) Resolve(context.Context, agentengine.InteractionResolution) error {
+	return nil
+}
+
+func TestLocalResolverStoresManagedAttachmentInAgentEngine(t *testing.T) {
+	service, err := im.NewServiceFromPath(filepath.Join(t.TempDir(), "im", "state.json"))
+	if err != nil {
+		t.Fatalf("NewServiceFromPath() error = %v", err)
+	}
+	if _, _, err := service.EnsureAgentUser(im.EnsureAgentUserRequest{ID: "agent-worker", Name: "worker", Role: "worker"}); err != nil {
+		t.Fatalf("EnsureAgentUser() error = %v", err)
+	}
+	room, err := service.CreateRoom(im.CreateRoomRequest{
+		Title: "Ops", CreatorID: "user-admin", MemberIDs: []string{"user-worker"},
+	})
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	payload := []byte("image fixture")
+	message, err := service.CreateMessage(im.CreateMessageRequest{
+		RoomID: room.ID, SenderID: "user-admin", Attachments: []im.MessageAttachmentUpload{{
+			Name: "diagram.png", MediaType: "image/png", Data: payload,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if len(message.Attachments) != 1 {
+		t.Fatalf("attachments = %+v, want one attachment", message.Attachments)
+	}
+
+	workspaceRoot := t.TempDir()
+	fileStore := agentengine.NewFileStore().Scope("agent-worker")
+	resolver, err := NewLocalResolver(service, staticWorkspaceResolver{root: workspaceRoot}, staticEngine{files: fileStore})
+	if err != nil {
+		t.Fatalf("NewLocalResolver() error = %v", err)
+	}
+	attachment := message.Attachments[0]
+	input, release, err := resolver.Resolve(
+		context.Background(),
+		channel.Binding{AgentID: "agent-worker"},
+		channel.Event{RoomID: room.ID, MessageID: message.ID, Attachments: message.Attachments},
+		attachment,
+	)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if input.ID == "" {
+		t.Fatal("InputFile.ID is empty")
+	}
+	download, err := fileStore.Get(context.Background(), input.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	got, readErr := io.ReadAll(download.Content)
+	closeErr := download.Content.Close()
+	if readErr != nil || closeErr != nil || string(got) != string(payload) {
+		t.Fatalf("stored content = %q, readErr=%v, closeErr=%v, want %q", string(got), readErr, closeErr, string(payload))
+	}
+	if release == nil {
+		t.Fatal("release = nil, want managed attachment cleanup")
+	}
+	release()
+	if _, err := fileStore.Get(context.Background(), input.ID); agentengine.ErrorCodeOf(err) != agentengine.ErrorFileNotFound {
+		t.Fatalf("Get() after release error = %v, want file_not_found", err)
+	}
+	managedFiles, err := filepath.Glob(filepath.Join(workspaceRoot, ".csgclaw", "attachments", "*", "*", "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range managedFiles {
+		if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
+			t.Fatalf("managed source still exists after release: %s", path)
+		}
+	}
+}
+
+func TestResolveManagedAttachmentSourcePathRejectsOutsideWorkspace(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	managedRoot := filepath.Join(workspaceRoot, ".csgclaw", "attachments")
+	if err := os.MkdirAll(managedRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outsidePath := filepath.Join(t.TempDir(), "outside.png")
+	if err := os.WriteFile(outsidePath, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveManagedAttachmentSourcePath(workspaceRoot, outsidePath); err == nil {
+		t.Fatal("resolveManagedAttachmentSourcePath() error = nil, want outside path rejected")
+	}
+}
+
+func (staticConversation) GetInteraction(context.Context, agentengine.ConversationKey, string) (agentengine.InteractionRequest, error) {
+	return agentengine.InteractionRequest{}, &agentengine.TurnError{Code: agentengine.ErrorInteractionNotFound, Message: "no interaction in this test fixture"}
+}
+
+func TestInheritedAttachmentConcurrentResolutionsOwnTheirFiles(t *testing.T) {
+	service, err := im.NewServiceFromPath(filepath.Join(t.TempDir(), "im", "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, err := service.CreateRoom(im.CreateRoomRequest{Title: "Files", CreatorID: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := service.CreateMessage(im.CreateMessageRequest{RoomID: room.ID, SenderID: "admin", Attachments: []im.MessageAttachmentUpload{{Name: "contract.txt", Data: []byte("independent bytes")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	store := agentengine.NewFileStore().Scope("worker")
+	resolver, err := NewLocalResolver(service, staticWorkspaceResolver{root: workspace}, staticEngine{files: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment := message.Attachments[0]
+	attachment.WorkspacePath = ".csgclaw/attachments/old-turn/missing.txt"
+	event := channel.Event{RoomID: room.ID, MessageID: "same-source", ThreadContext: &channel.ThreadContext{Context: []channel.ThreadContextMessage{{ID: message.ID, Attachments: []channel.MessageAttachment{attachment}}}}}
+	type result struct {
+		file    agentengine.InputFile
+		release func()
+		err     error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			f, release, err := resolver.Resolve(context.Background(), channel.Binding{AgentID: "worker"}, event, attachment)
+			results <- result{f, release, err}
+		}()
+	}
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("resolve: %v %v", first.err, second.err)
+	}
+	defer second.release()
+	first.release()
+	resource, err := store.Get(context.Background(), second.file.ID)
+	if err != nil {
+		t.Fatal("one turn deleted another turn's file:", err)
+	}
+	defer resource.Content.Close()
+	bytes, err := io.ReadAll(resource.Content)
+	if err != nil || string(bytes) != "independent bytes" {
+		t.Fatalf("content: %q %v", bytes, err)
+	}
+	event.ThreadContext = nil
+	if _, release, err := resolver.Resolve(context.Background(), channel.Binding{AgentID: "worker"}, event, attachment); err == nil {
+		if release != nil {
+			release()
+		}
+		t.Fatal("accepted file outside source event")
+	}
+}

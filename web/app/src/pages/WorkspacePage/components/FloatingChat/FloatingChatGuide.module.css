@@ -1,0 +1,228 @@
+.root {
+  position: absolute;
+  right: calc(-1 * var(--space-1));
+  bottom: 62px;
+  display: flex;
+  align-items: center;
+  isolation: isolate;
+  filter: drop-shadow(0 14px 28px color-mix(in srgb, var(--brand-800) 18%, transparent));
+  animation: guide-rise 280ms cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+
+.root::after {
+  content: "";
+  position: absolute;
+  right: 22px;
+  bottom: -8px;
+  z-index: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-base);
+  box-shadow:
+    1px 1px 0 color-mix(in srgb, var(--brand-500) 24%, transparent),
+    6px 8px 18px color-mix(in srgb, var(--brand-800) 12%, transparent);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--blue-dark-50) 98%, transparent) 0%,
+    color-mix(in srgb, var(--brand-50) 98%, transparent) 56%,
+    color-mix(in srgb, var(--teal-50) 98%, transparent) 100%
+  );
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+.callout {
+  position: relative;
+  z-index: 1;
+  isolation: isolate;
+  min-height: 56px;
+  padding: 0 50px 0 var(--space-6);
+  border: 1px solid color-mix(in srgb, var(--brand-500) 26%, transparent);
+  border-radius: var(--radius-full);
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  background:
+    radial-gradient(
+      circle at 18% 18%,
+      color-mix(in srgb, var(--white) 92%, transparent),
+      transparent 0 12px,
+      rgba(255, 255, 255, 0) 32px
+    ),
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--blue-dark-25) 98%, transparent) 0%,
+      color-mix(in srgb, var(--brand-50) 98%, transparent) 58%,
+      color-mix(in srgb, var(--teal-50) 98%, transparent) 100%
+    );
+  color: var(--gray-blue-800);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 760;
+  line-height: 22px;
+  letter-spacing: 0;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--white) 82%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--brand-600) 10%, transparent),
+    0 10px 24px color-mix(in srgb, var(--brand-600) 16%, transparent);
+  transform: translateZ(0);
+  transition:
+    box-shadow 180ms ease,
+    filter 180ms ease,
+    transform 180ms ease;
+}
+
+.callout::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(
+    110deg,
+    transparent 0 31%,
+    color-mix(in srgb, var(--white) 46%, transparent) 44%,
+    transparent 58% 100%
+  );
+  transform: translateX(-90%);
+  animation: guide-shine 3400ms ease-in-out infinite;
+}
+
+.callout::after {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  z-index: -1;
+  border-radius: inherit;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--white) 70%, transparent), transparent 60%),
+    radial-gradient(circle at 88% 22%, color-mix(in srgb, var(--brand-500) 12%, transparent), transparent 28%);
+  pointer-events: none;
+}
+
+.callout:hover {
+  filter: saturate(1.04) brightness(1.015);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--white) 84%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--brand-600) 10%, transparent),
+    0 14px 28px color-mix(in srgb, var(--brand-600) 22%, transparent);
+  transform: translateY(-1px);
+}
+
+.callout:focus-visible,
+.dismiss:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--white) 78%, transparent),
+    0 0 0 6px color-mix(in srgb, var(--brand-600) 24%, transparent);
+}
+
+.title {
+  position: relative;
+  z-index: 1;
+  text-shadow: 0 1px 12px color-mix(in srgb, var(--white) 72%, transparent);
+}
+
+.trail {
+  position: absolute;
+  right: 13px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at center, color-mix(in srgb, var(--brand-500) 30%, transparent) 0 2px, transparent 3px),
+    radial-gradient(circle at 72% 26%, color-mix(in srgb, var(--brand-500) 22%, transparent) 0 1px, transparent 2px),
+    radial-gradient(circle at 30% 78%, color-mix(in srgb, var(--teal-400) 20%, transparent) 0 1px, transparent 2px);
+}
+
+.dismiss {
+  position: absolute;
+  top: calc(-1 * var(--space-1));
+  right: calc(-1 * var(--space-1));
+  z-index: 2;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--white) 92%, transparent);
+  color: var(--gray-blue-500);
+  cursor: pointer;
+  box-shadow:
+    0 6px 14px color-mix(in srgb, var(--gray-blue-900) 14%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--brand-500) 18%, transparent);
+  transition:
+    background 160ms ease,
+    color 160ms ease,
+    transform 160ms ease;
+}
+
+.dismiss:hover {
+  background: var(--white);
+  color: var(--gray-800);
+  transform: scale(1.04);
+}
+
+.dismiss span,
+.dismiss span::after {
+  width: 9px;
+  height: 1.5px;
+  border-radius: var(--radius-full);
+  display: block;
+  background: currentColor;
+}
+
+.dismiss span {
+  transform: rotate(45deg);
+}
+
+.dismiss span::after {
+  content: "";
+  transform: rotate(90deg);
+}
+
+:global(:root[data-theme="dark"]) .root {
+  filter: drop-shadow(0 18px 36px color-mix(in srgb, var(--black) 34%, transparent));
+}
+
+:global(:root[data-theme="dark"]) .dismiss {
+  background: color-mix(in srgb, var(--gray-900) 90%, transparent);
+  color: var(--brand-100);
+}
+
+@keyframes guide-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes guide-shine {
+  0%,
+  42% {
+    transform: translateX(-90%);
+  }
+
+  68%,
+  100% {
+    transform: translateX(90%);
+  }
+}
+
+@media (max-width: 720px) {
+  .root {
+    right: calc(-1 * 2px);
+  }
+
+  .callout {
+    max-width: calc(100vw - 28px);
+  }
+}

@@ -1,0 +1,64 @@
+package agentworkspace
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestReadFileReturnsLargeTextPreviewInFull(t *testing.T) {
+	root := t.TempDir()
+	content := strings.Repeat("a", (32*1024*1024)) + "tail"
+	if err := os.WriteFile(filepath.Join(root, "large.txt"), []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	got, err := ReadFile(root, "large.txt")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if got.Truncated {
+		t.Fatal("Truncated = true, want false")
+	}
+	if got.Binary {
+		t.Fatal("Binary = true, want false")
+	}
+	if got.Content != content {
+		t.Fatalf("content length = %d, want %d", len(got.Content), (32 * 1024 * 1024))
+	}
+}
+
+func TestReadFilePreservesUTF8BeyondFormerPreviewLimit(t *testing.T) {
+	root := t.TempDir()
+	prefix := strings.Repeat("a", (32*1024*1024)-1)
+	if err := os.WriteFile(filepath.Join(root, "utf8.txt"), []byte(prefix+"世界"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	got, err := ReadFile(root, "utf8.txt")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if got.Truncated {
+		t.Fatal("Truncated = true, want false")
+	}
+	if got.Binary {
+		t.Fatal("Binary = true, want false")
+	}
+	if got.Content != prefix+"世界" {
+		t.Fatalf("content bytes = %d, want %d original prefix bytes", len(got.Content), len(prefix))
+	}
+}
+
+func TestListRejectsSymlinkPath(t *testing.T) {
+	root := t.TempDir()
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(root, "linked")); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+
+	if _, err := List(root, "linked"); err == nil {
+		t.Fatal("List() error = nil, want symlink error")
+	}
+}

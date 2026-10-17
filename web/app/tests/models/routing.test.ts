@@ -1,0 +1,135 @@
+import {
+  DefaultWorkspacePaneIds,
+  WorkspacePaneTypes,
+  WorkspaceTabs,
+  paneFromLocation,
+  pathForPane,
+  workspaceHasContextSidebar,
+  workspaceShowsFloatingChat,
+  workspaceTabForPane,
+} from "@/models/routing";
+
+describe("task routing", () => {
+  it("uses the conversation pane as the default workspace pane", () => {
+    expect(paneFromLocation("/")).toEqual({ type: WorkspacePaneTypes.conversation, id: "" });
+  });
+
+  it("parses the teams route as a team pane", () => {
+    expect(paneFromLocation("/teams/team-7")).toEqual({ type: WorkspacePaneTypes.team, id: "team-7" });
+  });
+
+  it("builds the teams route from a team pane", () => {
+    expect(pathForPane({ type: WorkspacePaneTypes.team, id: "team-7" })).toBe("/teams/team-7");
+  });
+
+  it("parses the humans route as a human pane", () => {
+    expect(paneFromLocation("/humans/u-admin")).toEqual({ type: WorkspacePaneTypes.human, id: "u-admin" });
+    expect(paneFromLocation("/human/u-admin")).toEqual({ type: WorkspacePaneTypes.human, id: "u-admin" });
+  });
+
+  it("builds the humans route from a human pane", () => {
+    expect(pathForPane({ type: WorkspacePaneTypes.human, id: "u-admin" })).toBe("/humans/u-admin");
+  });
+
+  it("parses model provider routes as resource-tab model panes", () => {
+    expect(paneFromLocation("/models/csghub-lite")).toEqual({
+      type: WorkspacePaneTypes.modelProvider,
+      id: "csghub-lite",
+    });
+    expect(pathForPane({ type: WorkspacePaneTypes.modelProvider, id: "openai" })).toBe("/models/openai");
+    expect(workspaceTabForPane({ type: WorkspacePaneTypes.modelProvider, id: "openai" })).toBe(WorkspaceTabs.hub);
+  });
+
+  it("parses the tasks route as a task pane", () => {
+    expect(paneFromLocation("/tasks/task-7")).toEqual({ type: WorkspacePaneTypes.task, id: "task-7" });
+  });
+
+  it("builds the tasks route from a task pane", () => {
+    expect(pathForPane({ type: WorkspacePaneTypes.task, id: "task-7" })).toBe("/tasks/task-7");
+    expect(pathForPane({ type: WorkspacePaneTypes.task })).toBe("/tasks");
+  });
+
+  it("parses and builds the settings route as an independent page", () => {
+    expect(paneFromLocation("/settings")).toEqual({ type: WorkspacePaneTypes.settings, id: "" });
+    expect(pathForPane({ type: WorkspacePaneTypes.settings })).toBe("/settings");
+  });
+
+  it("parses hub resource routes as hub panes", () => {
+    expect(paneFromLocation("/resources")).toEqual({
+      type: WorkspacePaneTypes.hub,
+      id: DefaultWorkspacePaneIds.hub,
+    });
+    expect(paneFromLocation("/hub")).toEqual({
+      type: WorkspacePaneTypes.hub,
+      id: DefaultWorkspacePaneIds.hub,
+    });
+    expect(paneFromLocation("/templates/builtin%2Fdemo")).toEqual({
+      type: WorkspacePaneTypes.hub,
+      id: "builtin/demo",
+      resourceType: "template",
+    });
+    expect(paneFromLocation("/skills/demo-skill")).toEqual({
+      type: WorkspacePaneTypes.hub,
+      id: "demo-skill",
+      resourceType: "skill",
+    });
+    expect(paneFromLocation("/knowledge-bases/42")).toEqual({
+      type: WorkspacePaneTypes.hub,
+      id: "42",
+      resourceType: "knowledge",
+    });
+  });
+
+  it("builds hub resource routes from hub panes", () => {
+    expect(pathForPane({ type: WorkspacePaneTypes.hub, id: DefaultWorkspacePaneIds.hub })).toBe("/resources");
+    expect(pathForPane({ type: WorkspacePaneTypes.hub, id: "builtin/demo", resourceType: "template" })).toBe(
+      "/templates/builtin%2Fdemo",
+    );
+    expect(pathForPane({ type: WorkspacePaneTypes.hub, id: "demo-skill", resourceType: "skill" })).toBe(
+      "/skills/demo-skill",
+    );
+    expect(pathForPane({ type: WorkspacePaneTypes.hub, id: "42", resourceType: "knowledge" })).toBe(
+      "/knowledge-bases/42",
+    );
+  });
+
+  it("maps the task pane to the tasks tab", () => {
+    expect(workspaceTabForPane({ type: WorkspacePaneTypes.team, id: "team-7" })).toBe(WorkspaceTabs.agents);
+    expect(workspaceTabForPane({ type: WorkspacePaneTypes.human, id: "u-admin" })).toBe(WorkspaceTabs.agents);
+    expect(workspaceTabForPane({ type: WorkspacePaneTypes.task, id: "task-7" })).toBe(WorkspaceTabs.tasks);
+    expect(workspaceTabForPane({ type: WorkspacePaneTypes.hub, id: DefaultWorkspacePaneIds.hub })).toBe(
+      WorkspaceTabs.hub,
+    );
+  });
+
+  it("hides the contextual sidebar on full-width workspace pages", () => {
+    expect(workspaceHasContextSidebar({ type: WorkspacePaneTypes.conversation, id: "" })).toBe(true);
+    expect(workspaceHasContextSidebar({ type: WorkspacePaneTypes.task, id: "" })).toBe(false);
+    expect(workspaceHasContextSidebar({ type: WorkspacePaneTypes.settings, id: "" })).toBe(false);
+  });
+
+  it("hides floating chat while a conversation is open", () => {
+    expect(workspaceShowsFloatingChat({ type: WorkspacePaneTypes.conversation, id: "room-1" })).toBe(false);
+    expect(workspaceShowsFloatingChat({ type: WorkspacePaneTypes.conversation, id: "" })).toBe(true);
+    expect(workspaceShowsFloatingChat({ type: WorkspacePaneTypes.agent, id: "agent-1" })).toBe(true);
+  });
+});
+
+describe("global App resource routing", () => {
+  it("keeps global resources in the resource area without a context sidebar", () => {
+    const pane = paneFromLocation("/connectors/shared-1");
+    expect(pane).toEqual({ type: WorkspacePaneTypes.apps, id: "shared-1" });
+    expect(pathForPane(pane)).toBe("/connectors/shared-1");
+    expect(workspaceTabForPane(pane)).toBe(WorkspaceTabs.hub);
+    expect(workspaceHasContextSidebar(pane)).toBe(false);
+    expect(pathForPane({ type: WorkspacePaneTypes.apps })).toBe("/connectors");
+  });
+});
+
+it("returns to unified connectors after MCP creation and preserves MCP detail links", () => {
+  expect(pathForPane({ type: WorkspacePaneTypes.hub, resourceType: "mcp", id: "" })).toBe("/connectors");
+  expect(paneFromLocation("/connectors")).toEqual({ type: WorkspacePaneTypes.apps, id: "" });
+  const detail = { type: WorkspacePaneTypes.hub, resourceType: "mcp" as const, id: "project tools" };
+  expect(pathForPane(detail)).toBe("/mcp-servers/project%20tools");
+  expect(paneFromLocation(pathForPane(detail))).toEqual(detail);
+});
