@@ -16,8 +16,18 @@
 用于 Windows 7 SP1 x64 兼容实验。桌面使用 Electron 22.3.27 和固定版本的
 Win7 Go 工具链，Web UI 以 Chromium 108 为目标构建，桌面自动更新已禁用。
 
-[Win7 兼容构建工作流](.github/workflows/win7-compat.yml) 在
-`codex/win7-v0.8-electron22` 分支构建便携 ZIP，请从工作流产物下载。
+[Win7 构建和发布工作流](.github/workflows/win7-compat.yml) 在 `main` 分支构建便携 ZIP。
+每次推送版本 tag 后，CI 自动构建并将 ZIP、`SHA256SUMS.txt` 和 `build-info.json` 发布到
+[本项目 Releases](https://github.com/OpenCSGs/csgclaw-win7/releases)。
+tag 使用语义化版本号，可带 `v` 前缀；含预发布标识的版本会标为 GitHub 预发布版。
+例如，在更新到最新 `main` 后执行：
+
+```bash
+git tag v0.8.0-alpha.win7.3
+git push origin v0.8.0-alpha.win7.3
+```
+
+分支提交和手动构建的产物仍保留在 Actions Artifacts 中，保留 14 天。
 下文的上游安装命令安装常规发行版，不用于安装 Win7 实验版本。
 
 当前在 UTM Windows 7 SP1 x64 虚拟机中的验证结果：

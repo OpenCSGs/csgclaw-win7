@@ -37,6 +37,8 @@ env:
 
 jobs:
   prepare:
+    # The Win7 repository publishes through win7-compat.yml instead.
+    if: github.repository == 'OpenCSGs/csgclaw'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -130,7 +132,7 @@ jobs:
           echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
   web:
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.repository == 'OpenCSGs/csgclaw' && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

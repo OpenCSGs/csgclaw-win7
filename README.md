@@ -17,10 +17,21 @@ This repository contains an experimental Windows 7 SP1 x64 port based on
 It uses Electron 22.3.27, a pinned Win7 Go toolchain, and a Web UI targeting
 Chromium 108. Desktop updates are disabled for this build.
 
-The [Win7 compatibility workflow](.github/workflows/win7-compat.yml) builds a
-portable ZIP on the `codex/win7-v0.8-electron22` branch. Download the ZIP from
-the workflow artifacts; the upstream installation commands below install the
-regular release and are not the Win7 installation path.
+The [Win7 build and release workflow](.github/workflows/win7-compat.yml) builds a
+portable ZIP on `main`. Pushing a version tag automatically builds and publishes
+the ZIP, `SHA256SUMS.txt`, and `build-info.json`
+to [this repository's Releases](https://github.com/OpenCSGs/csgclaw-win7/releases).
+Tags use semantic versions with an optional `v` prefix; prerelease versions are
+marked as GitHub prereleases. For example, after updating `main`:
+
+```bash
+git tag v0.8.0-alpha.win7.3
+git push origin v0.8.0-alpha.win7.3
+```
+
+Branch and manual builds remain available as workflow artifacts for 14 days.
+The upstream installation commands below install the regular release and are
+not the Win7 installation path.
 
 Current validation in a UTM Windows 7 SP1 x64 VM:
 
