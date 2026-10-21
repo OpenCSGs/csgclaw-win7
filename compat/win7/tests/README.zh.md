@@ -98,3 +98,9 @@ Manager 未保存运行意图时按内置服务的运行意图处理，显式停
 将该入口复制到准备后的 `.cache/win7/csgclaw/cmd/win7-job-launcher/main_windows.go`，在准备后的模块中用专用 Go 工具链交叉编译。
 它使用本仓库准备后的进程管理实现，不属于用户安装包。
 原生进程组回归运行 `TestWin7InheritedJobLifecycle`，覆盖允许显式分离、允许隐式分离和禁止分离三种策略，以及子进程停止和拥有者崩溃回收。
+
+## Win7 Emoji
+
+Emoji 验收应让真实模型回复 `👋 😀 ✅ 🚀 🧑‍💻 🇨🇳`，等待 `document.fonts.load('20px "CSGClaw Emoji"', text)` 完成，再检查实际消息截图。
+还应通过 Chromium `CSS.getPlatformFontsForNode` 确认这些字符使用 bundled Noto Color Emoji，而普通中英文继续使用文本字体。
+刷新和重启 App 后须重新检查，不能把临时注入字体的结果算作安装包验收。
