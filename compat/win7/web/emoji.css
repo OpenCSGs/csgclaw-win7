@@ -1,0 +1,7 @@
+@font-face {
+  font-family: "CSGClaw Emoji";
+  src: url("./fonts/noto-color-emoji.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}

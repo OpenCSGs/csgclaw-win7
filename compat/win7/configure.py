@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Apply Win7 build overlays to prepared sources, leaving upstream intact."""
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -7,6 +8,23 @@ import shutil
 ROOT = Path(__file__).resolve().parents[2]
 COMPAT = ROOT / 'compat/win7'
 SOURCE = ROOT / '.cache/win7/csgclaw'
+
+
+def configure_emoji_fonts(web):
+    lock = json.loads((COMPAT / 'sources.lock.json').read_text())
+    fonts = COMPAT / 'web/fonts'
+    for name, expected in lock['emoji_font']['files'].items():
+        if hashlib.sha256((fonts / name).read_bytes()).hexdigest() != expected:
+            raise ValueError('Win7 emoji font checksum mismatch: ' + name)
+    styles = web / 'src/shared/styles'
+    (styles / 'fonts').mkdir(parents=True, exist_ok=True)
+    for name in lock['emoji_font']['files']:
+        shutil.copy2(fonts / name, styles / 'fonts' / name)
+    shutil.copy2(COMPAT / 'web/emoji.css', styles / 'emoji.css')
+    replace(styles / 'globals.css', '@import "./tokens.css";\n',
+            '@import "./tokens.css";\n@import "./emoji.css";\n')
+    replace(styles / 'tokens.css', 'Helvetica, Arial, sans-serif;',
+            'Helvetica, Arial,\n    "CSGClaw Emoji", sans-serif;')
 
 
 def replace(path, before, after):
@@ -67,6 +85,7 @@ def main():
     replace(browser, 'contents.navigationHistory.getActiveIndex() > 0', 'contents.canGoBack()')
     replace(browser, 'contents.navigationHistory.getActiveIndex() + 1 <\n        contents.navigationHistory.length()', 'contents.canGoForward()')
     web = SOURCE / 'web/app'
+    configure_emoji_fonts(web)
     package = json.loads((web / 'package.json').read_text())
     package['devDependencies'].pop('@tailwindcss/vite')
     package['devDependencies'].update(tailwindcss='3.4.17', postcss='8.5.6', autoprefixer='10.4.21')

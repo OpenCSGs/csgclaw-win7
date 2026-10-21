@@ -92,5 +92,16 @@
     "compiler": "NSIS",
     "version": "3.13"
   },
-  "app_version": "0.8.0-win7.dev.13"
+  "app_version": "0.8.0-win7.dev.14",
+  "emoji_font": {
+    "repository": "https://github.com/googlefonts/noto-emoji",
+    "commit": "e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e",
+    "source_path": "2D/fonts/Noto-COLRv1.ttf",
+    "source_sha256": "b8e25ea68db82f9e4d0aee921f4420be2be39887bd5c893a2ad98710531f9d0c",
+    "conversion": "fonttools 4.67.0, WOFF2 flavor",
+    "files": {
+      "noto-color-emoji.woff2": "2328570f49f63a72bcd139dbca5085cefc974e457bfbc1ebeef799d77050799e",
+      "LICENSE.noto-emoji": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+    }
+  }
 }

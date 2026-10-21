@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[2]
 COMPAT = ROOT / 'compat/win7'
 REQUIRED = {
-    'CSGClaw.exe', 'ffmpeg.dll', 'libEGL.dll', 'libGLESv2.dll',
+    'CSGClaw.exe', 'ffmpeg.dll', 'libEGL.dll', 'libGLESv2.dll', 'LICENSE.noto-emoji',
     'resources/app.asar', 'resources/csgclaw.ico',
     'resources/backend/csgclaw/bin/csgclaw.exe',
     'resources/backend/csgclaw/bin/csgclaw-cli.exe',

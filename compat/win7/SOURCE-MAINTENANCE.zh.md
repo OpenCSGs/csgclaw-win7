@@ -47,3 +47,10 @@ Win7 专属补丁和定制 Codex 未修改，旧原生验收记录不覆盖新�
 
 本轮升级前的两仓库提交另存于各自的 `refs/backup/win7-rebase-20261020-before`。
 Win7 完整备份位于本地 `.cache/win7/rebase-main-20261020/before.bundle`。
+
+## Win7 Emoji 字体
+
+Win7 专属 Web overlay 内置并校验 Noto Color Emoji，普通中英文继续使用系统文本字体。
+字体、来源版本、校验值及许可证均保存在 `compat/win7/`，不会在运行时请求外部字体服务。
+该适配不包含通用 Provider 解析修复，后者在主仓库单独维护和评审。
+字体验收须使用真实 Win7 Electron 22 / Chromium 108，覆盖普通、组合及国旗 Emoji，并在重启 App 后重新检查。

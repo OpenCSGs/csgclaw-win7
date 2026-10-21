@@ -54,5 +54,6 @@ for (const output of outputs) {
     [FuseV1Options.OnlyLoadAppFromAsar]: true,
   });
   await fs.copyFile(path.join(root, 'LICENSE'), path.join(output, 'LICENSE.csgclaw'));
+  await fs.copyFile(path.join(root, 'compat/win7/web/fonts/LICENSE.noto-emoji'), path.join(output, 'LICENSE.noto-emoji'));
   console.log(output);
 }
