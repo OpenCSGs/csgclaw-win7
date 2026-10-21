@@ -1,7 +1,7 @@
 {
   "csgclaw": {
     "repository": "https://github.com/OpenCSGs/csgclaw.git",
-    "commit": "6f9bdd6043d4904ecc0cad482ae699c3f45f8e2a"
+    "commit": "cae4fdcbc52f644b0dc4913d485d57c010df3228"
   },
   "codex": {
     "repository": "https://github.com/openai/codex.git",
@@ -92,7 +92,7 @@
     "compiler": "NSIS",
     "version": "3.13"
   },
-  "app_version": "0.8.0-win7.dev.14",
+  "app_version": "0.8.0-win7.dev.15",
   "emoji_font": {
     "repository": "https://github.com/googlefonts/noto-emoji",
     "commit": "e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e",

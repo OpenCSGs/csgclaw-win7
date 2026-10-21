@@ -1,8 +1,8 @@
 # Win7 与主仓库的维护约定
 
-当前业务基线为上游 main `6f9bdd6043d4904ecc0cad482ae699c3f45f8e2a`。
+当前业务基线为上游 main `cae4fdcbc52f644b0dc4913d485d57c010df3228`。
 Git 历史保留主仓库 main 的原始提交时间线，Win7 提交线性追加在选定的上游基线之后。
-本次将完整 Win7 适配整理为一个 `feat(win7)` 提交，不创建 Win7 同步 merge commit。
+Win7 适配提交按原顺序线性 rebase 到该基线之后，不创建 Win7 同步 merge commit。
 仓库根目录的业务源码、依赖和工作流与该上游基线完全一致。
 
 ## 改动范围
@@ -52,5 +52,13 @@ Win7 完整备份位于本地 `.cache/win7/rebase-main-20261020/before.bundle`�
 
 Win7 专属 Web overlay 内置并校验 Noto Color Emoji，普通中英文继续使用系统文本字体。
 字体、来源版本、校验值及许可证均保存在 `compat/win7/`，不会在运行时请求外部字体服务。
-该适配不包含通用 Provider 解析修复，后者在主仓库单独维护和评审。
+通用 Provider 解析修复已随上游 PR #744 继承，不增加 Win7 专属 Provider 补丁。
 字体验收须使用真实 Win7 Electron 22 / Chromium 108，覆盖普通、组合及国旗 Emoji，并在重启 App 后重新检查。
+
+## 2026-10-21 同步与安装包
+
+本轮将已有 Win7 适配和 Emoji 字体提交 rebase 到主仓库 PR #744 合入后的 main，保留上游原始提交及 Win7 提交顺序。
+仓库根目录与当前上游基线完全一致，构建版本更新为 `0.8.0-win7.dev.15`。
+同步前的本地 main、远端 main 和字体提交分别保存在 `refs/backup/win7-sync-final-20261021-*`。
+完整历史备份位于本地 `.cache/win7/sync-main-final-20261021/before.bundle`。
+本轮新安装包的原生虚拟机验收单独执行，旧验收报告只对应原版本。
