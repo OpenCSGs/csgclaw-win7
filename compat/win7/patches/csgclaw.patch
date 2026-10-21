@@ -1,0 +1,1273 @@
+diff --git a/internal/api/workspace_open.go b/internal/api/workspace_open.go
+index 9ab440a5..c1f9ce1e 100644
+--- a/internal/api/workspace_open.go
++++ b/internal/api/workspace_open.go
+@@ -63,7 +63,7 @@ func (h *Handler) workspaceOpenTargets(r *http.Request) []string {
+ 		}
+ 	case "windows":
+ 		targets = append(targets, "system", "notepad")
+-		if _, err := exec.LookPath("wt.exe"); err == nil {
++		if windowsWorkspaceTerminalAvailable() {
+ 			targets = append(targets, "terminal")
+ 		}
+ 	case "linux":
+@@ -223,6 +223,12 @@ func workspaceOpenCommand(goos, path, target string, directory bool) (string, []
+ }
+ 
+ func openWorkspacePath(ctx context.Context, path, target string, directory bool) error {
++	if runtime.GOOS == "windows" && target == "terminal" {
++		if !directory {
++			path = filepath.Dir(path)
++		}
++		return openWindowsWorkspaceTerminal(ctx, path)
++	}
+ 	command, args, err := workspaceOpenCommand(runtime.GOOS, path, target, directory)
+ 	if err != nil {
+ 		return err
+diff --git a/internal/api/workspace_terminal_other.go b/internal/api/workspace_terminal_other.go
+new file mode 100644
+index 00000000..ddb7073a
+--- /dev/null
++++ b/internal/api/workspace_terminal_other.go
+@@ -0,0 +1,14 @@
++//go:build !windows
++
++package api
++
++import (
++	"context"
++	"errors"
++)
++
++func windowsWorkspaceTerminalAvailable() bool { return false }
++
++func openWindowsWorkspaceTerminal(context.Context, string) error {
++	return errors.New("Windows terminal is unavailable on this platform")
++}
+diff --git a/internal/api/workspace_terminal_windows.go b/internal/api/workspace_terminal_windows.go
+new file mode 100644
+index 00000000..5deae9ac
+--- /dev/null
++++ b/internal/api/workspace_terminal_windows.go
+@@ -0,0 +1,79 @@
++package api
++
++import (
++	"context"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++)
++
++func windowsWorkspaceTerminal(path string, lookup func(string) (string, error)) (*exec.Cmd, error) {
++	if terminal, err := lookup("wt.exe"); err == nil {
++		return exec.Command(terminal, "-d", strings.ReplaceAll(path, ";", `\;`)), nil
++	}
++	system, err := windows.GetSystemDirectory()
++	if err != nil {
++		return nil, err
++	}
++	command, err := lookup(filepath.Join(system, "cmd.exe"))
++	if err != nil {
++		return nil, err
++	}
++	// The working directory is process metadata, never shell source. /D disables
++	// registry AutoRun commands, and a separate console keeps this interactive.
++	child := exec.Command(command, "/D")
++	child.Dir = path
++	child.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_CONSOLE}
++	return child, nil
++}
++
++func windowsWorkspaceTerminalAvailable() bool {
++	_, err := windowsWorkspaceTerminal(".", exec.LookPath)
++	return err == nil
++}
++
++func openWindowsWorkspaceTerminal(ctx context.Context, path string) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	child, err := windowsWorkspaceTerminal(path, exec.LookPath)
++	if err != nil {
++		return err
++	}
++	application, err := windows.UTF16PtrFromString(child.Path)
++	if err != nil {
++		return err
++	}
++	commandLine, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(child.Args))
++	if err != nil {
++		return err
++	}
++	var directory *uint16
++	if child.Dir != "" {
++		directory, err = windows.UTF16PtrFromString(child.Dir)
++		if err != nil {
++			return err
++		}
++	}
++	var flags uint32
++	if child.SysProcAttr != nil {
++		flags = child.SysProcAttr.CreationFlags
++	}
++	startup := windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{}))}
++	var process windows.ProcessInformation
++	// Let Windows initialize real console handles. exec.Cmd would otherwise
++	// redirect its nil input/output to NUL, making the new console unusable.
++	if err := windows.CreateProcess(application, commandLine, nil, nil, false, flags, nil, directory, &startup, &process); err != nil {
++		return err
++	}
++	windows.CloseHandle(process.Thread)
++	go func() {
++		windows.WaitForSingleObject(process.Process, windows.INFINITE)
++		windows.CloseHandle(process.Process)
++	}()
++	return nil
++}
+diff --git a/internal/api/workspace_terminal_windows_test.go b/internal/api/workspace_terminal_windows_test.go
+new file mode 100644
+index 00000000..ecb2b1ce
+--- /dev/null
++++ b/internal/api/workspace_terminal_windows_test.go
+@@ -0,0 +1,45 @@
++package api
++
++import (
++	"errors"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++
++	"golang.org/x/sys/windows"
++)
++
++func TestWindowsWorkspaceTerminalWithoutWindowsTerminal(t *testing.T) {
++	system, err := windows.GetSystemDirectory()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, path := range []string{`C:\workspace\中文 & echo bad; %PATH%`, `\\server\share\work`} {
++		child, err := windowsWorkspaceTerminal(path, func(name string) (string, error) {
++			if name == "wt.exe" {
++				return "", exec.ErrNotFound
++			}
++			return exec.LookPath(name)
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		want := filepath.Join(system, "cmd.exe")
++		if !strings.EqualFold(child.Path, want) || !reflect.DeepEqual(child.Args, []string{want, "/D"}) || child.Dir != path || child.SysProcAttr.CreationFlags != windows.CREATE_NEW_CONSOLE {
++			t.Fatalf("unsafe terminal launch: path=%q args=%q dir=%q attr=%+v", child.Path, child.Args, child.Dir, child.SysProcAttr)
++		}
++	}
++	if _, err := windowsWorkspaceTerminal(".", func(string) (string, error) { return "", errors.New("unavailable") }); err == nil {
++		t.Fatal("accepted unavailable system terminal")
++	}
++}
++
++func TestWindowsWorkspaceTerminalPrefersWindowsTerminal(t *testing.T) {
++	path := `C:\workspace\docs;calc.exe`
++	child, err := windowsWorkspaceTerminal(path, func(name string) (string, error) { return name, nil })
++	if err != nil || !reflect.DeepEqual(child.Args, []string{"wt.exe", "-d", `C:\workspace\docs\;calc.exe`}) || child.Dir != "" {
++		t.Fatalf("Windows Terminal launch: %v %v", child, err)
++	}
++}
+diff --git a/internal/processgroup/process_unix.go b/internal/processgroup/process_unix.go
+index 80f69a4d..6406a952 100644
+--- a/internal/processgroup/process_unix.go
++++ b/internal/processgroup/process_unix.go
+@@ -20,6 +20,10 @@ func Start(cmd *exec.Cmd) error {
+ 	cmd.SysProcAttr.Setpgid = true
+ 	return cmd.Start()
+ }
++
++// StartWithChildJobs uses the process group normally on platforms without Windows jobs.
++func StartWithChildJobs(cmd *exec.Cmd) error { return Start(cmd) }
++
+ func Stop(pid int, force bool) error {
+ 	if pid <= 0 {
+ 		return nil
+diff --git a/internal/processgroup/process_windows.go b/internal/processgroup/process_windows.go
+--- a/internal/processgroup/process_windows.go
++++ b/internal/processgroup/process_windows.go
+@@ -23,12 +23,26 @@
+ // Assign the suspended process before it can launch descendants. Closing the
+ // owner's handles also terminates commands when CSGClaw exits unexpectedly.
+ func Start(cmd *exec.Cmd) error {
++	return start(cmd, windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
++}
++
++// StartWithChildJobs permits cooperating children to own command jobs on Win7.
++func StartWithChildJobs(cmd *exec.Cmd) error {
++	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
++	version := windows.RtlGetVersion()
++	if version.MajorVersion < 6 || version.MajorVersion == 6 && version.MinorVersion < 2 {
++		flags |= windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK
++	}
++	return start(cmd, flags)
++}
++
++func start(cmd *exec.Cmd, flags uint32) error {
+ 	job, err := windows.CreateJobObject(nil, nil)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+-	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
++	limits.BasicLimitInformation.LimitFlags = flags
+ 	if _, err = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+ 		windows.CloseHandle(job)
+ 		return err
+@@ -127,6 +141,10 @@
+ 	defer jobs.Unlock()
+ 	job, ok := jobs.handles[pid]
+ 	if !ok {
++		// Win7 taskkill can block in WMI even for a process already confirmed dead.
++		if running, probeErr := processAlive(pid); probeErr != nil || !running {
++			return probeErr
++		}
+ 		err := exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/T", "/F").Run()
+ 		if err != nil {
+ 			// An exited process can still be opened while another caller owns
+diff --git a/internal/processgroup/process_win7_windows_test.go b/internal/processgroup/process_win7_windows_test.go
+new file mode 100644
+index 00000000..a917cc84
+--- /dev/null
++++ b/internal/processgroup/process_win7_windows_test.go
+@@ -0,0 +1,116 @@
++package processgroup
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	"golang.org/x/sys/windows"
++)
++
++func TestWindowsChildJobHelper(t *testing.T) {
++	if os.Getenv("CSGCLAW_WINDOWS_CHILD_JOB_TEST") != "owner" {
++		return
++	}
++	child := exec.Command(os.Args[0], "-test.run=^TestProcessGroupHelper$")
++	child.Env = append(os.Environ(), "CSGCLAW_PROCESS_GROUP_TEST=child")
++	child.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_BREAKAWAY_FROM_JOB}
++	if err := Start(child); err != nil {
++		os.Exit(2)
++	}
++	if err := os.WriteFile(os.Getenv("CSGCLAW_PROCESS_GROUP_READY")+".pid", []byte(strconv.Itoa(child.Process.Pid)), 0600); err != nil {
++		os.Exit(3)
++	}
++	time.Sleep(time.Minute)
++	os.Exit(0)
++}
++
++func TestCooperatingChildJobCleanup(t *testing.T) {
++	for _, termination := range []string{"stop", "owner-crash"} {
++		t.Run(termination, func(t *testing.T) {
++			ready := filepath.Join(t.TempDir(), "ready")
++			cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsChildJobHelper$")
++			cmd.Env = append(os.Environ(), "CSGCLAW_WINDOWS_CHILD_JOB_TEST=owner", "CSGCLAW_PROCESS_GROUP_READY="+ready)
++			if err := StartWithChildJobs(cmd); err != nil {
++				t.Fatal(err)
++			}
++			t.Cleanup(func() { _ = Stop(cmd.Process.Pid, true) })
++			var pid int
++			deadline := time.Now().Add(20 * time.Second)
++			for time.Now().Before(deadline) {
++				data, err := os.ReadFile(ready + ".pid")
++				if err == nil {
++					pid, err = strconv.Atoi(strings.TrimSpace(string(data)))
++					if err == nil && pid > 0 {
++						break
++					}
++				}
++				time.Sleep(20 * time.Millisecond)
++			}
++			if pid == 0 {
++				t.Fatal("cooperating child did not start its own job")
++			}
++			child, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer windows.CloseHandle(child)
++			if termination == "stop" {
++				err = Stop(cmd.Process.Pid, true)
++			} else {
++				err = cmd.Process.Kill()
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			_ = cmd.Wait()
++			state, err := windows.WaitForSingleObject(child, 5000)
++			if err != nil || state != windows.WAIT_OBJECT_0 {
++				t.Fatalf("command job survived owner termination: state=%d err=%v", state, err)
++			}
++		})
++	}
++}
++
++func TestMain(m *testing.M) {
++	if os.Getenv("CSGCLAW_TASKKILL_PROBE") != "" {
++		if err := os.WriteFile(os.Getenv("CSGCLAW_TASKKILL_PROBE"), []byte("invoked"), 0600); err != nil {
++			os.Exit(2)
++		}
++		os.Exit(0)
++	}
++	os.Exit(m.Run())
++}
++
++func TestStopExitedProcessDoesNotLaunchTaskkill(t *testing.T) {
++	cmd := exec.Command(`C:\Windows\System32\cmd.exe`, "/d", "/c", "exit 0")
++	if err := cmd.Run(); err != nil {
++		t.Fatal(err)
++	}
++	dir := t.TempDir()
++	self, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	data, err := os.ReadFile(self)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = os.WriteFile(filepath.Join(dir, "taskkill.exe"), data, 0755); err != nil {
++		t.Fatal(err)
++	}
++	marker := filepath.Join(dir, "taskkill-invoked.txt")
++	t.Setenv("PATH", dir)
++	t.Setenv("CSGCLAW_TASKKILL_PROBE", marker)
++	if err = Stop(cmd.Process.Pid, true); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = os.Stat(marker); !os.IsNotExist(err) {
++		t.Fatalf("stopping an already-exited process launched taskkill: %v", err)
++	}
++}
+diff --git a/internal/runtime/codex/appserver_manager.go b/internal/runtime/codex/appserver_manager.go
+index 993f2f5f..cc04aa11 100644
+--- a/internal/runtime/codex/appserver_manager.go
++++ b/internal/runtime/codex/appserver_manager.go
+@@ -167,7 +167,7 @@ func (m *appServerManager) Start(ctx context.Context, spec SessionSpec) (*Sessio
+ 		_ = stderrFile.Close()
+ 		return nil, fmt.Errorf("codex app-server stdout pipe: %w", err)
+ 	}
+-	if err := processgroup.Start(cmd); err != nil {
++	if err := processgroup.StartWithChildJobs(cmd); err != nil {
+ 		_ = stderrFile.Close()
+ 		return nil, fmt.Errorf("start codex app-server: %w", err)
+ 	}
+diff --git a/internal/runtime/codex/win7_features_windows_test.go b/internal/runtime/codex/win7_features_windows_test.go
+new file mode 100644
+index 00000000..858c3e77
+--- /dev/null
++++ b/internal/runtime/codex/win7_features_windows_test.go
+@@ -0,0 +1,95 @@
++package codex
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	agentruntime "csgclaw/internal/runtime"
++)
++
++func TestWindowsReadOnlyCodexToolsE2E(t *testing.T) {
++	binary := os.Getenv("CSGCLAW_TEST_CODEX_BINARY")
++	if binary == "" {
++		t.Skip("set CSGCLAW_TEST_CODEX_BINARY for native read-only verification")
++	}
++	t.Setenv("CSGCLAW_EXECUTION_MODE", ExecutionModeReadOnly)
++	home := t.TempDir()
++	t.Setenv("HOME", home)
++	t.Setenv("CODEX_HOME", filepath.Join(home, "host"))
++	var mu sync.Mutex
++	names := map[string]bool{}
++	requests := 0
++	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]any
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			t.Error(err)
++			return
++		}
++		var collect func([]any)
++		collect = func(items []any) {
++			for _, v := range items {
++				if item, ok := v.(map[string]any); ok {
++					if name, ok := item["name"].(string); ok {
++						names[name] = true
++					}
++					if nested, ok := item["tools"].([]any); ok {
++						collect(nested)
++					}
++				}
++			}
++		}
++		mu.Lock()
++		requests++
++		if tools, ok := body["tools"].([]any); ok {
++			collect(tools)
++		}
++		mu.Unlock()
++		w.Header().Set("Content-Type", "text/event-stream")
++		for _, event := range []any{
++			map[string]any{"type": "response.created", "response": map[string]any{"id": "win7-read-only"}},
++			map[string]any{"type": "response.output_item.done", "item": map[string]any{"type": "message", "id": "readonly-final", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "WIN7_READ_ONLY_OK"}}}},
++			map[string]any{"type": "response.completed", "response": map[string]any{"id": "win7-read-only", "usage": map[string]any{"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}}},
++		} {
++			raw, _ := json.Marshal(event)
++			fmt.Fprintf(w, "data: %s\n\n", raw)
++		}
++	}))
++	defer provider.Close()
++	profile := agentruntime.Profile{Provider: "api", ModelID: "win7-native", BaseURL: provider.URL + "/v1", APIKey: "local-test-fixture"}
++	rt := New(Dependencies{EventSink: NewEventSink(), BinaryProvider: fakeBinaryProvider{path: binary}, AgentHome: func(string) (string, error) { return filepath.Join(home, "agent"), nil }, ResolveAgent: func(agentruntime.Handle) (AgentRef, error) {
++		return AgentRef{ID: "win7-read-only", Name: "win7-read-only", Profile: profile, RuntimeOptions: map[string]any{"memory_mode": "disabled", "execution_mode": "read_only"}}, nil
++	}})
++	defer rt.Close()
++	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
++	defer cancel()
++	h, err := rt.New(ctx, agentruntime.Spec{RuntimeID: "win7-read-only", AgentID: "win7-read-only", AgentName: "win7-read-only", Profile: profile})
++	if err != nil {
++		t.Fatal(err)
++	}
++	thread, err := rt.EnsureEngineSession(ctx, h.RuntimeID, "room:read-only")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = rt.Prompt(ctx, h.RuntimeID, thread, "Confirm read-only mode is usable."); err != nil {
++		t.Fatal(err)
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	if requests == 0 {
++		t.Fatal("no native model request observed")
++	}
++	t.Logf("native read-only tool catalog: %v", names)
++	for _, name := range []string{"exec_command", "write_stdin", "shell_command", "shell", "apply_patch"} {
++		if names[name] {
++			t.Errorf("read-only mode exposed local execution tool %s", name)
++		}
++	}
++}
+diff --git a/internal/runtime/codex/win7_interactive_windows_test.go b/internal/runtime/codex/win7_interactive_windows_test.go
+new file mode 100644
+index 00000000..c61ae1dc
+--- /dev/null
++++ b/internal/runtime/codex/win7_interactive_windows_test.go
+@@ -0,0 +1,205 @@
++package codex
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	agentruntime "csgclaw/internal/runtime"
++)
++
++func TestWindowsInteractiveCodexToolsE2E(t *testing.T) {
++	binary := os.Getenv("CSGCLAW_TEST_CODEX_BINARY")
++	if binary == "" {
++		t.Skip("set CSGCLAW_TEST_CODEX_BINARY for native interactive verification")
++	}
++	probe := os.Getenv("CSGCLAW_TEST_CONSOLE_PROBE")
++	if probe == "" {
++		t.Skip("set CSGCLAW_TEST_CONSOLE_PROBE to the native console fixture")
++	}
++	home := t.TempDir()
++	t.Setenv("HOME", home)
++	t.Setenv("CODEX_HOME", filepath.Join(home, "host"))
++	var mu sync.Mutex
++	var advertised []string
++	seenAdvertised := map[string]bool{}
++	namespaces := map[string]string{}
++	patchRequested := false
++	patchCommand := ""
++	patchExited := false
++	output := ""
++	command := ""
++	started, sent := false, false
++	consoleExited := false
++	seenOutputs := map[string]bool{}
++	sessionID := 0
++	requests := 0
++	sessionPattern := regexp.MustCompile(`Process running with session ID (\d+)`)
++	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]any
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			t.Error(err)
++			return
++		}
++		var collect func([]any)
++		collect = func(tools []any) {
++			for _, value := range tools {
++				tool, ok := value.(map[string]any)
++				if !ok {
++					continue
++				}
++				if name, ok := tool["name"].(string); ok {
++					if !seenAdvertised[name] {
++						advertised = append(advertised, name)
++						seenAdvertised[name] = true
++					}
++				}
++				if nested, ok := tool["tools"].([]any); ok {
++					for _, child := range nested {
++						if child, ok := child.(map[string]any); ok {
++							if n, ok := child["name"].(string); ok {
++								namespaces[n], _ = tool["name"].(string)
++							}
++						}
++					}
++					collect(nested)
++				}
++			}
++		}
++		mu.Lock()
++		if tools, ok := body["tools"].([]any); ok {
++			collect(tools)
++		}
++
++		defer mu.Unlock()
++		requests++
++		latest := ""
++		if input, ok := body["input"].([]any); ok {
++			for _, v := range input {
++				if item, ok := v.(map[string]any); ok && (item["type"] == "function_call_output" || item["type"] == "custom_tool_call_output") {
++					latest = fmt.Sprint(item["output"])
++					id, _ := item["call_id"].(string)
++					if !seenOutputs[id] {
++						output += "\n" + latest
++						seenOutputs[id] = true
++					}
++				}
++			}
++		}
++		if strings.Contains(latest, "Process exited with code 0") {
++			if patchRequested {
++				patchExited = true
++			} else {
++				consoleExited = true
++			}
++		}
++		if match := sessionPattern.FindStringSubmatch(latest); len(match) == 2 {
++			sessionID, _ = strconv.Atoi(match[1])
++		}
++		name := ""
++		args := map[string]any{}
++		switch {
++		case !started:
++			started = true
++			name = "exec_command"
++			args = map[string]any{"cmd": command, "tty": true, "yield_time_ms": 1000, "max_output_tokens": 3000}
++		case !sent && sessionID != 0:
++			name = "write_stdin"
++			args = map[string]any{"session_id": sessionID, "chars": "", "yield_time_ms": 1000, "max_output_tokens": 3000}
++			if strings.Contains(output, "WIN7_REAL_CONSOLE_READY") {
++				sent = true
++				args["chars"] = "你好_win7\rabc\x1b[D\x7fZ\rquit\r"
++			}
++		case sent && !consoleExited && sessionID != 0:
++			name = "write_stdin"
++			args = map[string]any{"session_id": sessionID, "chars": "", "yield_time_ms": 1000, "max_output_tokens": 3000}
++		case consoleExited && !patchRequested:
++			patchRequested = true
++			name = "exec_command"
++			args = map[string]any{"cmd": patchCommand, "tty": false, "yield_time_ms": 1000, "max_output_tokens": 3000}
++		case patchRequested && !patchExited && sessionID != 0:
++			name = "write_stdin"
++			args = map[string]any{"session_id": sessionID, "chars": "", "yield_time_ms": 1000, "max_output_tokens": 3000}
++		}
++		if requests > 16 {
++			name = ""
++		}
++		w.Header().Set("Content-Type", "text/event-stream")
++		emit := func(event any) { raw, _ := json.Marshal(event); fmt.Fprintf(w, "data: %s\n\n", raw) }
++		emit(map[string]any{"type": "response.created", "response": map[string]any{"id": "win7-pty"}})
++		if name != "" {
++			raw, _ := json.Marshal(args)
++			item := map[string]any{"type": "function_call", "call_id": fmt.Sprintf("pty-%d", requests), "name": name, "arguments": string(raw)}
++			if namespaces[name] != "" {
++				item["namespace"] = namespaces[name]
++			}
++			emit(map[string]any{"type": "response.output_item.done", "item": item})
++		} else {
++			emit(map[string]any{"type": "response.output_item.done", "item": map[string]any{"type": "message", "id": "win7-pty-final", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "WIN7_PTY_CHAIN_DONE"}}}})
++		}
++		emit(map[string]any{"type": "response.completed", "response": map[string]any{"id": "win7-pty", "usage": map[string]any{"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}}})
++	}))
++	defer provider.Close()
++	profile := agentruntime.Profile{Provider: "api", ModelID: "gpt-5.5", BaseURL: provider.URL + "/v1", APIKey: "local-test-fixture"}
++	agentHome := filepath.Join(home, "agent")
++	rt := New(Dependencies{EventSink: NewEventSink(), BinaryProvider: fakeBinaryProvider{path: binary}, AgentHome: func(string) (string, error) { return agentHome, nil }, ResolveAgent: func(agentruntime.Handle) (AgentRef, error) {
++		return AgentRef{ID: "win7-interactive", Name: "win7-interactive", Profile: profile, RuntimeOptions: map[string]any{"memory_mode": "disabled"}}, nil
++	}})
++	defer rt.Close()
++	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
++	defer cancel()
++	h, err := rt.New(ctx, agentruntime.Spec{RuntimeID: "win7-interactive", AgentID: "win7-interactive", AgentName: "win7-interactive", Profile: profile})
++	if err != nil {
++		t.Fatal(err)
++	}
++	thread, err := rt.EnsureEngineSession(ctx, h.RuntimeID, "room:win7-interactive")
++	if err != nil {
++		t.Fatal(err)
++	}
++	workspace, err := rt.WorkspaceDir(h.RuntimeID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	outside := filepath.Join(filepath.Dir(binary), "outside-workspace", "pty-chain-denied.txt")
++	if err := os.MkdirAll(filepath.Dir(outside), 0700); err != nil {
++		t.Fatal(err)
++	}
++	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
++	command = "& " + quote(probe) + " '--console-child' " + quote(outside)
++	patchCommand = "$patch = \"*** Begin Patch`n*** Add File: win7-apply-patch.txt`n+WIN7_APPLY_PATCH_OK`n*** End Patch`n\"; & " + quote(binary) + " '--codex-run-as-apply-patch' $patch"
++	if err := rt.Prompt(ctx, h.RuntimeID, thread, "Run and interact with the restricted native console fixture."); err != nil {
++		t.Fatal(err)
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	t.Logf("interactive requests=%d output=%s", requests, output)
++	for _, want := range []string{"WIN7_REAL_CONSOLE_READY", "RESTRICTED_TOKEN_OK", "OUTSIDE_WRITE_DENIED", "ECHO_你好_win7", "ECHO_aZc", "WIN7_PTY_BYE", "Process exited with code 0"} {
++		if !strings.Contains(output, want) {
++			t.Errorf("interactive chain missing %s", want)
++		}
++	}
++	if data, err := os.ReadFile(filepath.Join(workspace, "pty-inside.txt")); err != nil || string(data) != "WIN7_PTY_INSIDE" {
++		t.Errorf("workspace write: %s %v", data, err)
++	}
++	if _, err := os.Stat(outside); !os.IsNotExist(err) {
++		t.Errorf("outside workspace file exists or could not be checked: %v", err)
++	}
++	if data, err := os.ReadFile(filepath.Join(workspace, "win7-apply-patch.txt")); err != nil || string(data) != "WIN7_APPLY_PATCH_OK\n" {
++		t.Errorf("native apply_patch: %s %v", data, err)
++	}
++	for _, want := range []string{"exec_command", "write_stdin"} {
++		if !strings.Contains("|"+strings.Join(advertised, "|")+"|", "|"+want+"|") {
++			t.Fatalf("interactive tool %s missing from actual model request: %v", want, advertised)
++		}
++	}
++}
+diff --git a/internal/runtime/codex/win7_sandbox_windows_test.go b/internal/runtime/codex/win7_sandbox_windows_test.go
+new file mode 100644
+index 00000000..501f7ea5
+--- /dev/null
++++ b/internal/runtime/codex/win7_sandbox_windows_test.go
+@@ -0,0 +1,340 @@
++package codex
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	agentruntime "csgclaw/internal/runtime"
++	"golang.org/x/sys/windows"
++)
++
++// This helper runs inside the actual restricted Codex command process tree.
++func TestWin7SandboxHelper(t *testing.T) {
++	mode := os.Getenv("CSGCLAW_WIN7_E2E_HELPER")
++	if mode == "" {
++		return
++	}
++	ready := os.Getenv("CSGCLAW_WIN7_E2E_READY")
++	if mode == "work" {
++		if err := os.WriteFile("win7-workspace.txt", []byte("workspace write"), 0600); err != nil {
++			fmt.Println(err)
++			os.Exit(2)
++		}
++		if err := os.WriteFile(os.Getenv("CSGCLAW_WIN7_E2E_OUTSIDE"), []byte("unexpected"), 0600); !os.IsPermission(err) {
++			fmt.Println("outside write was not denied", err)
++			os.Exit(3)
++		}
++		fmt.Println("WIN7_NATIVE_WORKSPACE_OK")
++		os.Exit(0)
++	}
++	if mode == "child" {
++		if err := os.WriteFile(ready+".child", []byte("ready"), 0600); err != nil {
++			os.Exit(4)
++		}
++		time.Sleep(5 * time.Minute)
++		os.Exit(0)
++	}
++	child := exec.Command(os.Args[0], "-test.run=^TestWin7SandboxHelper$")
++	child.Env = append(os.Environ(), "CSGCLAW_WIN7_E2E_HELPER=child")
++	if err := child.Start(); err != nil {
++		fmt.Println(err)
++		os.Exit(5)
++	}
++	data, _ := json.Marshal([]int{os.Getpid(), child.Process.Pid})
++	if err := os.WriteFile(ready, data, 0600); err != nil {
++		fmt.Println(err)
++		os.Exit(7)
++	}
++	if mode == "background_stop" {
++		fmt.Println("WIN7_BACKGROUND_STARTED")
++		os.Exit(0)
++	}
++	time.Sleep(5 * time.Minute)
++	os.Exit(0)
++}
++
++func TestWindowsWorkspaceSandboxCodexE2E(t *testing.T) {
++	binary := os.Getenv("CSGCLAW_TEST_CODEX_BINARY")
++	if binary == "" {
++		t.Skip("set CSGCLAW_TEST_CODEX_BINARY for native Windows lifecycle verification")
++	}
++	for _, mode := range []string{"work", "cancel", "timeout", "background_stop", "owner_crash"} {
++		t.Run(mode, func(t *testing.T) {
++			home := t.TempDir()
++			t.Setenv("HOME", home)
++			t.Setenv("CODEX_HOME", filepath.Join(home, "host"))
++			outside := filepath.Join(filepath.Dir(binary), "outside-workspace")
++			if err := os.MkdirAll(outside, 0700); err != nil {
++				t.Fatal(err)
++			}
++			var mu sync.Mutex
++			calls := 0
++			output := ""
++			command := ""
++			unified := false
++			resumeOnly := false
++			sessionPattern := regexp.MustCompile(`Process running with session ID (\d+)`)
++			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.URL.Path != "/v1/responses" {
++					http.NotFound(w, r)
++					return
++				}
++				var body map[string]any
++				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++					t.Error(err)
++					return
++				}
++				mu.Lock()
++				defer mu.Unlock()
++				calls++
++				latest := ""
++				if items, ok := body["input"].([]any); ok {
++					for _, v := range items {
++						if m, ok := v.(map[string]any); ok && m["type"] == "function_call_output" {
++							latest = fmt.Sprint(m["output"])
++							output += latest
++						}
++					}
++				}
++				name, namespace := "", ""
++				writeNamespace := ""
++				var find func([]any, string)
++				find = func(tools []any, ns string) {
++					for _, v := range tools {
++						m, ok := v.(map[string]any)
++						if !ok {
++							continue
++						}
++						n, _ := m["name"].(string)
++						if n == "write_stdin" {
++							writeNamespace = ns
++						}
++						if n == "shell_command" || n == "exec_command" {
++							name = n
++							namespace = ns
++							return
++						}
++						if nested, ok := m["tools"].([]any); ok {
++							find(nested, n)
++							if name != "" {
++								return
++							}
++						}
++					}
++				}
++				if tools, ok := body["tools"].([]any); ok {
++					find(tools, "")
++					for _, v := range tools {
++						if tool, ok := v.(map[string]any); ok {
++							if nested, ok := tool["tools"].([]any); ok {
++								for _, v := range nested {
++									if child, ok := v.(map[string]any); ok && child["name"] == "write_stdin" {
++										writeNamespace, _ = tool["name"].(string)
++									}
++								}
++							}
++						}
++					}
++				}
++				w.Header().Set("Content-Type", "text/event-stream")
++				emit := func(v any) { raw, _ := json.Marshal(v); fmt.Fprintf(w, "data: %s\n\n", raw) }
++				emit(map[string]any{"type": "response.created", "response": map[string]any{"id": "win7-native"}})
++				if calls == 1 {
++					if name == "" {
++						t.Error("no native shell tool advertised")
++					}
++					args := map[string]any{"command": command, "timeout_ms": 60000}
++					if mode == "timeout" {
++						args["timeout_ms"] = 30000
++					}
++					if name == "exec_command" {
++						unified = true
++						args = map[string]any{"cmd": command, "tty": true, "yield_time_ms": 1000, "max_output_tokens": 2000}
++					}
++					raw, _ := json.Marshal(args)
++					item := map[string]any{"type": "function_call", "call_id": "win7-native-tool", "name": name, "arguments": string(raw)}
++					if namespace != "" {
++						item["namespace"] = namespace
++					}
++					emit(map[string]any{"type": "response.output_item.done", "item": item})
++				} else if match := sessionPattern.FindStringSubmatch(latest); unified && !resumeOnly && len(match) == 2 && calls < 60 {
++					sessionID, _ := strconv.Atoi(match[1])
++					raw, _ := json.Marshal(map[string]any{"session_id": sessionID, "chars": "", "yield_time_ms": 1000, "max_output_tokens": 2000})
++					item := map[string]any{"type": "function_call", "call_id": fmt.Sprintf("win7-poll-%d", calls), "name": "write_stdin", "arguments": string(raw)}
++					if writeNamespace != "" {
++						item["namespace"] = writeNamespace
++					}
++					emit(map[string]any{"type": "response.output_item.done", "item": item})
++				} else {
++					emit(map[string]any{"type": "response.output_item.done", "item": map[string]any{"type": "message", "id": "win7-final", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "WIN7_NATIVE_TURN_DONE"}}}})
++				}
++				emit(map[string]any{"type": "response.completed", "response": map[string]any{"id": "win7-native", "usage": map[string]any{"input_tokens": 20, "output_tokens": 20, "total_tokens": 40}}})
++			}))
++			defer provider.Close()
++			profile := agentruntime.Profile{Provider: "api", ModelID: "win7-native", BaseURL: provider.URL + "/v1", APIKey: "local-test-fixture"}
++			agentHome := filepath.Join(home, "agent")
++			rt := New(Dependencies{EventSink: NewEventSink(), BinaryProvider: fakeBinaryProvider{path: binary}, AgentHome: func(string) (string, error) { return agentHome, nil }, ResolveAgent: func(agentruntime.Handle) (AgentRef, error) {
++				return AgentRef{ID: "win7-agent", Name: "win7-agent", Profile: profile, RuntimeOptions: map[string]any{"memory_mode": "disabled"}}, nil
++			}})
++			defer rt.Close()
++			t.Cleanup(func() {
++				if t.Failed() {
++					logs, _ := os.ReadFile(rt.Layout(agentHome).HostLogPaths[0])
++					t.Logf("native Codex stderr: %s", logs)
++					mu.Lock()
++					t.Logf("model requests=%d tool output=%s", calls, output)
++					mu.Unlock()
++				}
++			})
++			ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
++			defer cancel()
++			h, err := rt.New(ctx, agentruntime.Spec{RuntimeID: "win7-runtime", AgentID: "win7-agent", AgentName: "win7-agent", Profile: profile})
++			if err != nil {
++				t.Fatal(err)
++			}
++			thread, err := rt.EnsureEngineSession(ctx, h.RuntimeID, "room:win7-native")
++			if err != nil {
++				t.Fatal(err)
++			}
++			workspace, err := rt.WorkspaceDir(h.RuntimeID)
++			if err != nil {
++				t.Fatal(err)
++			}
++			config, err := os.ReadFile(filepath.Join(filepath.Dir(rt.Layout(agentHome).SkillsRoot), "config.toml"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			for _, want := range []string{`sandbox_mode = "workspace-write"`, `sandbox = "unelevated"`} {
++				if !strings.Contains(string(config), want) {
++					t.Fatalf("missing default sandbox setting %s", want)
++				}
++			}
++			ready := filepath.Join(workspace, "lifecycle.json")
++			self, err := os.Executable()
++			if err != nil {
++				t.Fatal(err)
++			}
++			quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
++			command = "$env:CSGCLAW_WIN7_E2E_HELPER=" + quote(mode) + "; $env:CSGCLAW_WIN7_E2E_READY=" + quote(ready) + "; $env:CSGCLAW_WIN7_E2E_OUTSIDE=" + quote(filepath.Join(outside, "denied.txt")) + "; & " + quote(self) + " '-test.run=^TestWin7SandboxHelper$'"
++			promptCtx, stop := context.WithCancel(ctx)
++			if mode == "timeout" {
++				stop()
++				promptCtx, stop = context.WithTimeout(ctx, 60*time.Second)
++			}
++			defer stop()
++			done := make(chan error, 1)
++			go func() { done <- rt.Prompt(promptCtx, h.RuntimeID, thread, "Run the native lifecycle fixture.") }()
++			var children []windows.Handle
++			if mode != "work" {
++				deadline := time.Now().Add(45 * time.Second)
++				for time.Now().Before(deadline) {
++					data, e := os.ReadFile(ready)
++					var pids []uint32
++					if e == nil && json.Unmarshal(data, &pids) == nil && len(pids) == 2 {
++						for index, pid := range pids {
++							if mode == "background_stop" && index == 0 {
++								continue
++							}
++							handle, e := windows.OpenProcess(windows.SYNCHRONIZE, false, pid)
++							if e != nil {
++								t.Fatal(e)
++							}
++							children = append(children, handle)
++						}
++						break
++					}
++					select {
++					case e := <-done:
++						t.Fatalf("turn ended before descendants started: %v", e)
++					default:
++					}
++					time.Sleep(25 * time.Millisecond)
++				}
++				expectedHandles := 2
++				if mode == "background_stop" {
++					expectedHandles = 1
++				}
++				if len(children) != expectedHandles {
++					t.Fatal("descendant fixture did not start")
++				}
++				defer func() {
++					for _, h := range children {
++						windows.CloseHandle(h)
++					}
++				}()
++			}
++			if mode == "cancel" {
++				stop()
++			}
++			if mode == "owner_crash" {
++				live := rt.SessionManager().(*appServerManager).liveSession(h.RuntimeID)
++				if err := live.cmd.Process.Kill(); err != nil {
++					t.Fatal(err)
++				}
++			}
++			select {
++			case err = <-done:
++			case <-time.After(70 * time.Second):
++				t.Fatal("turn did not finish")
++			}
++			mu.Lock()
++			usesUnified := unified
++			mu.Unlock()
++			if mode == "cancel" && !errors.Is(err, context.Canceled) {
++				t.Fatalf("cancel result: %v", err)
++			}
++			if mode == "owner_crash" && (err == nil || !strings.Contains(err.Error(), "app-server exited")) {
++				t.Fatalf("app-server crash was not reported: %v", err)
++			}
++			if mode == "timeout" && usesUnified && !errors.Is(err, context.DeadlineExceeded) {
++				t.Fatalf("CSGClaw turn deadline: %v", err)
++			}
++			if mode != "cancel" && mode != "owner_crash" && !(mode == "timeout" && usesUnified) && err != nil {
++				t.Fatal(err)
++			}
++			if mode == "background_stop" {
++				if state, e := windows.WaitForSingleObject(children[len(children)-1], 0); e != nil || state != uint32(windows.WAIT_TIMEOUT) {
++					t.Fatalf("background child was not preserved: %d %v", state, e)
++				}
++				if err := rt.Close(); err != nil {
++					t.Fatal(err)
++				}
++			}
++			for _, child := range children {
++				if state, e := windows.WaitForSingleObject(child, 10000); e != nil || state != windows.WAIT_OBJECT_0 {
++					t.Fatalf("descendant survived %s: state=%d err=%v", mode, state, e)
++				}
++			}
++			mu.Lock()
++			got := output
++			mu.Unlock()
++			if mode == "work" && !strings.Contains(got, "WIN7_NATIVE_WORKSPACE_OK") {
++				t.Fatalf("sandbox tool output: %s", got)
++			}
++			if mode == "timeout" && !usesUnified && !strings.Contains(strings.ToLower(got), "timed out") {
++				t.Fatalf("timeout was not reported: %s", got)
++			}
++			if mode == "cancel" || mode == "timeout" {
++				mu.Lock()
++				resumeOnly = true
++				mu.Unlock()
++				if err := rt.Prompt(ctx, h.RuntimeID, thread, "Confirm this session still works after the previous interruption."); err != nil {
++					t.Fatalf("session recovery: %v", err)
++				}
++			}
++		})
++	}
++}
+diff --git a/web/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.css b/web/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.css
+index ebc308c4..94375edf 100644
+--- a/web/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.css
++++ b/web/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.css
+@@ -291,7 +291,7 @@
+ .document-preview-html-frame-wrap {
+   min-width: 0;
+   min-height: 0;
+-  overflow: auto;
++  overflow: hidden;
+   background: var(--surface);
+ }
+ 
+@@ -484,10 +484,15 @@
+   text-align: center;
+ }
+ 
++.document-preview-ppt-layout {
++  margin: 0 auto;
++  overflow: hidden;
++}
++
+ .document-preview-ppt-stage {
+   width: 960px;
+   min-height: 540px;
+-  margin: 0 auto;
++  transform-origin: top left;
+ }
+ 
+ @media (max-width: 960px) {
+diff --git a/web/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx b/web/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
+index 603c5225..532377ec 100644
+--- a/web/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
++++ b/web/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
+@@ -90,14 +90,14 @@ function sanitizedHTMLFragment(source: string): string {
+   return `${safeStyles ? `<style>${safeStyles}</style>` : ""}${template.innerHTML}`;
+ }
+ 
+-function htmlPreviewDocument(source: string, scale: number): string {
++function htmlPreviewDocument(source: string): string {
+   return `<!doctype html>
+ <html>
+ <head>
+ <meta charset="utf-8">
+ <meta http-equiv="Content-Security-Policy" content="${htmlPreviewCSP}">
+ <style>
+-  :root { color-scheme: light; zoom: ${scale}; }
++  :root { color-scheme: light; }
+   html { min-height: 100%; background: #fff; color: #111827; }
+   body { min-height: 100%; margin: 0; padding: 24px; box-sizing: border-box; overflow-wrap: anywhere; }
+   img, video { max-width: 100%; height: auto; }
+@@ -109,7 +109,7 @@ function htmlPreviewDocument(source: string, scale: number): string {
+ 
+ export default function HtmlPreview({ scale, text, t }: { scale: number; text: string; t: (key: string) => string }) {
+   const [mode, setMode] = useState<"preview" | "source">("preview");
+-  const srcDoc = useMemo(() => htmlPreviewDocument(text, scale), [scale, text]);
++  const srcDoc = useMemo(() => htmlPreviewDocument(text), [text]);
+ 
+   return (
+     <div className="document-preview-html-shell">
+@@ -130,6 +130,13 @@ export default function HtmlPreview({ scale, text, t }: { scale: number; text: s
+         <div className="document-preview-html-frame-wrap">
+           <iframe
+             className="document-preview-html-frame"
++            style={{
++              width: `${100 / scale}%`,
++              height: `${100 / scale}%`,
++              minHeight: `${100 / scale}%`,
++              transform: `scale(${scale})`,
++              transformOrigin: "top left",
++            }}
+             referrerPolicy="no-referrer"
+             sandbox=""
+             srcDoc={srcDoc}
+diff --git a/web/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx b/web/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
+index ba6d097e..76867d90 100644
+--- a/web/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
++++ b/web/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
+@@ -2,7 +2,7 @@ import { useCallback, useLayoutEffect, useMemo, useRef, useState, type UIEvent }
+ import { ChevronLeft, ChevronRight } from "lucide-react";
+ import { Document, Page, pdfjs } from "react-pdf";
+ import { Button, TextInput } from "@/components/ui";
+-import pdfWorkerURL from "pdfjs-dist/build/pdf.worker.min.mjs?url";
++import pdfWorkerURL from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
+ import { copyPreviewBuffer } from "./previewBuffer";
+ import "react-pdf/dist/Page/AnnotationLayer.css";
+ import "react-pdf/dist/Page/TextLayer.css";
+diff --git a/web/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx b/web/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
+index 98351db1..558feb2a 100644
+--- a/web/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
++++ b/web/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
+@@ -25,6 +25,20 @@ export default function PowerPointPreview({
+   const [slide, setSlide] = useState(1);
+   const [error, setError] = useState(false);
+   const [fittedScale, setFittedScale] = useState(1);
++  const [stageHeight, setStageHeight] = useState(540);
++  const renderedScale = fittedScale * scale;
++
++  useLayoutEffect(() => {
++    const stage = stageRef.current;
++    if (!stage) return;
++    const measure = () => {
++      if (stage.offsetHeight > 0) setStageHeight(stage.offsetHeight);
++    };
++    measure();
++    const observer = new ResizeObserver(measure);
++    observer.observe(stage);
++    return () => observer.disconnect();
++  }, []);
+ 
+   useLayoutEffect(() => {
+     const container = scrollRef.current;
+@@ -116,7 +130,12 @@ export default function PowerPointPreview({
+   return (
+     <div className="document-preview-powerpoint">
+       <div ref={scrollRef} className="document-preview-ppt-stage-shell" onScroll={handleScroll}>
+-        <div ref={stageRef} className="document-preview-ppt-stage" style={{ zoom: fittedScale * scale }} />
++        <div
++          className="document-preview-ppt-layout"
++          style={{ width: 960 * renderedScale, height: stageHeight * renderedScale }}
++        >
++          <div ref={stageRef} className="document-preview-ppt-stage" style={{ transform: `scale(${renderedScale})` }} />
++        </div>
+       </div>
+       {slideCount > 0 ? (
+         <div className="document-preview-page-controls">
+diff --git a/web/app/tests/components/DocumentPreviewPanel.test.tsx b/web/app/tests/components/DocumentPreviewPanel.test.tsx
+index c44743ee..3ae02044 100644
+--- a/web/app/tests/components/DocumentPreviewPanel.test.tsx
++++ b/web/app/tests/components/DocumentPreviewPanel.test.tsx
+@@ -307,6 +307,12 @@ describe("DocumentPreviewPanel", () => {
+     expect(frameDocument).not.toContain("window.hacked");
+     expect(frameDocument).not.toContain("tracker.example");
+ 
++    await user.click(screen.getByRole("button", { name: "Zoom in" }));
++    expect(frame).toHaveStyle({ transform: "scale(1.1)" });
++    expect(parseFloat((frame as HTMLIFrameElement).style.width)).toBeCloseTo(100 / 1.1);
++    expect(parseFloat((frame as HTMLIFrameElement).style.height)).toBeCloseTo(100 / 1.1);
++    expect(frame).toHaveAttribute("srcdoc", frameDocument);
++
+     await user.click(screen.getByRole("radio", { name: "Code" }));
+     await waitFor(() =>
+       expect(container.querySelector('.document-preview-shiki[data-language="html"]')).toHaveTextContent(
+@@ -815,3 +821,50 @@ describe("image preview sizing", () => {
+     }
+   });
+ });
++
++describe("PowerPoint preview sizing", () => {
++  it("fits the slide and allocates scaled layout space without CSS zoom", async () => {
++    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(560);
++    const height = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(1080);
++    try {
++      const zip = new JSZip();
++      zip.file(
++        "ppt/presentation.xml",
++        '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>',
++      );
++      const { container } = render(
++        <DocumentPreviewPanel
++          mode="embedded"
++          index={0}
++          items={[
++            {
++              file: new File([await zip.generateAsync({ type: "arraybuffer" })], "fit.pptx"),
++              id: "pptx-fit",
++              name: "fit.pptx",
++              mediaType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
++              sizeBytes: 10,
++            },
++          ]}
++          t={t}
++          onClose={() => {}}
++          onIndexChange={() => {}}
++        />,
++      );
++      await waitFor(() => expect(container.querySelector(".document-preview-ppt-layout")).toBeInTheDocument());
++      const layout = container.querySelector<HTMLElement>(".document-preview-ppt-layout")!;
++      const stage = container.querySelector<HTMLElement>(".document-preview-ppt-stage")!;
++      const fitted = parseFloat(layout.style.width);
++      expect(fitted).toBeLessThanOrEqual(560);
++      expect(parseFloat(layout.style.height)).toBeCloseTo((1080 * fitted) / 960);
++      expect(stage.style.transform).toBe(`scale(${fitted / 960})`);
++      await userEvent.click(screen.getByRole("button", { name: "Zoom in" }));
++      expect(parseFloat(layout.style.width)).toBeCloseTo(fitted * 1.1);
++      expect(parseFloat(layout.style.height)).toBeCloseTo(((1080 * fitted) / 960) * 1.1);
++      await userEvent.click(screen.getByRole("button", { name: "Reset zoom" }));
++      expect(parseFloat(layout.style.width)).toBe(fitted);
++    } finally {
++      width.mockRestore();
++      height.mockRestore();
++    }
++  });
++});
+diff --git a/web/app/tests/shared/pdfBrowserCompatibility.test.ts b/web/app/tests/shared/pdfBrowserCompatibility.test.ts
+new file mode 100644
+index 00000000..a86432a6
+--- /dev/null
++++ b/web/app/tests/shared/pdfBrowserCompatibility.test.ts
+@@ -0,0 +1,21 @@
++import { describe, expect, it, vi } from "vitest";
++
++describe("PDF browser compatibility", () => {
++  it("loads the shared PDF engine without native Promise.withResolvers", async () => {
++    const original = Object.getOwnPropertyDescriptor(Promise, "withResolvers");
++    try {
++      Object.defineProperty(Promise, "withResolvers", { configurable: true, writable: true, value: undefined });
++      const pdfjs = await import("pdfjs-dist");
++      const transport = new pdfjs.PDFDataRangeTransport(1, new Uint8Array());
++      const progress = vi.fn();
++      transport.addProgressListener(progress);
++      transport.transportReady();
++      transport.onDataProgress(1, 1);
++      await Promise.resolve();
++      expect(progress).toHaveBeenCalledWith(1, 1);
++    } finally {
++      if (original) Object.defineProperty(Promise, "withResolvers", original);
++      else Reflect.deleteProperty(Promise, "withResolvers");
++    }
++  });
++});
+diff --git a/web/app/vite.config.ts b/web/app/vite.config.ts
+index c2eb8fe3..4e20cd58 100644
+--- a/web/app/vite.config.ts
++++ b/web/app/vite.config.ts
+@@ -58,9 +58,12 @@ export default defineConfig(({ command }) => ({
+   base: "./",
+   publicDir: "public",
+   resolve: {
+-    alias: {
+-      "@": path.resolve(__dirname, "src"),
+-    },
++    alias: [
++      { find: "@", replacement: path.resolve(__dirname, "src") },
++      // React-PDF and its worker must use the same PDF.js build. The legacy
++      // build supplies platform APIs missing from Firefox 115 ESR on Win7.
++      { find: /^pdfjs-dist$/, replacement: path.resolve(__dirname, "node_modules/pdfjs-dist/legacy/build/pdf.mjs") },
++    ],
+   },
+   build: {
+     outDir: "../static-dist",

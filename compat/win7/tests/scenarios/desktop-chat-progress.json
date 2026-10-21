@@ -1,0 +1,70 @@
+[
+  {
+    "action": "start",
+    "name": "attach-updated-main-desktop"
+  },
+  {
+    "action": "script",
+    "name": "verified-app-version",
+    "script": "window.__mainErrors=[];addEventListener('error',e=>__mainErrors.push(e.message));addEventListener('unhandledrejection',e=>__mainErrors.push(String(e.reason)));return window.csgclawDesktop.getRuntimeInfo().then(r=>{if(r.appVersion!=='0.8.0-win7.dev.5')throw new Error(JSON.stringify(r));return r})"
+  },
+  {
+    "action": "script",
+    "name": "new-isolated-chat",
+    "script": "return fetch('/api/v1/rooms/',{method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(15000),body:JSON.stringify({title:'Win7 latest main verification',creator_id:'user-admin',member_ids:['user-win7'],is_direct:true,task_session:true,client_request_id:crypto.randomUUID(),locale:'zh'})}).then(async r=>{const room=await r.json();if(!r.ok)throw new Error(JSON.stringify(room));window.__mainRoom=room.id;location.hash='#/dms/'+room.id;return {roomID:room.id}})"
+  },
+  {
+    "action": "wait",
+    "name": "composer-ready",
+    "timeout": 120,
+    "script": "return !!document.querySelector('.composer-editor')&&!document.querySelector('.composer-working-stop')"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-editor"
+  },
+  {
+    "action": "insertText",
+    "text": "请只执行一次 exec_command，用 PowerShell 输出 [Environment]::OSVersion.VersionString、Get-Location，再 Write-Output WIN7_MAIN_CHAIN_OK。成功后只回复 WIN7_MAIN_CHAIN_OK。不要执行其他探索或工具。"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-send-button"
+  },
+  {
+    "action": "wait",
+    "name": "initial-progress-beside-agent-avatar",
+    "timeout": 120,
+    "script": "const p=document.querySelector('.message-row:not(.own) [data-turn-id]');return !!p?.closest('.message-row')?.querySelector('.message-avatar-status')&&!document.querySelector('.composer > .composer-working')"
+  },
+  {
+    "action": "script",
+    "name": "progress-and-stop-placement",
+    "script": "const p=document.querySelector('.message-row:not(.own) [data-turn-id]');const stop=document.querySelector('.composer-working-stop');if(!p||!stop||!p.closest('.message-row')?.contains(stop)||document.querySelector('.composer > .composer-working'))throw new Error('progress or stop control remained above composer');return {progress:p.textContent,avatar:true,stopInMessage:true,composerDraft:document.querySelector('.composer-editor')?.innerText}"
+  },
+  {
+    "action": "screenshot",
+    "path": "win7-main-initial-progress.png"
+  },
+  {
+    "action": "wait",
+    "name": "real-model-shell-and-final-reply",
+    "timeout": 360,
+    "script": "return fetch('/api/v1/messages/?room_id='+window.__mainRoom,{signal:AbortSignal.timeout(10000)}).then(r=>r.json()).then(ms=>{const m=ms.find(m=>m.sender_id==='user-win7'&&m.metadata?.csgclaw?.turn_progress?.status==='succeeded'&&m.content.includes('WIN7_MAIN_CHAIN_OK'));window.__mainReply=m;return !!m?.metadata.csgclaw.turn_progress.items.some(i=>i.tool?.exit_code===0&&i.tool.output?.includes('WIN7_MAIN_CHAIN_OK'))})"
+  },
+  {
+    "action": "wait",
+    "name": "composer-recovered",
+    "timeout": 60,
+    "script": "return !document.querySelector('.composer-working-stop')&&!document.querySelector('.composer-send-button.is-stopping')"
+  },
+  {
+    "action": "script",
+    "name": "native-chain-evidence",
+    "script": "if(__mainErrors.length)throw new Error(JSON.stringify(__mainErrors));const m=__mainReply;return {room:__mainRoom,status:m.metadata.csgclaw.turn_progress.status,reply:m.content,errors:__mainErrors,mode:document.querySelector('button[aria-label=\"运行模式\"]')?.innerText,tools:m.metadata.csgclaw.turn_progress.items.filter(i=>i.tool).map(i=>({name:i.tool.name,status:i.tool.status,exit:i.tool.exit_code,output:i.tool.output}))}"
+  },
+  {
+    "action": "screenshot",
+    "path": "win7-main-reply-succeeded.png"
+  }
+]

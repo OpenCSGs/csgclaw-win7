@@ -1,0 +1,38 @@
+{
+  "scope": "Windows 10/11 Go + Codex baseline; Electron excluded; external services conditional; DSH/Node not natively validated",
+  "win7": {
+    "native_api_unique_tests": 92,
+    "native_api_executions": 95,
+    "native_api_skips": 0,
+    "native_terminal_entry_tests": 2,
+    "native_runtime_lifecycle_cases": 5,
+    "preview_formats": 12,
+    "browser_routes": 10,
+    "real_model_cli_chain": "passed; workspace default standard mode; CLI exit 0; final reply rendered",
+    "running_server_pid": 4136,
+    "snapshot": "win7-csgclaw-full-features-20261017"
+  },
+  "host": {
+    "go_all": "passed",
+    "go_race": "passed for API/processgroup/Codex/delivery",
+    "web_check": "passed: 1626 tests, 215 files",
+    "make": "passed",
+    "rust_full_initial": {
+      "run": 15406,
+      "passed": 15397,
+      "failed": 9,
+      "skipped": 45,
+      "flaky_passes": 2
+    },
+    "rust_followups": [
+      "137 of 138 affected checks passed, final skill pagination fixture was corrected separately",
+      "remaining skill pagination check passed",
+      "all 5 tool parallelism checks passed with runner resource isolation under 4 test threads"
+    ],
+    "rust_static_checks": "passed: scoped just fix; just fmt"
+  },
+  "source_patches": {
+    "codex-win7.patch": "c7d7927c1344bda05f8c81cce719a33c52e4b6e3901cf3728db281985d4a0342",
+    "csgclaw-win7.patch": "925fb2671f0bb346c446523bfd8d60894b514a51e2d35e7725b07a15ddfa9146"
+  }
+}
