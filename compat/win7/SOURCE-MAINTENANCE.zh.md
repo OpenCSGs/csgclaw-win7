@@ -1,0 +1,49 @@
+# Win7 与主仓库的维护约定
+
+当前业务基线为上游 main `6f9bdd6043d4904ecc0cad482ae699c3f45f8e2a`。
+Git 历史保留主仓库 main 的原始提交时间线，Win7 提交线性追加在选定的上游基线之后。
+本次将完整 Win7 适配整理为一个 `feat(win7)` 提交，不创建 Win7 同步 merge commit。
+仓库根目录的业务源码、依赖和工作流与该上游基线完全一致。
+
+## 改动范围
+
+所有 Win7 专属代码、补丁、配置、构建脚本、测试和说明仅在 `compat/win7/` 中维护。
+完整定制 Codex 源码位于 `compat/win7/codex/`，保留原始目录结构和许可证。
+兼容构建将补丁应用到忽略的 `.cache/win7/csgclaw`，从同一仓库提交导出 `.cache/win7/codex`。
+生成目录不是源码维护入口，不能直接修改它交付功能。
+`patches/codex.patch` 和 `patches/previous-desktop-port.patch` 仅作为来源记录，不重复应用。
+
+Win7 专属差异包括 Job breakaway、WinPTY 终端、专用 Go 工具链、Electron 22、PowerShell 2、Chromium 108 以及打包和原生测试夹具。
+头像等待状态与取消、工作租约、进程退出清理等通用修复已由主仓库 PR #721、#722 合入，直接继承上游实现。
+新的跨平台修复应在主仓库单独评审和合并，再同步到本仓库。
+通用恢复、重建入口和连接器修复已由主仓库 PR #739 合入，直接继承该上游实现。
+对应的三个临时补丁、engine overlay 和重复的服务关闭测试改动已移除，仅保留仍有独立作用的适配。
+后续通用修复合入上游后同样核对并移除重复适配，补丁或 overlay 冲突必须停止构建。
+
+## 提交和上游同步
+
+所有自行创建的提交必须使用 `(win7)` scope，例如 `fix(win7): ...`、`feat(win7): ...` 和 `build(win7): ...`。
+引入的上游提交保留原始消息和 SHA，不改写为 Win7 提交。
+
+1. 在本仓库获取 `upstream/main`，检查选定版本与当前适配的差异。
+2. 保留可恢复的历史备份，仅将 Win7 提交 rebase 到选定的上游 main 之后，禁止创建同步 merge commit。
+   上游提交的 SHA 和消息保持不变；仅在明确要求时将 Win7 提交整理为一个提交。
+3. 根目录文件保持与选定的上游版本一致，仅在 `compat/win7/` 解决适配冲突。
+4. 更新 `sources.lock.json` 的 CSGClaw 基线和当前说明，重新准备源码并检查补丁与校验值。
+5. 执行受影响的检查；运行时或构建变化须完成对应 Win7 原生桌面验收后，才能声明兼容通过。
+
+补丁上下文或哈希冲突必须明确失败，不能静默丢弃适配。
+CSGClaw 升级不会自动升级定制 Codex、Electron 或 WinPTY；替换运行时须重新审核来源、哈希和原生结果。
+发布目标是 `origin` 指向的 `OpenCSGs/csgclaw-win7`，不得误推主仓库。
+未经明确授权不重写共享历史，重写前保留可恢复备份，推送使用核对过的 force-with-lease。
+
+## 历史结果与备份
+
+已有报告和验收 JSON 继续记录其原始版本和测试范围，不代表新基线重新通过全部原生验收。
+本次整理同步上游 PR #720 的每轮用量和模型展示，以及 PR #721、#722 的通用修复。
+Win7 专属补丁和定制 Codex 未修改，旧原生验收记录不覆盖新增的上游功能。
+整理前的全部 Git refs 和完整历史保存于本地 `.cache/win7/history-cleanup-20261019/before.bundle`。
+旧发布标签及其对应产物保留用于追溯，不移动标签或改写历史验收记录。
+
+本轮升级前的两仓库提交另存于各自的 `refs/backup/win7-rebase-20261020-before`。
+Win7 完整备份位于本地 `.cache/win7/rebase-main-20261020/before.bundle`。
