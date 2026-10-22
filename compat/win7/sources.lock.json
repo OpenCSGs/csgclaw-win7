@@ -1,7 +1,7 @@
 {
   "csgclaw": {
     "repository": "https://github.com/OpenCSGs/csgclaw.git",
-    "commit": "cae4fdcbc52f644b0dc4913d485d57c010df3228"
+    "commit": "e67bb26666a996ae145d81cd623d7fefdfc47f17"
   },
   "codex": {
     "repository": "https://github.com/openai/codex.git",
@@ -11,7 +11,7 @@
   },
   "previous_port_commit": "edf39aba2e307766913e97ddcf1a0cbaa21463ed",
   "patches": {
-    "csgclaw.patch": "03a34dfebaf0f7283e874bf96c46378f32aa56405e7975a48d2847acd0e1cbe8",
+    "csgclaw.patch": "a95733130ee427aab3c3150c5cac2731f55a9910cad6051e16e908e32f556169",
     "codex.patch": "c7d7927c1344bda05f8c81cce719a33c52e4b6e3901cf3728db281985d4a0342",
     "previous-desktop-port.patch": "27e44e27c96fb8004eb7690286305d14002d037b167a947a33e6305463491c04",
     "test-stability.patch": "155eda8954af363fdfc64846795ae0589a7b86a65998211fd4af1db30a4731e9",
@@ -92,7 +92,7 @@
     "compiler": "NSIS",
     "version": "3.13"
   },
-  "app_version": "0.8.0-win7.dev.15",
+  "app_version": "0.8.0-win7.dev.20",
   "emoji_font": {
     "repository": "https://github.com/googlefonts/noto-emoji",
     "commit": "e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e",

@@ -1,17 +1,16 @@
 diff --git a/internal/api/workspace_open.go b/internal/api/workspace_open.go
-index 9ab440a5..c1f9ce1e 100644
 --- a/internal/api/workspace_open.go
 +++ b/internal/api/workspace_open.go
-@@ -63,7 +63,7 @@ func (h *Handler) workspaceOpenTargets(r *http.Request) []string {
- 		}
+@@ -55,7 +55,7 @@
+ 		targets = append(targets, workspaceOpenTarget{ID: "system"}, workspaceOpenTarget{ID: "terminal"})
  	case "windows":
- 		targets = append(targets, "system", "notepad")
+ 		targets = append(targets, workspaceOpenTarget{ID: "system"})
 -		if _, err := exec.LookPath("wt.exe"); err == nil {
 +		if windowsWorkspaceTerminalAvailable() {
- 			targets = append(targets, "terminal")
+ 			targets = append(targets, workspaceOpenTarget{ID: "terminal"})
  		}
  	case "linux":
-@@ -223,6 +223,12 @@ func workspaceOpenCommand(goos, path, target string, directory bool) (string, []
+@@ -221,6 +221,12 @@
  }
  
  func openWorkspacePath(ctx context.Context, path, target string, directory bool) error {
