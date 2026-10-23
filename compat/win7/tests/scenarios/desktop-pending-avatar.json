@@ -1,0 +1,58 @@
+[
+  {
+    "action": "start",
+    "name": "attach-dev4-desktop"
+  },
+  {
+    "action": "script",
+    "name": "version-and-login",
+    "script": "return Promise.all([window.csgclawDesktop.getRuntimeInfo(),fetch('/api/v1/auth/status',{signal:AbortSignal.timeout(15000)}).then(r=>r.json())]).then(([r,a])=>{if(r.appVersion!=='0.8.0-win7.dev.4')throw Error('Unexpected app version');return {version:r.appVersion,authenticated:a.authenticated}})"
+  },
+  {
+    "action": "script",
+    "name": "isolated-pending-reply-room",
+    "script": "window.__pendingReturnRoute=location.hash;return fetch('/api/v1/rooms/',{method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(15000),body:JSON.stringify({title:'Win7 pending avatar regression',creator_id:'user-admin',member_ids:['user-win7'],is_direct:true,task_session:true,client_request_id:crypto.randomUUID(),locale:'zh'})}).then(async r=>{const room=await r.json();if(!r.ok)throw Error('room HTTP '+r.status);window.__pendingRoom=room.id;location.hash='#/dms/'+room.id;return {room:room.id}})"
+  },
+  {
+    "action": "wait",
+    "name": "room-ready",
+    "timeout": 90,
+    "script": "return location.hash.endsWith(window.__pendingRoom)&&!!document.querySelector('.composer-editor')"
+  },
+  {
+    "action": "script",
+    "name": "lease-before-transcript",
+    "script": "window.__pendingLease=crypto.randomUUID();window.__pendingLeaseURL='/api/v1/channels/csgclaw/participants/pt-win7/work-leases/'+window.__pendingLease;setTimeout(()=>fetch(window.__pendingLeaseURL,{method:'DELETE'}),45000);return fetch(window.__pendingLeaseURL,{method:'PUT',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(15000),body:JSON.stringify({room_id:window.__pendingRoom,request_id:'pending-avatar-native-test',kind:'agent_turn',ttl_seconds:60})}).then(r=>{if(!r.ok)throw Error('lease HTTP '+r.status);return {leaseStarted:true}})"
+  },
+  {
+    "action": "wait",
+    "name": "pending-reply-in-timeline",
+    "timeout": 45,
+    "script": "return !!document.querySelector('.messages .message-row[data-work-lease-id] .avatar')&&!document.querySelector('.composer > .composer-working')"
+  },
+  {
+    "action": "script",
+    "name": "pending-avatar-native-evidence",
+    "script": "const row=document.querySelector('[data-work-lease-id]');const avatar=row?.querySelector('.avatar');const card=row?.querySelector('.message-card');const dot=row?.querySelector('.message-avatar-status');if(!row||!avatar||!card||!dot||document.querySelector('.composer > .composer-working'))throw Error('pending reply remained above composer');const a=avatar.getBoundingClientRect(),c=card.getBoundingClientRect(),d=dot.getBoundingClientRect();if(a.left>=c.left||d.right>a.right+1||d.bottom>a.bottom+1)throw Error('avatar layout invalid');return {pendingAvatarRows:document.querySelectorAll('[data-work-lease-id]').length,oldComposerFallback:false,avatarLeft:true,dotAnchored:true,hasStructuredProgress:!!row.querySelector('[data-turn-id]'),phase:row.innerText}"
+  },
+  {
+    "action": "screenshot",
+    "path": "win7-dev4-pending-avatar.png"
+  },
+  {
+    "action": "script",
+    "name": "release-owned-test-lease",
+    "script": "window.__pendingCleanup=null;fetch(window.__pendingLeaseURL,{method:'DELETE',signal:AbortSignal.timeout(15000)}).then(r=>window.__pendingCleanup=r.status);return {cleanupRequested:true}"
+  },
+  {
+    "action": "wait",
+    "name": "pending-row-released",
+    "timeout": 60,
+    "script": "return window.__pendingCleanup===204&&!document.querySelector('[data-work-lease-id]')"
+  },
+  {
+    "action": "script",
+    "name": "restore-review-window",
+    "script": "location.hash=window.__pendingReturnRoute;void window.csgclawDesktop.showWindow();return {testLeaseReleased:window.__pendingCleanup===204}"
+  }
+]

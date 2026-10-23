@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-20",
+  "version": "0.8.0-win7.dev.8",
+  "source_commit": "37b2f6900af965352511cb2178770f6b2a7063b3",
+  "source_dirty": true,
+  "upstream_commit": "762f3d981832654d827bee48764fe5bec15f74d1",
+  "package_sha256": "7371d8f657f2f8c1735859fafb462328e65713d0932776fe6cf377d57ce7a520",
+  "window_close": "close-to-tray restored; tray Quit retains full shutdown",
+  "automatic_recovery": {
+    "task_id": "manager-dev8-recovery-0602e5bc411a",
+    "exit": 0,
+    "duration": "2m18.1474609s"
+  },
+  "installed_files": {
+    "task_id": "verify-final-dev8-d1acd0388455",
+    "exit": 0,
+    "duration": "33.9091796s"
+  },
+  "native_recovery_policy": {
+    "task_id": "manager-engine-bounded-tests-tests-800f17e7436c",
+    "exit": 0,
+    "duration": "2m24.8427734s"
+  },
+  "native_filesystem": {
+    "task_id": "manager-skills-current-tests-tests-3b7331d5528d",
+    "exit": 0,
+    "duration": "12.4580078s"
+  },
+  "native_sandbox_and_cleanup": {
+    "task_id": "manager-recovery-native-runtime-lifecycle-deafdb22ccc7",
+    "exit": 0,
+    "duration": "2m7.8623047s"
+  },
+  "real_model_reply": "WIN7_MANAGER_AUTO_RECOVERY_OK",
+  "model_dependency": "real DeepSeek through task-owned host relay; credentials stay on host",
+  "not_passed": {
+    "consecutive_profile_saves": "model availability validation timed out; not counted as passed"
+  },
+  "remote_uu": "original failure observed; remote machine not upgraded",
+  "initial_no_models_hypothesis": "possible, not proven for the remote machine"
+}

@@ -1,0 +1,4 @@
+patches/*.patch -whitespace
+
+# Keep imported upstream source and whitespace-sensitive fixtures byte-for-byte.
+codex/** -whitespace

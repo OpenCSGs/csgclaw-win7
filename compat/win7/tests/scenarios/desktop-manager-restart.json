@@ -1,0 +1,124 @@
+[
+  {
+    "action": "start",
+    "name": "attach-installed-manager"
+  },
+  {
+    "action": "wait",
+    "name": "configured-manager-online",
+    "timeout": 120,
+    "script": "return fetch('/api/v1/agents/agent-manager').then(r=>r.json()).then(a=>a.runtime?.state==='running'&&!a.model_config?.env_restart_required)"
+  },
+  {
+    "action": "script",
+    "name": "record-initial-session",
+    "script": "return fetch('/api/v1/agents/agent-manager').then(r=>r.json()).then(a=>window.__previousManagerSession=a.runtime.sandbox_id)"
+  },
+  {
+    "action": "click",
+    "selector": "button[aria-label='智能体']"
+  },
+  {
+    "action": "wait",
+    "name": "agent-list",
+    "script": "return location.hash==='#/agents'&&Array.from(document.querySelectorAll('main button')).some(e=>e.textContent.includes('manager')&&e.textContent.includes('通用'))"
+  },
+  {
+    "action": "script",
+    "name": "open-manager",
+    "script": "Array.from(document.querySelectorAll('main button')).find(e=>e.textContent.includes('manager')&&e.textContent.includes('通用')).click();return true"
+  },
+  {
+    "action": "wait",
+    "name": "profile-pane",
+    "script": "return !!document.querySelector('button[aria-label=\"推理策略\"]')"
+  },
+  {
+    "action": "click",
+    "selector": "button[aria-label='推理策略']"
+  },
+  {
+    "action": "script",
+    "name": "change-first-reasoning-setting",
+    "script": "const opts=Array.from(document.querySelectorAll('[role=option]'));const selected=document.querySelector('button[aria-label=\"推理策略\"]')?.textContent||'';const text=selected.includes('中')?'低':'中';const target=opts.find(e=>e.textContent.trim()===text);if(!target)throw Error('reasoning option missing');window.__expectedReasoning=text===\"中\"?\"medium\":\"low\";target.click();return text"
+  },
+  {
+    "action": "wait",
+    "name": "save-button-visible",
+    "timeout": 45,
+    "script": "return Array.from(document.querySelectorAll('button')).some(e=>e.textContent.trim()==='保存更改'&&!e.disabled)"
+  },
+  {
+    "action": "clickText",
+    "selector": "button",
+    "text": "保存更改"
+  },
+  {
+    "action": "wait",
+    "name": "save-1-response",
+    "timeout": 180,
+    "script": "const error=document.querySelector('.form-error')?.textContent;if(error)throw Error(error);return fetch('/api/v1/agents/agent-manager').then(r=>r.json()).then(a=>{window.__lastSavedManager={runtime:a.runtime,restart:!!a.model_config?.env_restart_required,reasoning:a.model_config?.reasoning_effort||''};return a.runtime?.state==='running'&&!a.model_config?.env_restart_required&&(a.model_config?.reasoning_effort||'')===window.__expectedReasoning&&a.runtime.sandbox_id!==window.__previousManagerSession})"
+  },
+  {
+    "action": "script",
+    "name": "save-1-restarted",
+    "script": "window.__previousManagerSession=window.__lastSavedManager.runtime.sandbox_id;return window.__lastSavedManager"
+  },
+  {
+    "action": "wait",
+    "name": "save-1-online-badges",
+    "timeout": 90,
+    "script": "const b=Array.from(document.querySelectorAll('.status-pill')).map(e=>e.textContent);return b.includes('在线')&&!b.includes('需要重建')"
+  },
+  {
+    "action": "click",
+    "selector": "button[aria-label='推理策略']"
+  },
+  {
+    "action": "clickText",
+    "selector": "[role=option]",
+    "text": "模型默认"
+  },
+  {
+    "action": "script",
+    "name": "expect-default-reasoning",
+    "script": "window.__expectedReasoning='';return true"
+  },
+  {
+    "action": "wait",
+    "name": "save-button-visible",
+    "timeout": 45,
+    "script": "return Array.from(document.querySelectorAll('button')).some(e=>e.textContent.trim()==='保存更改'&&!e.disabled)"
+  },
+  {
+    "action": "clickText",
+    "selector": "button",
+    "text": "保存更改"
+  },
+  {
+    "action": "wait",
+    "name": "save-2-response",
+    "timeout": 180,
+    "script": "const error=document.querySelector('.form-error')?.textContent;if(error)throw Error(error);return fetch('/api/v1/agents/agent-manager').then(r=>r.json()).then(a=>{window.__lastSavedManager={runtime:a.runtime,restart:!!a.model_config?.env_restart_required,reasoning:a.model_config?.reasoning_effort||''};return a.runtime?.state==='running'&&!a.model_config?.env_restart_required&&(a.model_config?.reasoning_effort||'')===window.__expectedReasoning&&a.runtime.sandbox_id!==window.__previousManagerSession})"
+  },
+  {
+    "action": "script",
+    "name": "save-2-restarted",
+    "script": "window.__previousManagerSession=window.__lastSavedManager.runtime.sandbox_id;return window.__lastSavedManager"
+  },
+  {
+    "action": "wait",
+    "name": "save-2-online-badges",
+    "timeout": 90,
+    "script": "const b=Array.from(document.querySelectorAll('.status-pill')).map(e=>e.textContent);return b.includes('在线')&&!b.includes('需要重建')"
+  },
+  {
+    "action": "script",
+    "name": "final-manager-state",
+    "script": "return {badges:Array.from(document.querySelectorAll('.status-pill')).map(e=>e.textContent),last:window.__lastSavedManager}"
+  },
+  {
+    "action": "screenshot",
+    "path": "win7-manager-restart-passed.png"
+  }
+]
