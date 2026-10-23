@@ -1,0 +1,102 @@
+[
+  {
+    "action": "start",
+    "name": "attach-fixed-desktop"
+  },
+  {
+    "action": "wait",
+    "name": "desktop-bridge-and-page",
+    "timeout": 120,
+    "script": "return !!window.csgclawDesktop && document.body.innerText.length>100"
+  },
+  {
+    "action": "rememberWindow",
+    "name": "main-app-target"
+  },
+  {
+    "action": "script",
+    "name": "desktop-runtime-versions",
+    "script": "return window.csgclawDesktop.getRuntimeInfo()"
+  },
+  {
+    "action": "script",
+    "name": "capture-renderer-errors",
+    "script": "window.__desktopErrors=[];addEventListener('error',e=>__desktopErrors.push(e.message));addEventListener('unhandledrejection',e=>__desktopErrors.push(String(e.reason)));location.hash='#/dms/room-1792147489164062500';return true"
+  },
+  {
+    "action": "wait",
+    "name": "direct-chat",
+    "script": "return !!document.querySelector(\".composer-editor\")"
+  },
+  {
+    "action": "click",
+    "selector": ".chat-tools-actions button[aria-label=\"浏览器\"]"
+  },
+  {
+    "action": "wait",
+    "name": "native-browser-input",
+    "script": "return !!document.querySelector(\"input[aria-label=网页地址]\")"
+  },
+  {
+    "action": "keys",
+    "selector": "input[aria-label=\"网页地址\"]",
+    "text": "ahttp://10.0.2.2:48817/electron-browser-home.html"
+  },
+  {
+    "action": "remoteWindow",
+    "name": "actual-embedded-browser-target",
+    "text": "electron-browser-home.html"
+  },
+  {
+    "action": "wait",
+    "name": "remote-page-rendered",
+    "script": "return document.body.innerText.includes(\"WIN7_BROWSER_HOME\")"
+  },
+  {
+    "action": "script",
+    "name": "remote-page-isolation",
+    "script": "if(typeof process!==\"undefined\"||typeof require!==\"undefined\"||window.csgclawDesktop)throw new Error(\"remote page has privileged APIs\");return fetch(\"http://127.0.0.1:18080/api/v1/bootstrap\").then(()=>{throw new Error(\"remote page reached privileged origin\")},()=>({node:false,bridge:false,applicationOriginBlocked:true}))"
+  },
+  {
+    "action": "click",
+    "selector": "#next"
+  },
+  {
+    "action": "wait",
+    "name": "embedded-browser-navigation",
+    "script": "return document.body.innerText.includes(\"WIN7_BROWSER_NEXT\")"
+  },
+  {
+    "action": "mainWindow"
+  },
+  {
+    "action": "wait",
+    "name": "back-button-enabled",
+    "script": "return !!document.querySelector(\"button[aria-label=后退]:not([disabled])\")"
+  },
+  {
+    "action": "click",
+    "selector": "button[aria-label=\"后退\"]"
+  },
+  {
+    "action": "remoteWindow",
+    "text": "electron-browser-home.html"
+  },
+  {
+    "action": "wait",
+    "name": "back-history",
+    "script": "return document.body.innerText.includes(\"WIN7_BROWSER_HOME\")"
+  },
+  {
+    "action": "mainWindow"
+  },
+  {
+    "action": "script",
+    "name": "main-app-errors",
+    "script": "if(__desktopErrors.length)throw new Error(JSON.stringify(__desktopErrors));return {errors:__desktopErrors,browserError:document.querySelector(\".chat-browser-native [role=alert]\")?.innerText||null}"
+  },
+  {
+    "action": "screenshot",
+    "path": "electron-browser-green.png"
+  }
+]
