@@ -1,0 +1,20 @@
+--- a/internal/runtime/codex/runtime.go
++++ b/internal/runtime/codex/runtime.go
+@@ -1662,7 +1662,7 @@
+ 	if r.deps.ReadFile != nil {
+ 		return r.deps.ReadFile(path)
+ 	}
+-	return os.ReadFile(path)
++	return readRuntimeFile(path)
+ }
+ 
+ func (r *Runtime) stat(path string) (os.FileInfo, error) {
+@@ -1676,7 +1676,7 @@
+ 	if r.deps.WriteFile != nil {
+ 		return r.deps.WriteFile(path, data, mode)
+ 	}
+-	return os.WriteFile(path, data, mode)
++	return writeRuntimeFile(path, data, mode)
+ }
+ 
+ func (r *Runtime) removeAll(path string) error {
