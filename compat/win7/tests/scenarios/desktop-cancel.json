@@ -1,0 +1,114 @@
+[
+  {
+    "action": "start",
+    "name": "fresh-sequential-desktop-connection"
+  },
+  {
+    "action": "script",
+    "name": "initialize-renderer-error-capture",
+    "script": "window.__desktopErrors=[];window.addEventListener(\"error\",e=>__desktopErrors.push(e.message));window.addEventListener(\"unhandledrejection\",e=>__desktopErrors.push(String(e.reason)));return true"
+  },
+  {
+    "action": "script",
+    "name": "isolated-task-conversation",
+    "script": "return fetch('/api/v1/rooms/',{method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(15000),body:JSON.stringify({title:'Win7 desktop cancel acceptance',creator_id:'user-admin',member_ids:['user-win7'],is_direct:true,task_session:true,client_request_id:crypto.randomUUID(),locale:'zh'})}).then(async r=>{const room=await r.json();if(!r.ok)throw new Error(JSON.stringify(room));window.__desktopCancelRoomId=room.id;location.hash='#/dms/'+room.id;return {roomID:room.id}})"
+  },
+  {
+    "action": "wait",
+    "name": "new-conversation-composer",
+    "timeout": 120,
+    "script": "return !!document.querySelector(\".composer-editor\")&&!document.querySelector(\".composer-working-stop\")"
+  },
+  {
+    "action": "rememberWindow"
+  },
+  {
+    "action": "prepareTree",
+    "path": "C:\\CSGClawTest\\desktop-profile\\.csgclaw\\agents\\agent-win7\\.codex\\workspace\\webdriver-desktop-cancel-clean-pids.json"
+  },
+  {
+    "action": "clickIfPresent",
+    "selector": ".chat-side-layout-actions button[aria-label=\"收起侧栏\"]"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-editor"
+  },
+  {
+    "action": "keys",
+    "selector": ".composer-editor",
+    "text": "a"
+  },
+  {
+    "action": "insertText",
+    "text": "请验收停止按钮。调用 exec_command，tty=true、yield_time_ms=30000，执行 & 'C:\\CSGClawTest\\compat\\desktop-tree.exe' 'webdriver-desktop-cancel-clean-pids.json'。我会点击停止，不要主动结束，若返回会话ID请持续write_stdin等待。"
+  },
+  {
+    "action": "wait",
+    "name": "cancel-prompt-ready",
+    "script": "return document.querySelector(\".composer-editor\")?.innerText.includes(\"webdriver-desktop-cancel-clean-pids.json\")&&!document.querySelector(\".composer-send-button\")?.disabled"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-send-button"
+  },
+  {
+    "action": "trackCurrentTree",
+    "path": "C:\\CSGClawTest\\desktop-profile\\.csgclaw\\agents\\agent-win7\\.codex\\workspace\\webdriver-desktop-cancel-clean-pids.json",
+    "text": "C:\\CSGClawTest\\compat\\desktop-tree.exe",
+    "name": "authenticate-live-parent-and-child",
+    "script": "return fetch('/api/v1/messages/?room_id='+window.__desktopCancelRoomId,{signal:AbortSignal.timeout(10000)}).then(r=>r.json()).then(ms=>{const u=ms.filter(m=>m.sender_id==='user-admin'&&m.content.includes('webdriver-desktop-cancel-clean-pids.json')).pop();const m=ms.find(m=>m.metadata?.codex?.source_message_id===u?.id&&m.sender_id==='user-win7');const text=m?.metadata?.csgclaw?.turn_progress?.items?.map(x=>x.tool?.output||'').join('\\n')||'';const p=text.match(/WIN7_WEBDRIVER_PROCESS_TREE_READY\\s*\\[(\\d+)\\s+(\\d+)\\]/);return p?[Number(p[1]),Number(p[2])]:null})",
+    "timeout": 300
+  },
+  {
+    "action": "wait",
+    "name": "visible-stop-control",
+    "timeout": 120,
+    "script": "return !!document.querySelector(\".composer-working-stop:not([disabled])\")"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-working-stop:not([disabled])"
+  },
+  {
+    "action": "assertChildrenStopped",
+    "name": "desktop-stop-reaped-the-tree"
+  },
+  {
+    "action": "wait",
+    "name": "persisted-canceled-without-runtime-error",
+    "script": "return fetch('/api/v1/messages/?room_id='+window.__desktopCancelRoomId,{signal:AbortSignal.timeout(10000)}).then(r=>r.json()).then(ms=>{const u=ms.filter(m=>m.sender_id==='user-admin'&&m.content.includes('webdriver-desktop-cancel-clean-pids.json')).pop();const m=ms.find(m=>m.metadata?.codex?.source_message_id===u?.id&&m.sender_id==='user-win7');return m?.metadata?.csgclaw?.turn_progress?.status==='canceled'&&!m.metadata.csgclaw.runtime_error&&!m.metadata.csgclaw.turn_progress.error})"
+  },
+  {
+    "action": "wait",
+    "name": "composer-idle",
+    "script": "return !document.querySelector(\".composer-working-stop\")"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-editor"
+  },
+  {
+    "action": "insertText",
+    "text": "请只回复 WIN7_DESKTOP_CANCEL_RECOVERED，不要调用工具。"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-send-button"
+  },
+  {
+    "action": "wait",
+    "name": "same-session-recovery",
+    "timeout": 240,
+    "script": "return fetch('/api/v1/messages/?room_id='+window.__desktopCancelRoomId,{signal:AbortSignal.timeout(10000)}).then(r=>r.json()).then(ms=>ms.some(m=>m.sender_id==='user-win7'&&m.content.includes('WIN7_DESKTOP_CANCEL_RECOVERED')&&m.metadata?.csgclaw?.turn_progress?.status==='succeeded'))"
+  },
+  {
+    "action": "script",
+    "name": "mode-and-renderer-errors",
+    "script": "if(__desktopErrors.length)throw new Error(JSON.stringify(__desktopErrors));return {mode:document.querySelector(\"button[aria-label=运行模式]\")?.innerText,errors:__desktopErrors}"
+  },
+  {
+    "action": "screenshot",
+    "path": "electron-cancel-recovered.png"
+  }
+]

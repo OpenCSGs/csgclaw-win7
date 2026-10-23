@@ -1,0 +1,21 @@
+--- a/internal/runtime/codex/runtime.go
++++ b/internal/runtime/codex/runtime.go
+@@ -1295,13 +1295,16 @@
+ 	sourceRoot := pathpkg.Join(templateembed.CodexManagerRoot, templateembed.SkillsDirName)
+ 	targetRoot := filepath.Join(runtimeCodexHome, "skills")
+ 	for _, name := range []string{"basics", "agent-teams"} {
+-		if err := r.removeAll(filepath.Join(targetRoot, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
++		if err := r.removeManagerSkillDirectory(filepath.Join(targetRoot, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+ 			return fmt.Errorf("remove legacy manager codex skill %q: %w", name, err)
+ 		}
+ 	}
+ 	for _, name := range skillNames {
+ 		target := filepath.Join(targetRoot, name)
+-		if err := r.removeAll(target); err != nil && !errors.Is(err, os.ErrNotExist) {
++		if r.managerSkillDirectoryMatches(source, pathpkg.Join(sourceRoot, name), target) {
++			continue
++		}
++		if err := r.removeManagerSkillDirectory(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+ 			return fmt.Errorf("remove manager codex template skill %q: %w", name, err)
+ 		}
+ 		if err := r.copyEmbeddedDir(source, pathpkg.Join(sourceRoot, name), target); err != nil {

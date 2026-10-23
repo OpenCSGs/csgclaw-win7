@@ -1,0 +1,424 @@
+[
+  {
+    "action": "mainWindow"
+  },
+  {
+    "action": "script",
+    "name": "preview-monitor",
+    "script": "window.__win7Errors=[];window.addEventListener('error',e=>window.__win7Errors.push(e.message));window.addEventListener('unhandledrejection',e=>window.__win7Errors.push(String(e.reason)));window.__activePreview=()=>document.querySelector('.chat-side-tab-body:not([hidden]) .document-preview-panel');return {withResolvers:typeof Promise.withResolvers,ua:navigator.userAgent}"
+  },
+  {
+    "action": "click",
+    "selector": ".chat-tools-actions button[aria-label=\"文件\"]"
+  },
+  {
+    "action": "clickText",
+    "selector": ".chat-files-sources [role=tab]",
+    "text": "工作区文件"
+  },
+  {
+    "action": "wait",
+    "name": "synthetic-preview-directory",
+    "script": "return Array.from(document.querySelectorAll('.chat-files-open')).some(e=>e.textContent.trim()==='win7-feature-previews')"
+  },
+  {
+    "action": "clickText",
+    "selector": ".chat-files-open",
+    "text": "win7-feature-previews"
+  },
+  {
+    "action": "wait",
+    "name": "synthetic-preview-files",
+    "script": "return document.querySelectorAll(\".chat-files-open\").length>=12"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.docx\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "docx preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.textContent.includes(\"WIN7_DOCX_PREVIEW_OK\")) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "docx actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.textContent.includes(\"WIN7_DOCX_PREVIEW_OK\")))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-docx.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.xlsx\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "xlsx preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.textContent.includes(\"WIN7_XLSX_PREVIEW_OK\")) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "xlsx actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.textContent.includes(\"WIN7_XLSX_PREVIEW_OK\")))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tab-body:not([hidden]) .document-preview-sheet-tabs button",
+    "Text": "Second"
+  },
+  {
+    "Action": "wait",
+    "Name": "second workbook sheet",
+    "Script": "return window.__activePreview()?.textContent.includes('WIN7_SECOND_SHEET_OK');"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-xlsx.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.pptx\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "pptx preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.textContent.includes(\"WIN7_PPTX_PREVIEW_OK\")) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "pptx actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.textContent.includes(\"WIN7_PPTX_PREVIEW_OK\")))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "script",
+    "Name": "PowerPoint fits actual viewport",
+    "Script": "let p=window.__activePreview(),slide=p.querySelector('.pptx-preview-slide-wrapper'),shell=p.querySelector('.document-preview-ppt-stage-shell');let width=slide.getBoundingClientRect().width,available=shell.clientWidth-40;if(width>available+2)throw new Error('Clipped PPT slide '+width+' available '+available);return {width,available,height:slide.getBoundingClientRect().height};"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .document-preview-powerpoint .document-preview-page-controls button:last-child"
+  },
+  {
+    "Action": "wait",
+    "Name": "second PowerPoint slide",
+    "Script": "return window.__activePreview().querySelector('.document-preview-page-controls button:last-child').disabled;"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-pptx.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.csv\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "csv preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.textContent.includes(\"WIN7_CSV_PREVIEW_OK\")) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "csv actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.textContent.includes(\"WIN7_CSV_PREVIEW_OK\")))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-csv.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.md\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "md preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.textContent.includes(\"WIN7_MARKDOWN_PREVIEW_OK\")) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "md actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.textContent.includes(\"WIN7_MARKDOWN_PREVIEW_OK\")))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-md.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.png\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "png preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.querySelector('img.document-preview-image')?.naturalWidth===320) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "png actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.querySelector('img.document-preview-image')?.naturalWidth===320))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-png.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.wav\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "wav preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.querySelector('audio')?.readyState>=1) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "wav actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.querySelector('audio')?.readyState>=1))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "script",
+    "Name": "wav play real media",
+    "Script": "let m=window.__activePreview().querySelector('audio');m.muted=true;return m.play().then(()=>true);"
+  },
+  {
+    "Action": "wait",
+    "Name": "wav playback clock advanced",
+    "Script": "let m=window.__activePreview().querySelector('audio');return !m.error&&m.currentTime>=0.3;"
+  },
+  {
+    "Action": "script",
+    "Name": "wav decoded media state",
+    "Script": "let m=window.__activePreview().querySelector('audio');m.pause();return {currentTime:m.currentTime,duration:m.duration,readyState:m.readyState,width:m.videoWidth,frames:m.getVideoPlaybackQuality?.().totalVideoFrames};"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-wav.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.mp4\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "mp4 preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.querySelector('video')?.readyState>=2) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "mp4 actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.querySelector('video')?.readyState>=2))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "script",
+    "Name": "mp4 play real media",
+    "Script": "let m=window.__activePreview().querySelector('video');m.muted=true;return m.play().then(()=>true);"
+  },
+  {
+    "Action": "wait",
+    "Name": "mp4 playback clock advanced",
+    "Script": "let m=window.__activePreview().querySelector('video');return !m.error&&m.currentTime>=0.3;"
+  },
+  {
+    "Action": "script",
+    "Name": "mp4 decoded media state",
+    "Script": "let m=window.__activePreview().querySelector('video');m.pause();return {currentTime:m.currentTime,duration:m.duration,readyState:m.readyState,width:m.videoWidth,frames:m.getVideoPlaybackQuality?.().totalVideoFrames};"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-mp4.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.html\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "html preview content",
+    "Timeout": 120,
+    "Script": "return !!(!!window.__activePreview()?.querySelector('iframe')) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "html actual rendering assertion",
+    "Script": "if(!(!!window.__activePreview()?.querySelector('iframe')))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "frame",
+    "Selector": ".chat-side-tab-body:not([hidden]) .document-preview-html-frame"
+  },
+  {
+    "Action": "wait",
+    "Name": "isolated HTML body",
+    "Script": "return document.body.textContent.includes('WIN7_HTML_PREVIEW_OK');"
+  },
+  {
+    "Action": "frame"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .document-preview-panel button[aria-label=\"放大\"]"
+  },
+  {
+    "Action": "script",
+    "Name": "HTML zoom changes physical scale",
+    "Script": "let f=window.__activePreview().querySelector('iframe'),ratio=f.getBoundingClientRect().width/f.clientWidth;if(ratio<1.09)throw new Error('HTML zoom ineffective: '+ratio);if(window.__win7PreviewXSS)throw new Error('Preview script escaped sandbox');return {ratio,transform:getComputedStyle(f).transform};"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .document-preview-panel button[aria-label=\"适合窗口\"]"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-html.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-syntax.go\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "go preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.textContent.includes(\"WIN7_GO_HIGHLIGHT_OK\")) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "go actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.textContent.includes(\"WIN7_GO_HIGHLIGHT_OK\")))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "wait",
+    "Name": "Go syntax colors rendered",
+    "Script": "return !!window.__activePreview().querySelector('.document-preview-shiki[data-language=go] .shiki span[style]');"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-go.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-cp1252.txt\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "cp1252 preview content",
+    "Timeout": 120,
+    "Script": "return !!(window.__activePreview()?.textContent.includes(\"WIN7_CP1252_OK\")) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "cp1252 actual rendering assertion",
+    "Script": "if(!(window.__activePreview()?.textContent.includes(\"WIN7_CP1252_OK\")))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "script",
+    "Name": "Windows-1252 text decoded",
+    "Script": "if(!window.__activePreview().textContent.includes('l’école, le café coûte 10 €'))throw new Error('Legacy text encoding corrupted');return true;"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-cp1252.png"
+  },
+  {
+    "Action": "clickText",
+    "Selector": ".chat-side-tabs [role=\"tab\"]",
+    "Text": "文件"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .chat-files-open[title$=\"win7-preview.pdf\"]"
+  },
+  {
+    "Action": "wait",
+    "Name": "pdf preview content",
+    "Timeout": 120,
+    "Script": "return !!(!!window.__activePreview()?.querySelector('.document-preview-pdf canvas')) || !!document.querySelector('.document-preview-status.is-error') || document.body.innerText.includes('Unexpected Application Error');"
+  },
+  {
+    "Action": "script",
+    "Name": "pdf actual rendering assertion",
+    "Script": "if(!(!!window.__activePreview()?.querySelector('.document-preview-pdf canvas')))throw new Error('Preview failed: '+document.body.innerText.slice(-1500));return {errors:window.__win7Errors,content:window.__activePreview().innerText.slice(0,600)};"
+  },
+  {
+    "Action": "wait",
+    "Name": "PDF page one text layer",
+    "Script": "return window.__activePreview().textContent.includes('WIN7_PDF_PREVIEW_OK_PAGE_1');"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .document-preview-pdf .document-preview-page-controls button:last-child"
+  },
+  {
+    "Action": "wait",
+    "Name": "PDF page two rendered",
+    "Script": "return window.__activePreview().textContent.includes('WIN7_PDF_PREVIEW_OK_PAGE_2') && !!window.__activePreview().querySelector('[data-page-number=\"2\"] canvas');"
+  },
+  {
+    "Action": "click",
+    "Selector": ".chat-side-tab-body:not([hidden]) .document-preview-panel button[aria-label=\"放大\"]"
+  },
+  {
+    "Action": "screenshot",
+    "Path": "webdriver-fixed-preview-pdf.png"
+  }
+]
