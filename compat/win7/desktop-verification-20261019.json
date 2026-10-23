@@ -1,0 +1,500 @@
+{
+  "date": "2026-10-19",
+  "scope": "Native Electron desktop + Go + Codex; DSH/Node separate; external services conditional",
+  "upstream_commit": "80d920a1c95bd7449f56766cceea7bc6cb23e8a7",
+  "integration_commit": "2c01e5b5",
+  "version": "0.8.0-win7.dev.1",
+  "environment": {
+    "os": "Windows 7 Ultimate SP1 x64 6.1.7601",
+    "utm": "5.0.7",
+    "emulation": "x86 TCG on Apple Silicon",
+    "memory_gb": 4,
+    "virtual_cpus": 1,
+    "electron": "22.3.27",
+    "chromium": "108.0.5359.215",
+    "codex": "rust-v0.149.1 + patches/codex.patch",
+    "model": "deepseek-flash via host relay",
+    "default_mode": "standard workspace sandbox"
+  },
+  "host_checks": {
+    "web_files": 215,
+    "web_tests_passed": 1626,
+    "desktop_tests_passed": 103,
+    "go_all": "passed",
+    "race": "passed for API/processgroup/Codex/delivery",
+    "make": "passed"
+  },
+  "installed_files_sha256_verified": 91,
+  "preview_formats": [
+    "docx",
+    "xlsx",
+    "pptx",
+    "csv",
+    "markdown",
+    "png",
+    "wav",
+    "mp4",
+    "html",
+    "go",
+    "windows-1252",
+    "pdf"
+  ],
+  "runtime_lifecycle_cases": [
+    "work",
+    "cancel",
+    "timeout",
+    "background_stop",
+    "owner_crash"
+  ],
+  "native_evidence": [
+    {
+      "log": ".cache/win7/logs/fresh-ui.json",
+      "sha256": "76b646fc47bef6bbbf9c60736a2c4cd115ac5ea46020950c168879a424890bde",
+      "exit": 0,
+      "duration": "36.3242187s",
+      "checks": [
+        {
+          "action": "start",
+          "name": "attach-fresh-user-data",
+          "elapsed": "9.0771484s",
+          "value": {
+            "capabilities": {
+              "acceptInsecureCerts": false,
+              "browserName": "chrome",
+              "browserVersion": "108.0.5359.215",
+              "chrome": {
+                "chromedriverVersion": "108.0.5359.215 (9a6ae621682e0d95e503c36911cd1df3fbe96c97-refs/branch-heads/5938@{#1286})"
+              },
+              "goog:chromeOptions": {
+                "debuggerAddress": "127.0.0.1:48824"
+              },
+              "pageLoadStrategy": "eager",
+              "platformName": "",
+              "proxy": {},
+              "setWindowRect": false,
+              "strictFileInteractability": false,
+              "timeouts": {
+                "implicit": 0,
+                "pageLoad": 300000,
+                "script": 30000
+              },
+              "unhandledPromptBehavior": "dismiss and notify",
+              "webauthn:extension:credBlob": true,
+              "webauthn:extension:largeBlob": true,
+              "webauthn:virtualAuthenticators": true
+            },
+            "sessionId": "995b3059b8bc90dfb20284b97655ce08"
+          }
+        },
+        {
+          "action": "wait",
+          "name": "fresh-desktop-ui",
+          "elapsed": "17.7392578s",
+          "value": true
+        },
+        {
+          "action": "script",
+          "name": "fresh-default-backend-and-authenticated-UI",
+          "elapsed": "2.6708984s",
+          "value": {
+            "bootstrap": 200,
+            "errors": false,
+            "runtime": {
+              "appVersion": "0.8.0-win7.dev.1",
+              "arch": "x64",
+              "backendVersion": "dev",
+              "platform": "win32"
+            },
+            "viewport": [
+              980,
+              686
+            ]
+          }
+        },
+        {
+          "action": "script",
+          "name": "native-light-dark-theme-IPC",
+          "elapsed": "4.3095703s",
+          "value": {
+            "dark": {
+              "focused": true,
+              "fullscreen": false
+            },
+            "light": {
+              "focused": true,
+              "fullscreen": false
+            }
+          }
+        },
+        {
+          "action": "screenshot",
+          "name": "",
+          "elapsed": "828.125ms",
+          "value": "electron-fresh-default-startup.png"
+        }
+      ]
+    },
+    {
+      "log": ".cache/win7/logs/second-review-v2.json",
+      "sha256": "223f81caa22c54d187fa3afa30b69ae8f2c04939f68e37e347c67db44b4b31cf",
+      "exit": 0,
+      "duration": "5.4550781s"
+    },
+    {
+      "log": ".cache/win7/logs/final-chain-v3.json",
+      "sha256": "98239c3b8a7505c9eaac40a9777f48678b6edf62eb50aad002216e49f95d21c8",
+      "exit": 0,
+      "duration": "3m46.6679688s"
+    },
+    {
+      "log": ".cache/win7/logs/scoped-confirm.json",
+      "sha256": "db3de78ff5ce404f3f1b6a3bf6b3357462c0b08f7801827526ccfb48cef39cbb",
+      "exit": 0,
+      "duration": "1.3916016s",
+      "checks": [
+        {
+          "action": "script",
+          "name": "actual-restricted-console-and-API-evidence",
+          "elapsed": "454.1016ms",
+          "value": {
+            "chinese": true,
+            "cliAPIRoundTrip": true,
+            "errors": [],
+            "outsideWriteDenied": true,
+            "reply": "WIN7_DESKTOP_SCOPED_API_OK",
+            "restrictedToken": true,
+            "status": "succeeded"
+          }
+        },
+        {
+          "action": "screenshot",
+          "name": "",
+          "elapsed": "671.875ms",
+          "value": "electron-scoped-sandbox-confirmed.png"
+        }
+      ]
+    },
+    {
+      "log": ".cache/win7/logs/cancel-clean-confirm.json",
+      "sha256": "a504d68d7e676ae6e53b8ed018de28916ae45d3262d8c9b2a0de754143a5a736",
+      "exit": 0,
+      "duration": "5m59.3417969s",
+      "checks": [
+        {
+          "action": "trackCurrentTree",
+          "name": "authenticate-live-parent-and-child",
+          "elapsed": "291.0156ms",
+          "value": [
+            4660,
+            2764
+          ]
+        },
+        {
+          "action": "wait",
+          "name": "visible-stop-control",
+          "elapsed": "565.4297ms",
+          "value": true
+        },
+        {
+          "action": "click",
+          "name": "",
+          "elapsed": "2.4814453s",
+          "value": null
+        },
+        {
+          "action": "assertChildrenStopped",
+          "name": "desktop-stop-reaped-the-tree",
+          "elapsed": "0s",
+          "value": "both parent and child exited"
+        },
+        {
+          "action": "wait",
+          "name": "persisted-canceled-without-runtime-error",
+          "elapsed": "1m44.4931641s",
+          "value": true
+        },
+        {
+          "action": "wait",
+          "name": "composer-idle",
+          "elapsed": "43.9454ms",
+          "value": true
+        },
+        {
+          "action": "click",
+          "name": "",
+          "elapsed": "1.0810547s",
+          "value": null
+        },
+        {
+          "action": "insertText",
+          "name": "",
+          "elapsed": "910.1562ms",
+          "value": {}
+        },
+        {
+          "action": "click",
+          "name": "",
+          "elapsed": "1.3007812s",
+          "value": null
+        },
+        {
+          "action": "wait",
+          "name": "same-session-recovery",
+          "elapsed": "4m4.4941406s",
+          "value": true
+        },
+        {
+          "action": "script",
+          "name": "mode-and-renderer-errors",
+          "elapsed": "51.7578ms",
+          "value": {
+            "errors": [],
+            "mode": "标准模式"
+          }
+        },
+        {
+          "action": "screenshot",
+          "name": "",
+          "elapsed": "816.4062ms",
+          "value": "electron-cancel-recovered.png"
+        }
+      ]
+    },
+    {
+      "log": ".cache/win7/logs/native-runtime-current.json",
+      "sha256": "8d06f45529266d844d5e77ddcf2874079f436cff5dc56a666aa282dd5143fa36",
+      "exit": 0,
+      "duration": "7m18.8408203s",
+      "output": "=== RUN   TestWindowsWorkspaceSandboxCodexE2E\n=== RUN   TestWindowsWorkspaceSandboxCodexE2E/work\n=== RUN   TestWindowsWorkspaceSandboxCodexE2E/cancel\n=== RUN   TestWindowsWorkspaceSandboxCodexE2E/timeout\n=== RUN   TestWindowsWorkspaceSandboxCodexE2E/background_stop\n=== RUN   TestWindowsWorkspaceSandboxCodexE2E/owner_crash\n--- PASS: TestWindowsWorkspaceSandboxCodexE2E (276.53s)\n    --- PASS: TestWindowsWorkspaceSandboxCodexE2E/work (91.46s)\n    --- PASS: TestWindowsWorkspaceSandboxCodexE2E/cancel (24.67s)\n    --- PASS: TestWindowsWorkspaceSandboxCodexE2E/timeout (78.00s)\n    --- PASS: TestWindowsWorkspaceSandboxCodexE2E/background_stop (54.01s)\n    --- PASS: TestWindowsWorkspaceSandboxCodexE2E/owner_crash (28.36s)\nPASS\n"
+    },
+    {
+      "log": ".cache/win7/logs/browser-final.json",
+      "sha256": "7e7ca748a6395f8fed889348c6afbfe35c14e88622bffc9778a9d87096aeccfd",
+      "exit": 0,
+      "duration": "41.6542969s",
+      "checks": [
+        {
+          "action": "start",
+          "name": "attach-fixed-desktop",
+          "elapsed": "746.0938ms",
+          "value": {
+            "capabilities": {
+              "acceptInsecureCerts": false,
+              "browserName": "chrome",
+              "browserVersion": "108.0.5359.215",
+              "chrome": {
+                "chromedriverVersion": "108.0.5359.215 (9a6ae621682e0d95e503c36911cd1df3fbe96c97-refs/branch-heads/5938@{#1286})"
+              },
+              "goog:chromeOptions": {
+                "debuggerAddress": "127.0.0.1:48824"
+              },
+              "pageLoadStrategy": "eager",
+              "platformName": "",
+              "proxy": {},
+              "setWindowRect": false,
+              "strictFileInteractability": false,
+              "timeouts": {
+                "implicit": 0,
+                "pageLoad": 300000,
+                "script": 30000
+              },
+              "unhandledPromptBehavior": "dismiss and notify",
+              "webauthn:extension:credBlob": true,
+              "webauthn:extension:largeBlob": true,
+              "webauthn:virtualAuthenticators": true
+            },
+            "sessionId": "762e83cbdf6799673e848f0313d5916d"
+          }
+        },
+        {
+          "action": "wait",
+          "name": "desktop-bridge-and-page",
+          "elapsed": "262.6953ms",
+          "value": true
+        },
+        {
+          "action": "rememberWindow",
+          "name": "main-app-target",
+          "elapsed": "7.8125ms",
+          "value": "CDwindow-C9FF69CBE83B0CBCD54BE589E8D32146"
+        },
+        {
+          "action": "script",
+          "name": "desktop-runtime-versions",
+          "elapsed": "51.7578ms",
+          "value": {
+            "appVersion": "0.8.0-win7.dev.1",
+            "arch": "x64",
+            "backendVersion": "dev",
+            "platform": "win32"
+          }
+        },
+        {
+          "action": "script",
+          "name": "capture-renderer-errors",
+          "elapsed": "488.2812ms",
+          "value": true
+        },
+        {
+          "action": "wait",
+          "name": "direct-chat",
+          "elapsed": "14.8554688s",
+          "value": true
+        },
+        {
+          "action": "click",
+          "name": "",
+          "elapsed": "3.9365234s",
+          "value": null
+        },
+        {
+          "action": "wait",
+          "name": "native-browser-input",
+          "elapsed": "91.7969ms",
+          "value": true
+        },
+        {
+          "action": "keys",
+          "name": "",
+          "elapsed": "10.828125s",
+          "value": null
+        },
+        {
+          "action": "remoteWindow",
+          "name": "actual-embedded-browser-target",
+          "elapsed": "3.8671875s",
+          "value": "http://10.0.2.2:48817/electron-browser-home.html"
+        },
+        {
+          "action": "wait",
+          "name": "remote-page-rendered",
+          "elapsed": "54.6875ms",
+          "value": true
+        },
+        {
+          "action": "script",
+          "name": "remote-page-isolation",
+          "elapsed": "131.836ms",
+          "value": {
+            "applicationOriginBlocked": true,
+            "bridge": false,
+            "node": false
+          }
+        },
+        {
+          "action": "click",
+          "name": "",
+          "elapsed": "2.1552734s",
+          "value": null
+        },
+        {
+          "action": "wait",
+          "name": "embedded-browser-navigation",
+          "elapsed": "57.6172ms",
+          "value": true
+        },
+        {
+          "action": "mainWindow",
+          "name": "",
+          "elapsed": "14.6485ms",
+          "value": null
+        },
+        {
+          "action": "wait",
+          "name": "back-button-enabled",
+          "elapsed": "100.5859ms",
+          "value": true
+        },
+        {
+          "action": "click",
+          "name": "",
+          "elapsed": "2.3203125s",
+          "value": null
+        },
+        {
+          "action": "remoteWindow",
+          "name": "",
+          "elapsed": "113.2813ms",
+          "value": "http://10.0.2.2:48817/electron-browser-home.html"
+        },
+        {
+          "action": "wait",
+          "name": "back-history",
+          "elapsed": "41.0157ms",
+          "value": true
+        },
+        {
+          "action": "mainWindow",
+          "name": "",
+          "elapsed": "14.6484ms",
+          "value": null
+        },
+        {
+          "action": "script",
+          "name": "main-app-errors",
+          "elapsed": "54.6875ms",
+          "value": {
+            "browserError": null,
+            "errors": []
+          }
+        },
+        {
+          "action": "screenshot",
+          "name": "",
+          "elapsed": "534.1797ms",
+          "value": "electron-browser-green.png"
+        }
+      ]
+    },
+    {
+      "log": ".cache/win7/logs/previews-final.json",
+      "sha256": "fb4cb8887e9d2c95a0bc25047b8ef9379fc85248d823ca893ef9e42d5f4ce35e",
+      "exit": 0,
+      "duration": "3m17.4208984s"
+    },
+    {
+      "log": ".cache/win7/logs/environment-native-v4.json",
+      "sha256": "c9ce6f0b6c2781e1f96fc85b388ff288c87f4013472969c9eaa59118712e1282",
+      "exit": 0,
+      "duration": "4.0800782s",
+      "output": "{\"path_entries\":4,\"powershell2_compatible\":true,\"valid_json\":true}\n"
+    },
+    {
+      "log": ".cache/win7/logs/final-owner-stop.json",
+      "sha256": "563b73db7beeaa7aed2b015955349b17e368a309c8622d7bc2da8894136f0504",
+      "exit": 0,
+      "duration": "6.2285156s",
+      "output": "Holding actual Go sidecar handle 6792\nApplication owner stopped; Go sidecar exited through its control channel\n"
+    },
+    {
+      "log": ".cache/win7/logs/verify-installed-native.json",
+      "sha256": "8dbbbf31cc7f3c1d9b4b30701c3f0a4aac99f842c0ffddd405a075bcafaad290",
+      "exit": 0,
+      "duration": "46.6826172s",
+      "output": "Verified installed package SHA-256 files 91\n"
+    }
+  ],
+  "host_log_fingerprints": {
+    ".cache/win7/logs/reproducible-app-build-v2.log": "6ca333f6dd9165472026fb906181876cf315a0a2c981006c5382f32f1c6791f6",
+    ".cache/win7/logs/web-tests.log": "0646152dc3c3f20eaf1c2b4d696bbd2041efb6baa6976c82abc26c819c6b7160",
+    ".cache/win7/logs/desktop-tests-viewport.log": "aba6f1f1b55e22b3e54ae4805f2d3de51a9cf386a254882f656a4affe9af3f73",
+    ".cache/win7/logs/go-all-final.log": "4fa08f97f32450b3d05de3d6781e03c3cac329d3f0bc514f5bbb66b64d00deaa",
+    ".cache/win7/logs/race-final.log": "4909e6777828a0b42a4e5e27cf2477fac80c54fbe1df6f71926bf83af80868c1",
+    ".cache/win7/logs/heartbeat-race.log": "6c15abcb4bae0c48eaa98b1beceafc410a124aa6fec9bb80aa9735e75bdc6d9d",
+    ".cache/win7/logs/make-host.log": "87db3986fd7d05c89f32586d320e5b930f8ab8c1ccfc85bb9111f59baa38ba53"
+  },
+  "verified_binary_sha256": {
+    "CSGClaw.exe": "c551a82c418b39bd33363ae2c1834836e6104f4964e7bc7c5761078b785de559",
+    "resources/app.asar": "634b292b2bc2fe8daab15cda0ee13d8574e7de24f1ecd40f93dba2cf2db84db3",
+    "resources/backend/csgclaw/bin/csgclaw.exe": "57ebadf7c795b59e2ee5a0eb53527bca98b1147df22f79917df50ae8da4c9cc4",
+    "resources/backend/csgclaw/bin/codex.exe": "0ce90becd690f4a901fbb7270e69d946f99e92af48512ef22e934b7b1a080527"
+  },
+  "limitations": [
+    "Development portable package; no signed installer or Win7 release workflow",
+    "Normal Windows auto-update feed disabled",
+    "DSH/Node not natively validated",
+    "Third-party dependencies and services require their own conditions",
+    "Functionality validation, not physical x64 hardware performance certification",
+    "Earlier Web/API matrix is historical evidence in verification-20261017.json; not all rerun through desktop UI"
+  ]
+}

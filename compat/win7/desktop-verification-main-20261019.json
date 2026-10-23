@@ -1,0 +1,710 @@
+{
+  "date": "2026-10-19",
+  "upstream_main": "d1a138d041cd7b45fe39dbd5fc1117323dd6a07f",
+  "shared_fixes_primary": "8d0183afd10b14f2e26553c0368c3d916296d2cb",
+  "shared_fixes_fork": "72fdcce2",
+  "version": "0.8.0-win7.dev.2",
+  "host": {
+    "web_files": 219,
+    "web_tests": 1695,
+    "desktop_tests": 103,
+    "go_all": "passed with pinned Win7 SDK in reproducible pipeline",
+    "primary_go_all_and_build": "passed",
+    "primary_race": "passed for Codex and CSGClaw delivery"
+  },
+  "installed_sha256_files": 91,
+  "native_lifecycle_cases": [
+    "cancel",
+    "timeout",
+    "owner_crash"
+  ],
+  "native_evidence": [
+    {
+      "log": ".cache/win7/update-main/single-progress-result.json",
+      "sha256": "6ed3cc8add6e545a8aad9700dd1df193b7c78c4e89f414975fd1fa526811ac67",
+      "duration": "8m7.4794922s",
+      "exit": 0,
+      "checks": [
+        {
+          "action": "start",
+          "name": "attach-updated-main-desktop",
+          "elapsed": "753.9062ms"
+        },
+        {
+          "action": "script",
+          "name": "verified-app-version",
+          "elapsed": "46.875ms",
+          "value": {
+            "appVersion": "0.8.0-win7.dev.2",
+            "arch": "x64",
+            "backendVersion": "dev",
+            "platform": "win32"
+          }
+        },
+        {
+          "action": "script",
+          "name": "new-isolated-chat",
+          "elapsed": "1.3388672s"
+        },
+        {
+          "action": "wait",
+          "name": "composer-ready",
+          "elapsed": "6.2333984s"
+        },
+        {
+          "action": "click",
+          "name": "",
+          "elapsed": "690.4297ms"
+        },
+        {
+          "action": "insertText",
+          "name": "",
+          "elapsed": "1.3876953s"
+        },
+        {
+          "action": "click",
+          "name": "",
+          "elapsed": "1.8125s"
+        },
+        {
+          "action": "wait",
+          "name": "initial-progress-beside-agent-avatar",
+          "elapsed": "3m49.1933594s"
+        },
+        {
+          "action": "script",
+          "name": "progress-and-stop-placement",
+          "elapsed": "787.1094ms",
+          "value": {
+            "avatar": true,
+            "composerDraft": "",
+            "progress": "正在处理·3m 48s已开始，等待运行时输出…",
+            "stopInMessage": true
+          }
+        },
+        {
+          "action": "screenshot",
+          "name": "",
+          "elapsed": "1.993164s"
+        },
+        {
+          "action": "wait",
+          "name": "real-model-shell-and-final-reply",
+          "elapsed": "4m0.9472656s"
+        },
+        {
+          "action": "wait",
+          "name": "composer-recovered",
+          "elapsed": "162.1094ms"
+        },
+        {
+          "action": "script",
+          "name": "native-chain-evidence",
+          "elapsed": "43.9453ms",
+          "value": {
+            "errors": [],
+            "mode": "标准模式",
+            "reply": "WIN7_MAIN_CHAIN_OK",
+            "room": "room-1792391763153320300",
+            "status": "succeeded",
+            "tools": [
+              {
+                "exit": 0,
+                "name": "Run shell command",
+                "output": "﻿Microsoft Windows NT 6.1.7601 Service Pack 1\r\n\r\nPath                                                                           \r\n----                                                                           \r\nC:\\CSGClawTest\\desktop-profile\\.csgclaw\\agents\\agent-win7\\.codex\\workspace     \r\nWIN7_MAIN_CHAIN_OK",
+                "status": "completed"
+              }
+            ]
+          }
+        },
+        {
+          "action": "screenshot",
+          "name": "",
+          "elapsed": "1.2226562s"
+        }
+      ]
+    },
+    {
+      "log": ".cache/win7/update-main/verify-result.json",
+      "sha256": "225841eef94a2c2a760df8f13bf17c49093e0e24982e4f112c06eba5bf4bc45e",
+      "duration": "31.8544922s",
+      "exit": 0,
+      "output": "Verified installed package SHA-256 files 91\n"
+    },
+    {
+      "log": ".cache/win7/update-main/lifecycle-result.json",
+      "sha256": "9d862065b5d905c38a7cf55c4786d71811ae3a78116859aa1a04d087ca361bf6",
+      "duration": "1m32.2978515s",
+      "exit": 0,
+      "output": "=== RUN   TestWindowsWorkspaceSandboxCodexE2E\n=== RUN   TestWindowsWorkspaceSandboxCodexE2E/cancel\n=== RUN   TestWindowsWorkspaceSandboxCodexE2E/timeout\n=== RUN   TestWindowsWorkspaceSandboxCodexE2E/owner_crash\n--- PASS: TestWindowsWorkspaceSandboxCodexE2E (103.35s)\n    --- PASS: TestWindowsWorkspaceSandboxCodexE2E/cancel (17.01s)\n    --- PASS: TestWindowsWorkspaceSandboxCodexE2E/timeout (70.51s)\n    --- PASS: TestWindowsWorkspaceSandboxCodexE2E/owner_crash (15.82s)\nPASS\n"
+    },
+    {
+      "log": ".cache/win7/update-main/mutex-proof-result.json",
+      "sha256": "ccf3cc93e85435f73f77376bc06ad850421d1710f856fcc1336878f65046446b",
+      "duration": "228.5156ms",
+      "exit": 0,
+      "output": "Test queue already has an executor\n"
+    },
+    {
+      "log": ".cache/win7/update-main/stop-old-active-result.json",
+      "sha256": "3df015dace16e9e549a3aec6679ac43e18c5fff674027fa2132052268434ab67",
+      "duration": "929.6875ms",
+      "exit": 0,
+      "output": "Holding actual Go sidecar handle 5988\nApplication owner stopped; Go sidecar exited through its control channel\n"
+    },
+    {
+      "log": ".cache/win7/update-main/install-result.json",
+      "sha256": "5ec77ea9b002be68fbb1236b9934c5ecd7cd6348b2d5ad2e53e18bd3a36b2136",
+      "duration": "46.6044922s",
+      "exit": 0,
+      "output": "Installed isolated desktop fixture C:\\CSGClawTest\\desktop-20261019\n"
+    },
+    {
+      "log": ".cache/win7/update-main/warm-state-result.json",
+      "sha256": "564a65b3ca75b418c46ae08d0c7c63c8a5acbc40ae3cabf60ea6cc11a61f02e0",
+      "exit": 0,
+      "duration": "564.4532ms",
+      "checks": [
+        {
+          "action": "mainWindow",
+          "elapsed": "110.3515ms",
+          "name": "",
+          "value": null
+        },
+        {
+          "action": "script",
+          "elapsed": "235.3516ms",
+          "name": "continued-chat-current-state",
+          "value": {
+            "errors": [],
+            "legacyWorking": null,
+            "reply": [
+              "WIN7_WARM_REPLY_OK"
+            ],
+            "sending": false,
+            "stop": false
+          }
+        }
+      ]
+    },
+    {
+      "log": ".cache/win7/update-main/timings-real-result.json",
+      "sha256": "1a05500d6ff4082fde9533c4c9706c7f331cd8a28f0de4d3d4f159aed0896f5d",
+      "exit": 0,
+      "duration": "13.0917968s",
+      "records": [
+        {
+          "status": "succeeded",
+          "runtime": "codex",
+          "model": "deepseek-flash",
+          "started_at": "2026-10-19T14:53:57.7597656+08:00",
+          "phases": [
+            {
+              "name": "message.accept",
+              "owner": "csgclaw",
+              "start_ms": 0,
+              "end_ms": 1016.6015
+            },
+            {
+              "name": "message.dispatch",
+              "owner": "csgclaw",
+              "start_ms": 1016.6015,
+              "end_ms": 1032.2265
+            },
+            {
+              "name": "channel.queue",
+              "owner": "csgclaw",
+              "start_ms": 1032.2265,
+              "end_ms": 1047.8515
+            },
+            {
+              "name": "input.prepare",
+              "owner": "csgclaw",
+              "start_ms": 3274.414,
+              "end_ms": 3277.3437
+            },
+            {
+              "name": "input.resolve",
+              "owner": "csgclaw",
+              "start_ms": 3278.3203,
+              "end_ms": 3278.3203
+            },
+            {
+              "name": "engine.queue",
+              "owner": "csgclaw",
+              "start_ms": 3278.3203,
+              "end_ms": 3278.3203
+            },
+            {
+              "name": "runtime.lease",
+              "owner": "csgclaw",
+              "start_ms": 3281.25,
+              "end_ms": 3281.25
+            },
+            {
+              "name": "runtime.inspect",
+              "owner": "runtime",
+              "start_ms": 3281.25,
+              "end_ms": 3285.1562
+            },
+            {
+              "name": "session.prepare",
+              "owner": "runtime",
+              "start_ms": 19166.9922,
+              "end_ms": 19166.9922
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 19177.7344,
+              "end_ms": 19179.6875
+            },
+            {
+              "name": "runtime.accepted",
+              "owner": "runtime",
+              "start_ms": 128150.3906,
+              "end_ms": 128150.3906
+            },
+            {
+              "name": "llm.request",
+              "owner": "llm",
+              "start_ms": 214282.2265,
+              "end_ms": 215022.4609
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 215368.164,
+              "end_ms": 217198.2422
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217198.2422,
+              "end_ms": 217200.1953
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217200.1953,
+              "end_ms": 217200.1953
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217200.1953,
+              "end_ms": 217200.1953
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217200.1953,
+              "end_ms": 217200.1953
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217200.1953,
+              "end_ms": 217200.1953
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217200.1953,
+              "end_ms": 217200.1953
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217200.1953,
+              "end_ms": 217200.1953
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217200.1953,
+              "end_ms": 217201.1719
+            },
+            {
+              "name": "result.process",
+              "owner": "csgclaw",
+              "start_ms": 217201.1719,
+              "end_ms": 217202.1484
+            },
+            {
+              "name": "message.deliver",
+              "owner": "csgclaw",
+              "start_ms": 217202.1484,
+              "end_ms": 218627.9297
+            }
+          ]
+        },
+        {
+          "status": "succeeded",
+          "runtime": "codex",
+          "model": "deepseek-flash",
+          "started_at": "2026-10-19T14:36:13.5859375+08:00",
+          "phases": [
+            {
+              "name": "message.accept",
+              "owner": "csgclaw",
+              "start_ms": 0,
+              "end_ms": 1180.664
+            },
+            {
+              "name": "message.dispatch",
+              "owner": "csgclaw",
+              "start_ms": 1180.664,
+              "end_ms": 1441.4062
+            },
+            {
+              "name": "channel.queue",
+              "owner": "csgclaw",
+              "start_ms": 1442.3828,
+              "end_ms": 1530.2734
+            },
+            {
+              "name": "input.prepare",
+              "owner": "csgclaw",
+              "start_ms": 3473.6328,
+              "end_ms": 3476.5625
+            },
+            {
+              "name": "input.resolve",
+              "owner": "csgclaw",
+              "start_ms": 3477.539,
+              "end_ms": 3477.539
+            },
+            {
+              "name": "engine.queue",
+              "owner": "csgclaw",
+              "start_ms": 3477.539,
+              "end_ms": 3477.539
+            },
+            {
+              "name": "runtime.lease",
+              "owner": "csgclaw",
+              "start_ms": 3480.4687,
+              "end_ms": 3480.4687
+            },
+            {
+              "name": "runtime.inspect",
+              "owner": "runtime",
+              "start_ms": 3480.4687,
+              "end_ms": 3485.3515
+            },
+            {
+              "name": "session.prepare",
+              "owner": "runtime",
+              "start_ms": 3495.1171,
+              "end_ms": 227559.5703
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 229523.4375,
+              "end_ms": 229525.3906
+            },
+            {
+              "name": "runtime.accepted",
+              "owner": "runtime",
+              "start_ms": 233892.5781,
+              "end_ms": 233892.5781
+            },
+            {
+              "name": "llm.request",
+              "owner": "llm",
+              "start_ms": 235245.1171,
+              "end_ms": 237010.7421
+            },
+            {
+              "name": "tool.exec_command",
+              "owner": "tool",
+              "start_ms": 239846.6796,
+              "end_ms": 246282.2265
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 239848.6328,
+              "end_ms": 241365.2343
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 246282.2265,
+              "end_ms": 246861.3281
+            },
+            {
+              "name": "llm.request",
+              "owner": "llm",
+              "start_ms": 246609.375,
+              "end_ms": 247359.375
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 246861.3281,
+              "end_ms": 246861.3281
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 247879.8828,
+              "end_ms": 248977.539
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248977.539,
+              "end_ms": 248977.539
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248977.539,
+              "end_ms": 248977.539
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248977.539,
+              "end_ms": 248977.539
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248977.539,
+              "end_ms": 248977.539
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248977.539,
+              "end_ms": 248977.539
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248978.5156,
+              "end_ms": 248978.5156
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248978.5156,
+              "end_ms": 248978.5156
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248978.5156,
+              "end_ms": 248978.5156
+            },
+            {
+              "name": "result.process",
+              "owner": "csgclaw",
+              "start_ms": 248978.5156,
+              "end_ms": 248979.4921
+            },
+            {
+              "name": "message.deliver",
+              "owner": "csgclaw",
+              "start_ms": 248979.4921,
+              "end_ms": 250228.5156
+            }
+          ]
+        },
+        {
+          "status": "succeeded",
+          "runtime": "codex",
+          "model": "deepseek-flash",
+          "started_at": "2026-10-19T14:00:03.6982422+08:00",
+          "phases": [
+            {
+              "name": "message.accept",
+              "owner": "csgclaw",
+              "start_ms": 0,
+              "end_ms": 1104.4922
+            },
+            {
+              "name": "message.dispatch",
+              "owner": "csgclaw",
+              "start_ms": 1104.4922,
+              "end_ms": 1120.1172
+            },
+            {
+              "name": "channel.queue",
+              "owner": "csgclaw",
+              "start_ms": 1135.7422,
+              "end_ms": 1135.7422
+            },
+            {
+              "name": "input.prepare",
+              "owner": "csgclaw",
+              "start_ms": 2172.8516,
+              "end_ms": 2174.8047
+            },
+            {
+              "name": "input.resolve",
+              "owner": "csgclaw",
+              "start_ms": 2175.7812,
+              "end_ms": 2175.7812
+            },
+            {
+              "name": "engine.queue",
+              "owner": "csgclaw",
+              "start_ms": 2175.7812,
+              "end_ms": 2176.7578
+            },
+            {
+              "name": "runtime.lease",
+              "owner": "csgclaw",
+              "start_ms": 2179.6875,
+              "end_ms": 2179.6875
+            },
+            {
+              "name": "runtime.inspect",
+              "owner": "runtime",
+              "start_ms": 2179.6875,
+              "end_ms": 2183.5937
+            },
+            {
+              "name": "session.prepare",
+              "owner": "runtime",
+              "start_ms": 2196.2891,
+              "end_ms": 67239.2578
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 67677.7344,
+              "end_ms": 67681.6406
+            },
+            {
+              "name": "runtime.accepted",
+              "owner": "runtime",
+              "start_ms": 69118.1641,
+              "end_ms": 69118.1641
+            },
+            {
+              "name": "llm.request",
+              "owner": "llm",
+              "start_ms": 73981.4453,
+              "end_ms": 75695.3125
+            },
+            {
+              "name": "tool.exec_command",
+              "owner": "tool",
+              "start_ms": 77736.3281,
+              "end_ms": 85531.25
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 77739.2578,
+              "end_ms": 79248.0469
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 85531.25,
+              "end_ms": 85932.6172
+            },
+            {
+              "name": "llm.request",
+              "owner": "llm",
+              "start_ms": 85806.6406,
+              "end_ms": 86586.9141
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 85932.6172,
+              "end_ms": 85932.6172
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 86517.5781,
+              "end_ms": 88391.6016
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88391.6016,
+              "end_ms": 88392.5781
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88392.5781,
+              "end_ms": 88392.5781
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88392.5781,
+              "end_ms": 88392.5781
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88392.5781,
+              "end_ms": 88392.5781
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88392.5781,
+              "end_ms": 88392.5781
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88392.5781,
+              "end_ms": 88392.5781
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88392.5781,
+              "end_ms": 88392.5781
+            },
+            {
+              "name": "event.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88392.5781,
+              "end_ms": 88392.5781
+            },
+            {
+              "name": "result.process",
+              "owner": "csgclaw",
+              "start_ms": 88393.5547,
+              "end_ms": 88393.5547
+            },
+            {
+              "name": "message.deliver",
+              "owner": "csgclaw",
+              "start_ms": 88395.5078,
+              "end_ms": 89606.4453
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "binary_sha256": {
+    "CSGClaw.exe": "a7ab20f1f32e287bb177106166a00e994e3b9d716a709f8ae43977dd16ce976b",
+    "resources/app.asar": "c212addad59b79583c4f87c94f644b3f93660881be1507c80e0769b46f0ea499",
+    "resources/backend/csgclaw/bin/csgclaw.exe": "4cd541fd1e3330aa248bc38a67ca9f690337563494213b5a18b843df1eb42977",
+    "resources/backend/csgclaw/bin/codex.exe": "0ce90becd690f4a901fbb7270e69d946f99e92af48512ef22e934b7b1a080527"
+  },
+  "limitations": [
+    "Focused main-update regression, not a rerun of all historical native and external-service cases",
+    "Approximately eight minutes for the full automated chat/tool scenario on x86 TCG; not physical x64 performance certification",
+    "DSH/Node remains separate",
+    "Normal Windows update feed disabled; development portable package",
+    "Continued chat automatic wait hit a driver script timeout; subsequent readback confirmed success and no active/legacy/sending UI state. Minute-level runtime preparation remains unresolved in this VM."
+  ]
+}
