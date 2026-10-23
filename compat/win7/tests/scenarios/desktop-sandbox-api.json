@@ -1,0 +1,78 @@
+[
+  {
+    "action": "mainWindow"
+  },
+  {
+    "action": "clickIfPresent",
+    "selector": ".composer-working-stop:not([disabled])"
+  },
+  {
+    "action": "wait",
+    "name": "idle-after-prior-fixture",
+    "timeout": 90,
+    "script": "return !document.querySelector(\".composer-working-stop\")"
+  },
+  {
+    "action": "mainWindow"
+  },
+  {
+    "action": "rememberWindow"
+  },
+  {
+    "action": "script",
+    "name": "open-direct-chat",
+    "script": "location.hash='#/dms/room-1792147489164062500';window.__desktopErrors=[];addEventListener('error',e=>__desktopErrors.push(e.message));addEventListener('unhandledrejection',e=>__desktopErrors.push(String(e.reason)));return true"
+  },
+  {
+    "action": "wait",
+    "name": "composer-ready",
+    "timeout": 120,
+    "script": "return !!document.querySelector(\".composer-editor\")&&!document.querySelector(\".composer-working-stop:not([disabled])\")"
+  },
+  {
+    "action": "clickIfPresent",
+    "selector": ".chat-side-layout-actions button[aria-label=\"收起侧栏\"]"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-editor"
+  },
+  {
+    "action": "keys",
+    "selector": ".composer-editor",
+    "text": "a"
+  },
+  {
+    "action": "insertText",
+    "text": "请直接验收 Win7 桌面沙箱，不要委派或显示凭据。用 exec_command(tty=true) 执行 & 'C:\\CSGClawTest\\compat\\win7-pty-probe-v4.exe' --console-child 'C:\\CSGClawTest\\compat\\outside-workspace\\desktop-forbidden.txt'，再用 write_stdin 输入两行“你好_Win7App”和“quit”。确认实际输出含 RESTRICTED_TOKEN_OK、OUTSIDE_WRITE_DENIED、ECHO_你好_Win7App、WIN7_PTY_BYE 且退出码为0。然后执行 & 'C:\\CSGClawTest\\desktop-20261019\\resources\\backend\\csgclaw\\bin\\csgclaw-cli.exe' --output json app list --agent agent-win7，确认成功调用本应用的 API。全部成功后只回复 WIN7_DESKTOP_SCOPED_API_OK。 不要再尝试列出全局房间，受限 Agent 无此权限，这是正常策略。"
+  },
+  {
+    "action": "wait",
+    "name": "trusted-paste-complete",
+    "script": "return document.querySelector(\".composer-editor\")?.textContent.includes(\"WIN7_DESKTOP_SCOPED_API_OK\")"
+  },
+  {
+    "action": "wait",
+    "name": "send-control-fits-actual-viewport",
+    "script": "const e=document.querySelector(\".composer-send-button\");if(!e)return false;const r=e.getBoundingClientRect();return !e.disabled&&r.left>=0&&r.right<=innerWidth+1&&r.bottom<=innerHeight+1"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-send-button"
+  },
+  {
+    "action": "wait",
+    "name": "sandbox-and-CLI-API-success",
+    "timeout": 360,
+    "script": "return fetch('/api/v1/messages/?room_id=room-1792147489164062500',{signal:AbortSignal.timeout(10000)}).then(r=>r.json()).then(ms=>ms.some(m=>m.sender_id==='user-win7'&&m.content.includes('WIN7_DESKTOP_SCOPED_API_OK')&&m.metadata?.csgclaw?.turn_progress?.status==='succeeded'))"
+  },
+  {
+    "action": "script",
+    "name": "actual-restricted-console-and-API-evidence",
+    "script": "return fetch('/api/v1/messages/?room_id=room-1792147489164062500',{signal:AbortSignal.timeout(10000)}).then(r=>r.json()).then(ms=>{const m=ms.filter(m=>m.sender_id==='user-win7'&&m.content.includes('WIN7_DESKTOP_SCOPED_API_OK')).pop();const tools=m.metadata.csgclaw.turn_progress.items.map(x=>x.tool).filter(Boolean);const output=tools.map(t=>t.output||'').join('\\n');for(const s of ['RESTRICTED_TOKEN_OK','OUTSIDE_WRITE_DENIED','ECHO_你好_Win7App','WIN7_PTY_BYE'])if(!output.includes(s))throw new Error('missing '+s);if(!tools.some(t=>t.command?.includes('csgclaw-cli.exe')&&t.command?.includes('app list')&&t.exit_code===0&&(t.output?.includes('items')||t.output?.includes('API_CALL_OK'))))throw new Error('missing real CLI API round trip');if(__desktopErrors.length)throw new Error(JSON.stringify(__desktopErrors));return {status:m.metadata.csgclaw.turn_progress.status,reply:m.content,restrictedToken:true,outsideWriteDenied:true,chinese:true,cliAPIRoundTrip:true,errors:__desktopErrors}})"
+  },
+  {
+    "action": "screenshot",
+    "path": "electron-sandbox-api.png"
+  }
+]

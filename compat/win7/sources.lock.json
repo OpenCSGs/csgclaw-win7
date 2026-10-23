@@ -1,0 +1,107 @@
+{
+  "csgclaw": {
+    "repository": "https://github.com/OpenCSGs/csgclaw.git",
+    "commit": "a9492c456326c9de77697646de8f17f9919a855b"
+  },
+  "codex": {
+    "repository": "https://github.com/openai/codex.git",
+    "tag": "rust-v0.149.1",
+    "commit": "ff29a44391deccde0aba0f8390337d7f3c319ea4",
+    "source_path": "compat/win7/codex"
+  },
+  "previous_port_commit": "edf39aba2e307766913e97ddcf1a0cbaa21463ed",
+  "patches": {
+    "csgclaw.patch": "a95733130ee427aab3c3150c5cac2731f55a9910cad6051e16e908e32f556169",
+    "codex.patch": "c7d7927c1344bda05f8c81cce719a33c52e4b6e3901cf3728db281985d4a0342",
+    "previous-desktop-port.patch": "27e44e27c96fb8004eb7690286305d14002d037b167a947a33e6305463491c04",
+    "test-stability.patch": "155eda8954af363fdfc64846795ae0589a7b86a65998211fd4af1db30a4731e9",
+    "runtime-metadata-win7.patch": "2577ccfe6be26fe0ec59a438c30627bd3f003a7544e3662d71af008419e0cc25",
+    "manager-skills-win7.patch": "daa498d0635d177e48d369729ab7b26ca8bf9a4b2dc7c510f0632a6334c88aa4",
+    "inherited-job.patch": "bfe4416dcd80d8830fcdaa2c89e37509a4717a26905b775af57ff19d127fc903"
+  },
+  "runtime": {
+    "codex.exe": {
+      "bytes": 300060160,
+      "sha256": "0ce90becd690f4a901fbb7270e69d946f99e92af48512ef22e934b7b1a080527"
+    },
+    "winpty.dll": {
+      "bytes": 257024,
+      "sha256": "bd04302d63fefe06de1bb6b82a3550f3ee2b11f52c54355e30841c1976122959"
+    },
+    "winpty-agent.exe": {
+      "bytes": 333312,
+      "sha256": "9b5b44c40f6bd673c3f91ce7cef4f6112fe0d9e478d52f829f8a90c0d9f1be15"
+    },
+    "LICENSE.winpty": {
+      "bytes": 1085,
+      "sha256": "c39e428064b4f3e4fe81a975bf0fd3b845922b431bc4d9a7ffc8bfb091981836"
+    }
+  },
+  "go": {
+    "tag": "patched-1.27.2",
+    "assets": {
+      "go-for-win7-darwin-amd64.zip": {
+        "url": "https://github.com/XTLS/go-win7/releases/download/patched-1.27.2/go-for-win7-darwin-amd64.zip",
+        "sha256": "faab266a5f657993f45c30e724ea49f2a947f431e4610b3da8136466bbe1edde"
+      },
+      "go-for-win7-darwin-arm64.zip": {
+        "url": "https://github.com/XTLS/go-win7/releases/download/patched-1.27.2/go-for-win7-darwin-arm64.zip",
+        "sha256": "82e7d2470f28e67af317aaa8c6947e421906cda0064a1d58cf0eef1abf9e3ec9"
+      },
+      "go-for-win7-linux-amd64.zip": {
+        "url": "https://github.com/XTLS/go-win7/releases/download/patched-1.27.2/go-for-win7-linux-amd64.zip",
+        "sha256": "3d9123e1a2dffda763c04135bebbc825dddb202561b6f4004ea3a3795bd30f66"
+      },
+      "go-for-win7-linux-arm64.zip": {
+        "url": "https://github.com/XTLS/go-win7/releases/download/patched-1.27.2/go-for-win7-linux-arm64.zip",
+        "sha256": "35a1e8c569d89d052f792b6df41897435fb2f44b6d1ede7960c29fff9eb60a7c"
+      },
+      "go-for-win7-windows-amd64.zip": {
+        "url": "https://github.com/XTLS/go-win7/releases/download/patched-1.27.2/go-for-win7-windows-amd64.zip",
+        "sha256": "bbed56ed27b8f51e15e1d3f599410cde9dece80415a008738fd4d55667f133be"
+      },
+      "go-for-win7-windows-arm64.zip": {
+        "url": "https://github.com/XTLS/go-win7/releases/download/patched-1.27.2/go-for-win7-windows-arm64.zip",
+        "sha256": "77ec181a5968358a504873241bb7d88e3ee225b936fccd9235a992e87b45daa4"
+      }
+    },
+    "source_fingerprints": {
+      "src/runtime/os_windows.go": "667f759f203140a52faf98c83762acafd4560286520f8124b02b290b43376ddd",
+      "src/runtime/syscall_windows.go": "53518810c4557c36e5ab3aec6c45f79a905cc676ff909ebae0bdf15e0a94043e",
+      "src/internal/syscall/windows/syscall_windows.go": "9730965e37af0568120e0caa26c1d9beee003083e576d49b1de53c91a9774575"
+    }
+  },
+  "electron": {
+    "version": "22.3.27",
+    "archive": "electron-v22.3.27-win32-x64.zip",
+    "url": "https://github.com/electron/electron/releases/download/v22.3.27/electron-v22.3.27-win32-x64.zip",
+    "sha256": "ad723ed7dad32f9459f7a9de1fd6d718cf713c4809c2431503bea62ce8f786e6"
+  },
+  "chromedriver": {
+    "version": "22.3.27",
+    "archive": "chromedriver-v22.3.27-win32-x64.zip",
+    "sha256": "8d01b742ca0e0f5b6d9eb73a2b650aaf5aeea4e060a6880bdfbf968d710793f7"
+  },
+  "csgclaw_extra_patches": [
+    "test-stability.patch",
+    "runtime-metadata-win7.patch",
+    "manager-skills-win7.patch",
+    "inherited-job.patch"
+  ],
+  "installer": {
+    "compiler": "NSIS",
+    "version": "3.13"
+  },
+  "app_version": "0.9.0",
+  "emoji_font": {
+    "repository": "https://github.com/googlefonts/noto-emoji",
+    "commit": "e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e",
+    "source_path": "2D/fonts/Noto-COLRv1.ttf",
+    "source_sha256": "b8e25ea68db82f9e4d0aee921f4420be2be39887bd5c893a2ad98710531f9d0c",
+    "conversion": "fonttools 4.67.0, WOFF2 flavor",
+    "files": {
+      "noto-color-emoji.woff2": "2328570f49f63a72bcd139dbca5085cefc974e457bfbc1ebeef799d77050799e",
+      "LICENSE.noto-emoji": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+    }
+  }
+}
