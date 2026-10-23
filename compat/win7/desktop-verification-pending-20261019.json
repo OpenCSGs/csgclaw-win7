@@ -1,0 +1,45 @@
+{
+  "date": "2026-10-19",
+  "version": "0.8.0-win7.dev.4",
+  "upstream_commit": "eba0c39957cebf29afdf31307871209c128cc767",
+  "main_ui_fix": "411035df4976af25c37666238341111f7d4bbfef",
+  "before": {
+    "oldComposerFallback": true,
+    "pendingAvatarRows": 0
+  },
+  "native_win7": {
+    "platform": "Windows 7 SP1 x64, UTM x86 emulation",
+    "runtime": {
+      "authenticated": true,
+      "version": "0.8.0-win7.dev.4"
+    },
+    "pending_reply": {
+      "avatarLeft": true,
+      "dotAnchored": true,
+      "hasStructuredProgress": false,
+      "oldComposerFallback": false,
+      "pendingAvatarRows": 1,
+      "phase": "win7-assistant\n正在准备回复"
+    },
+    "cleanup": {
+      "testLeaseReleased": true
+    },
+    "installed_file_hashes_verified": 91
+  },
+  "host_browser_e2e": {
+    "pendingAvatar": true,
+    "composerFallback": false,
+    "deduplicated": true,
+    "terminalRecovered": true,
+    "cancelRecovered": true,
+    "errors": []
+  },
+  "host_checks": {
+    "web_files": 221,
+    "web_tests": 1717,
+    "desktop_tests": 103,
+    "go_all": true,
+    "make": true
+  },
+  "test_scope": "Native desktop work-lease fixture verifies the interval before transcript progress arrives. Host browser E2E verifies progress replacement, completion and cancellation. Model latency is outside this UI regression."
+}

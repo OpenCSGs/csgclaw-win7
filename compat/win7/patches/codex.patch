@@ -1,0 +1,3746 @@
+diff --git a/codex-rs/.config/nextest.toml b/codex-rs/.config/nextest.toml
+index f3f3ca2..23a946b 100644
+--- a/codex-rs/.config/nextest.toml
++++ b/codex-rs/.config/nextest.toml
+@@ -82,3 +82,10 @@ platform = 'cfg(windows)'
+ filter = 'test(suite::resume::) | test(suite::cli_stream::) | test(suite::auth_env::) | test(start_thread_uses_all_default_environments_from_codex_home) | test(connect_stdio_command_initializes_json_rpc_client_on_windows)'
+ test-group = 'windows_process_heavy'
+ slow-timeout = { period = "45s", terminate-after = 2 }
++
++[[profile.default.overrides]]
++# These tests measure concurrency inside a turn with wall-clock assertions.
++# Reserve the runner pool so other test processes cannot skew those measurements.
++# https://nexte.st/docs/configuration/threads-required/
++filter = 'package(codex-core) & kind(test) & test(suite::tool_parallelism::)'
++threads-required = 'num-test-threads'
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 471c342..2bee941 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -394,7 +394,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+ 
+ [[package]]
+ name = "app_test_support"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -1870,7 +1870,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-core",
+@@ -1882,7 +1882,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-graph-store"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-state",
+@@ -1897,7 +1897,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-identity"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -1917,7 +1917,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-analytics"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-app-server-protocol",
+  "codex-git-utils",
+@@ -1938,7 +1938,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-ansi-escape"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "ansi-to-tui",
+  "ratatui",
+@@ -1947,7 +1947,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-api"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "assert_matches",
+@@ -1982,7 +1982,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -2082,7 +2082,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-app-server",
+  "codex-app-server-protocol",
+@@ -2109,7 +2109,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-daemon"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-app-server-protocol",
+@@ -2130,7 +2130,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-protocol"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-app-server-protocol-noop-macros",
+@@ -2163,11 +2163,11 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-protocol-noop-macros"
+-version = "0.0.0"
++version = "0.149.1"
+ 
+ [[package]]
+ name = "codex-app-server-test-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2189,7 +2189,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-transport"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -2231,7 +2231,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-apply-patch"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -2251,7 +2251,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-arg0"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-apply-patch",
+@@ -2271,7 +2271,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-async-utils"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "pretty_assertions",
+  "tokio",
+@@ -2280,7 +2280,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-aws-auth"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "aws-config",
+  "aws-credential-types",
+@@ -2295,7 +2295,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-backend-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-api",
+@@ -2315,7 +2315,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-backend-openapi-models"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "serde",
+  "serde_json",
+@@ -2324,7 +2324,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-build-info"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-install-context",
+  "pretty_assertions",
+@@ -2336,7 +2336,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-bwrap"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "cc",
+  "libc",
+@@ -2345,7 +2345,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-chatgpt"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2367,7 +2367,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cli"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -2455,7 +2455,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-http-client",
+  "eventsource-stream",
+@@ -2468,7 +2468,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-config"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
+@@ -2493,7 +2493,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2526,7 +2526,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2541,7 +2541,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks-mock-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "chrono",
+  "codex-cloud-tasks-client",
+@@ -2550,7 +2550,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-code-mode-protocol",
+  "codex-http-client",
+@@ -2574,7 +2574,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-host"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -2601,7 +2601,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-protocol"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-protocol",
+  "glob",
+@@ -2619,7 +2619,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-runtime"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-code-mode-protocol",
+  "codex-protocol",
+@@ -2635,11 +2635,11 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-collaboration-mode-templates"
+-version = "0.0.0"
++version = "0.149.1"
+ 
+ [[package]]
+ name = "codex-config"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -2687,7 +2687,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-connectors"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -2709,7 +2709,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-connectors-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-connectors",
+  "codex-core-plugins",
+@@ -2723,7 +2723,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-context-fragments"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-string",
+@@ -2731,7 +2731,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -2862,7 +2862,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core-api"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-analytics",
+  "codex-app-server-protocol",
+@@ -2885,7 +2885,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core-plugins"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2941,7 +2941,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-diagnostics"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "libc",
+  "pretty_assertions",
+@@ -2949,7 +2949,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -2996,7 +2996,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3054,7 +3054,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server-protocol"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-file-system",
+@@ -3069,7 +3069,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server-test-support"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-exec-server",
+  "codex-http-client",
+@@ -3077,7 +3077,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-execpolicy"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3095,7 +3095,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-experimental-api-macros"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -3104,7 +3104,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-extension-api"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-config",
+  "codex-context-fragments",
+@@ -3121,7 +3121,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-extension-items"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "pretty_assertions",
+@@ -3133,7 +3133,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-external-agent-migration"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "chrono",
+  "codex-analytics",
+@@ -3163,7 +3163,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-features"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-otel",
+  "codex-protocol",
+@@ -3176,7 +3176,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-feedback"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-http-client",
+@@ -3194,7 +3194,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-search"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3210,7 +3210,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-system"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "bytes",
+  "codex-protocol",
+@@ -3222,7 +3222,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-watcher"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "notify",
+  "pretty_assertions",
+@@ -3233,7 +3233,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-git-attribution"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-backend-client",
+  "codex-extension-api",
+@@ -3246,7 +3246,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-git-utils"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3272,7 +3272,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-goal-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3296,7 +3296,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-guardian-v2"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-api",
+@@ -3318,7 +3318,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-history"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-protocol",
+@@ -3330,7 +3330,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-home"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-extension-api",
+  "codex-utils-absolute-path",
+@@ -3341,7 +3341,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-hooks"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "async-channel",
+@@ -3366,7 +3366,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-http-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "bytes",
+  "codex-utils-cargo-bin",
+@@ -3398,7 +3398,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-image-generation-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-api",
+@@ -3425,7 +3425,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-install-context"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "codex-utils-home-dir",
+@@ -3438,7 +3438,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-keyring-store"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "keyring",
+  "tracing",
+@@ -3446,7 +3446,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-linux-sandbox"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "clap",
+  "codex-core",
+@@ -3471,7 +3471,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-lmstudio"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-core",
+  "codex-http-client",
+@@ -3485,7 +3485,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-login"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -3528,7 +3528,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mcp"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3566,7 +3566,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mcp-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-config",
+  "codex-connectors",
+@@ -3592,7 +3592,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mcp-server"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -3631,7 +3631,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-core",
+  "codex-extension-api",
+@@ -3652,7 +3652,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-read"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-shell-command",
+@@ -3662,7 +3662,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-write"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3699,7 +3699,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-message-history"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-config",
+  "memchr",
+@@ -3713,7 +3713,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-model-provider"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-agent-identity",
+  "codex-api",
+@@ -3736,7 +3736,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-model-provider-info"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-api",
+  "codex-protocol",
+@@ -3752,7 +3752,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-models-manager"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "chrono",
+  "codex-collaboration-mode-templates",
+@@ -3772,7 +3772,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-network-proxy"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -3810,7 +3810,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-ollama"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "assert_matches",
+  "async-stream",
+@@ -3830,7 +3830,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-otel"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "chrono",
+  "codex-api",
+@@ -3863,7 +3863,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-plugin"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-config",
+  "codex-protocol",
+@@ -3876,7 +3876,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-process-hardening"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "libc",
+  "pretty_assertions",
+@@ -3884,7 +3884,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-prompts"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-context-fragments",
+@@ -3898,7 +3898,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-protocol"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chardetng",
+@@ -3940,7 +3940,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-queue-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-core",
+@@ -3961,7 +3961,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-response-debug-context"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-api",
+@@ -3972,7 +3972,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-responses-api-proxy"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3989,7 +3989,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rmcp-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4035,7 +4035,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rollout"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4062,7 +4062,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rollout-trace"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-code-mode",
+@@ -4078,7 +4078,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-sandboxing"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-network-proxy",
+@@ -4102,7 +4102,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-secrets"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "age",
+  "anyhow",
+@@ -4123,7 +4123,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-shell-command"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -4146,7 +4146,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-shell-escalation"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4166,7 +4166,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-skills"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-shell-command",
+@@ -4183,7 +4183,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-skills-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-analytics",
+  "codex-config",
+@@ -4219,7 +4219,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-state"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4243,7 +4243,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-stdio-to-uds"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-uds",
+@@ -4255,7 +4255,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-terminal-detection"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "pretty_assertions",
+  "tracing",
+@@ -4263,7 +4263,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-test-binary-support"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-arg0",
+  "tempfile",
+@@ -4271,7 +4271,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-thread-manager-sample"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4282,7 +4282,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-thread-store"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "chrono",
+  "codex-app-server-protocol",
+@@ -4312,7 +4312,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-tools"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "bitflags 2.13.1",
+  "codex-code-mode",
+@@ -4338,7 +4338,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-tui"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -4450,7 +4450,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-uds"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "async-io",
+  "pretty_assertions",
+@@ -4462,7 +4462,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-absolute-path"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "dirs",
+  "dunce",
+@@ -4476,14 +4476,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-approval-presets"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-protocol",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-audio"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-protocol",
+@@ -4497,7 +4497,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cache"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "lru",
+  "sha1 0.10.6",
+@@ -4506,7 +4506,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cargo-bin"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "assert_cmd",
+  "runfiles",
+@@ -4515,7 +4515,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cli"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "clap",
+  "codex-protocol",
+@@ -4527,15 +4527,15 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-elapsed"
+-version = "0.0.0"
++version = "0.149.1"
+ 
+ [[package]]
+ name = "codex-utils-fuzzy-match"
+-version = "0.0.0"
++version = "0.149.1"
+ 
+ [[package]]
+ name = "codex-utils-home-dir"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dirs",
+@@ -4545,7 +4545,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-image"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-utils-cache",
+@@ -4558,7 +4558,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-json-to-toml"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "pretty_assertions",
+  "serde_json",
+@@ -4567,7 +4567,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-oss"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-core",
+  "codex-lmstudio",
+@@ -4577,7 +4577,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-output-truncation"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-string",
+@@ -4586,7 +4586,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-path"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dunce",
+@@ -4596,7 +4596,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-path-uri"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-utils-absolute-path",
+@@ -4612,7 +4612,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-plugins"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-exec-server",
+  "codex-exec-server-protocol",
+@@ -4626,7 +4626,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-pty"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "filedescriptor",
+@@ -4642,7 +4642,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-readiness"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "assert_matches",
+  "thiserror 2.0.18",
+@@ -4652,14 +4652,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-rustls-provider"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "rustls",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-sandbox-summary"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-absolute-path",
+@@ -4668,7 +4668,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-sleep-inhibitor"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "core-foundation 0.9.4",
+  "libc",
+@@ -4678,14 +4678,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-stream-parser"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-string"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "pretty_assertions",
+  "regex-lite",
+@@ -4695,14 +4695,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-template"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-v8-poc"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "pretty_assertions",
+  "v8",
+@@ -4710,7 +4710,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-web-search-extension"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-api",
+  "codex-core",
+@@ -4731,7 +4731,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-websocket-client"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-http-client",
+  "codex-utils-rustls-provider",
+@@ -4747,7 +4747,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-windows-sandbox"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -4760,6 +4760,7 @@ dependencies = [
+  "dirs-next",
+  "dunce",
+  "glob",
++ "portable-pty",
+  "pretty_assertions",
+  "rand 0.8.6",
+  "serde",
+@@ -4773,7 +4774,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-workload-identity"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "codex-http-client",
+  "pretty_assertions",
+@@ -5013,7 +5014,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "core_test_support"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -9275,7 +9276,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "mcp_test_support"
+-version = "0.0.0"
++version = "0.149.1"
+ dependencies = [
+  "anyhow",
+  "codex-login",
+diff --git a/codex-rs/app-server-transport/src/transport/unix_socket_tests.rs b/codex-rs/app-server-transport/src/transport/unix_socket_tests.rs
+index ac0b2b0..b25e3fd 100644
+--- a/codex-rs/app-server-transport/src/transport/unix_socket_tests.rs
++++ b/codex-rs/app-server-transport/src/transport/unix_socket_tests.rs
+@@ -55,7 +55,7 @@ fn listen_unix_socket_accepts_relative_custom_path() {
+ 
+ #[tokio::test]
+ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_and_pings() {
+-    let temp_dir = tempfile::TempDir::new().expect("temp dir");
++    let temp_dir = test_socket_directory();
+     let socket_path = test_socket_path(temp_dir.path());
+     let (transport_event_tx, mut transport_event_rx) =
+         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+@@ -143,7 +143,7 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
+ 
+ #[tokio::test]
+ async fn app_server_startup_lock_serializes_waiters() {
+-    let temp_dir = tempfile::TempDir::new().expect("temp dir");
++    let temp_dir = test_socket_directory();
+     let lock_path = test_startup_lock_path(temp_dir.path());
+     let first_lock = acquire_app_server_startup_lock(lock_path.clone())
+         .await
+@@ -168,7 +168,7 @@ async fn app_server_startup_lock_serializes_waiters() {
+ async fn control_socket_file_is_private_after_bind() {
+     use std::os::unix::fs::PermissionsExt;
+ 
+-    let temp_dir = tempfile::TempDir::new().expect("temp dir");
++    let temp_dir = test_socket_directory();
+     let socket_path = test_socket_path(temp_dir.path());
+     let (transport_event_tx, _transport_event_rx) =
+         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+@@ -199,6 +199,16 @@ fn default_control_socket_path() -> AbsolutePathBuf {
+     app_server_control_socket_path(&codex_home).expect("default control socket path")
+ }
+ 
++fn test_socket_directory() -> tempfile::TempDir {
++    // macOS TMPDIR can exceed the Unix-domain socket path limit once the
++    // control socket filename is appended.
++    #[cfg(target_os = "macos")]
++    let directory = tempfile::tempdir_in("/tmp");
++    #[cfg(not(target_os = "macos"))]
++    let directory = tempfile::tempdir();
++    directory.expect("short control socket fixture directory")
++}
++
+ fn test_socket_path(temp_dir: &Path) -> AbsolutePathBuf {
+     AbsolutePathBuf::from_absolute_path(
+         temp_dir
+diff --git a/codex-rs/app-server/tests/suite/v2/executor_skills.rs b/codex-rs/app-server/tests/suite/v2/executor_skills.rs
+index 2d13852..bb1de6e 100644
+--- a/codex-rs/app-server/tests/suite/v2/executor_skills.rs
++++ b/codex-rs/app-server/tests/suite/v2/executor_skills.rs
+@@ -1,5 +1,6 @@
+ use std::time::Duration;
+ 
++use anyhow::Context;
+ use anyhow::Result;
+ use app_test_support::TestAppServer;
+ use app_test_support::to_response;
+@@ -122,6 +123,8 @@ async fn exercise_executor_skill(scenario: ExecutorSkillScenario) -> Result<()>
+         format!(
+             r#"
+ model = "mock-model"
++# Exercise the skill SDK's own pagination budget without generic context truncation.
++tool_output_token_limit = 200000
+ {analytics_config}
+ approval_policy = "{approval_policy}"
+ {sandbox_config}
+@@ -526,7 +529,8 @@ stream_max_retries = 0
+         &requests[1]
+             .function_call_output_text("list")
+             .expect("skills.list output"),
+-    )?;
++    )
++    .context("skills.list JSON")?;
+     match scenario {
+         ExecutorSkillScenario::VisibleWithBudgetWarning
+         | ExecutorSkillScenario::RestrictedVisible => {
+@@ -565,7 +569,8 @@ stream_max_retries = 0
+         &requests[2]
+             .function_call_output_text("main")
+             .expect("main skill output"),
+-    )?;
++    )
++    .context("main skill JSON")?;
+     assert!(
+         main_output["contents"]
+             .as_str()
+@@ -587,7 +592,8 @@ stream_max_retries = 0
+         assert!(approved_reference_output.contains(REFERENCE_MARKER));
+         return Ok(());
+     }
+-    let reference_output = serde_json::from_str::<serde_json::Value>(&reference_output_text)?;
++    let reference_output = serde_json::from_str::<serde_json::Value>(&reference_output_text)
++        .context("referenced skill resource JSON")?;
+     assert!(
+         reference_output["contents"]
+             .as_str()
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+index c0cc479..b32c59b 100644
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -76,6 +76,7 @@ async fn test_config_with_cli_overrides(
+     ));
+     let config = ConfigBuilder::without_managed_config_for_tests()
+         .codex_home(home.path().to_path_buf())
++        .fallback_cwd(Some(home.path().to_path_buf()))
+         .cli_overrides(cli_overrides)
+         .build()
+         .await
+@@ -295,12 +296,17 @@ fn history_contains_text<'a>(
+ }
+ 
+ async fn wait_for_recorded_user_message(thread: &CodexThread, needle: &str) {
+-    timeout(Duration::from_secs(5), async {
++    let mut events = Vec::new();
++    let result = timeout(Duration::from_secs(5), async {
+         loop {
+             let event = thread
+                 .next_event()
+                 .await
+                 .expect("event stream should stay open");
++            events.push(format!("{:?}", event.msg));
++            if events.len() > 8 {
++                events.remove(0);
++            }
+             if let EventMsg::ItemCompleted(ItemCompletedEvent {
+                 item: TurnItem::UserMessage(item),
+                 ..
+@@ -313,8 +319,11 @@ async fn wait_for_recorded_user_message(thread: &CodexThread, needle: &str) {
+             }
+         }
+     })
+-    .await
+-    .expect("timed out waiting for user message recording");
++    .await;
++    assert!(
++        result.is_ok(),
++        "timed out waiting for user message recording; events={events:?}"
++    );
+ }
+ 
+ fn history_contains_assistant_inter_agent_communication<'a>(
+@@ -606,7 +615,10 @@ async fn subscribe_status_updates_on_shutdown() {
+ 
+ #[tokio::test]
+ async fn send_input_submits_user_message() {
+-    let harness = AgentControlHarness::new().await;
++    let (home, mut config) = test_config().await;
++    // This input-recording fixture does not exercise upstream websocket prewarm.
++    config.model_provider.supports_websockets = false;
++    let harness = AgentControlHarness::new_with_config(home, config).await;
+     let (thread_id, thread) = harness.start_thread().await;
+ 
+     let submission_id = harness
+@@ -950,7 +962,10 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
+ 
+ #[tokio::test]
+ async fn spawn_agent_creates_thread_and_sends_prompt() {
+-    let harness = AgentControlHarness::new().await;
++    let (home, mut config) = test_config().await;
++    // This input-recording fixture does not exercise upstream websocket prewarm.
++    config.model_provider.supports_websockets = false;
++    let harness = AgentControlHarness::new_with_config(home, config).await;
+     let thread_id = harness
+         .control
+         .spawn_agent(
+@@ -1306,7 +1321,10 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
+ 
+ #[tokio::test]
+ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
+-    let harness = AgentControlHarness::new().await;
++    let (home, mut config) = test_config().await;
++    // This input-recording fixture does not exercise upstream websocket prewarm.
++    config.model_provider.supports_websockets = false;
++    let harness = AgentControlHarness::new_with_config(home, config).await;
+     let mut parent_config = harness.config.clone();
+     let _ = parent_config.features.enable(Feature::MultiAgentV2);
+     parent_config.developer_instructions = Some("Parent developer instructions.".to_string());
+diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
+index cc71acb..74a4c2a 100644
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -916,6 +916,17 @@ impl Session {
+             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
+             .await;
+ 
++        // Win7 command jobs break away from the outer app-server job. An
++        // interrupted turn must explicitly stop its own live terminals before
++        // reporting completion, while previous turns' servers keep running.
++        #[cfg(windows)]
++        if codex_utils_pty::legacy_windows_jobs() {
++            self.services
++                .unified_exec_manager
++                .terminate_turn_processes(&sub_id)
++                .await;
++        }
++
+         if reason == TurnAbortReason::Interrupted
+             && let Some(marker) = interrupted_turn_history_marker(
+                 InterruptedTurnHistoryMarker::from_config_and_version(
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+index fc76ab4..8e6fd11 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -2608,7 +2608,9 @@ async fn send_input_interrupts_before_prompt() {
+     let (mut session, turn) = make_session_and_context().await;
+     let manager = thread_manager();
+     session.services.agent_control = manager.agent_control();
+-    let config = turn.config.as_ref().clone();
++    let mut config = turn.config.as_ref().clone();
++    // This coordination fixture must not wait for a real upstream websocket.
++    config.model_provider.supports_websockets = false;
+     let thread = manager
+         .start_thread(StartThreadOptions::new(config.clone()))
+         .await
+@@ -2657,7 +2659,9 @@ async fn send_input_accepts_structured_items() {
+     let (mut session, turn) = make_session_and_context().await;
+     let manager = thread_manager();
+     session.services.agent_control = manager.agent_control();
+-    let config = turn.config.as_ref().clone();
++    let mut config = turn.config.as_ref().clone();
++    // This coordination fixture must not wait for a real upstream websocket.
++    config.model_provider.supports_websockets = false;
+     let thread = manager
+         .start_thread(StartThreadOptions::new(config.clone()))
+         .await
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index 0283d6a..fdf7046 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -840,7 +840,7 @@ async fn shell_zsh_fork_stays_standalone_until_unified_exec_composition_is_enabl
+     })
+     .await;
+ 
+-    if codex_utils_pty::conpty_supported() {
++    if codex_utils_pty::interactive_pty_supported() {
+         composed.assert_visible_contains(&["exec_command", "write_stdin"]);
+         composed.assert_visible_lacks(&["shell_command"]);
+         composed.assert_registered_contains(&["exec_command", "write_stdin", "shell_command"]);
+@@ -853,7 +853,7 @@ async fn shell_zsh_fork_stays_standalone_until_unified_exec_composition_is_enabl
+ 
+ #[tokio::test]
+ async fn zsh_fork_unified_exec_hides_shell_parameter() {
+-    if !codex_utils_pty::conpty_supported() {
++    if !codex_utils_pty::interactive_pty_supported() {
+         return;
+     }
+ 
+@@ -878,7 +878,7 @@ async fn zsh_fork_unified_exec_hides_shell_parameter() {
+ 
+ #[tokio::test]
+ async fn zsh_fork_unified_exec_keeps_shell_parameter_when_remote_environment_available() {
+-    if !codex_utils_pty::conpty_supported() {
++    if !codex_utils_pty::interactive_pty_supported() {
+         return;
+     }
+ 
+diff --git a/codex-rs/core/src/unified_exec/mod.rs b/codex-rs/core/src/unified_exec/mod.rs
+index 77b2362..cf6b47f 100644
+--- a/codex-rs/core/src/unified_exec/mod.rs
++++ b/codex-rs/core/src/unified_exec/mod.rs
+@@ -51,6 +51,8 @@ mod head_tail_buffer;
+ mod process;
+ mod process_manager;
+ mod process_state;
++#[cfg(any(windows, test))]
++mod turn_cleanup;
+ 
+ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
+     process_manager::set_deterministic_process_ids_for_tests(enabled);
+@@ -167,6 +169,8 @@ impl Default for UnifiedExecProcessManager {
+ }
+ 
+ struct ProcessEntry {
++    #[cfg(any(windows, test))]
++    turn_id: String,
+     process: Arc<UnifiedExecProcess>,
+     plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
+     call_id: String,
+diff --git a/codex-rs/core/src/unified_exec/mod_tests.rs b/codex-rs/core/src/unified_exec/mod_tests.rs
+index 682d789..c8c19a0 100644
+--- a/codex-rs/core/src/unified_exec/mod_tests.rs
++++ b/codex-rs/core/src/unified_exec/mod_tests.rs
+@@ -133,6 +133,7 @@ async fn exec_command_with_tty(
+     let process_started_alive = !process.has_exited() && process.exit_code().is_none();
+     if process_started_alive {
+         let entry = ProcessEntry {
++            turn_id: "fixture-turn".to_string(),
+             process: Arc::clone(&process),
+             plugin_metrics_sidecar: None,
+             call_id: context.call_id.clone(),
+@@ -608,6 +609,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
+     manager.process_store.lock().await.processes.insert(
+         process_id,
+         ProcessEntry {
++            turn_id: "fixture-turn".to_string(),
+             process,
+             plugin_metrics_sidecar: None,
+             call_id: "call".to_string(),
+@@ -682,6 +684,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
+     manager.process_store.lock().await.processes.insert(
+         process_id,
+         ProcessEntry {
++            turn_id: "fixture-turn".to_string(),
+             process: Arc::clone(&process),
+             plugin_metrics_sidecar: None,
+             call_id: "call".to_string(),
+diff --git a/codex-rs/core/src/unified_exec/process_manager.rs b/codex-rs/core/src/unified_exec/process_manager.rs
+index 9fd8b08..603220e 100644
+--- a/codex-rs/core/src/unified_exec/process_manager.rs
++++ b/codex-rs/core/src/unified_exec/process_manager.rs
+@@ -271,7 +271,7 @@ impl Drop for InitialExecCommandGuard {
+     }
+ }
+ 
+-async fn unregister_network_approval_for_entry(entry: &ProcessEntry) {
++pub(super) async fn unregister_network_approval_for_entry(entry: &ProcessEntry) {
+     if let Some(network_approval) = entry.network_approval.as_ref()
+         && let Some(session) = entry.session.upgrade()
+     {
+@@ -1007,6 +1007,8 @@ impl UnifiedExecProcessManager {
+         let plugin_metrics_sidecar =
+             metrics_sidecar.map(|sidecar| Arc::new(std::sync::Mutex::new(Some(sidecar))));
+         let entry = ProcessEntry {
++            #[cfg(any(windows, test))]
++            turn_id: context.step_context.turn.sub_id.clone(),
+             process: Arc::clone(&process),
+             plugin_metrics_sidecar: plugin_metrics_sidecar.clone(),
+             call_id: context.call_id.clone(),
+diff --git a/codex-rs/core/src/unified_exec/process_manager_tests.rs b/codex-rs/core/src/unified_exec/process_manager_tests.rs
+index 4d3429e..b487b7f 100644
+--- a/codex-rs/core/src/unified_exec/process_manager_tests.rs
++++ b/codex-rs/core/src/unified_exec/process_manager_tests.rs
+@@ -576,6 +576,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
+         store.processes.insert(
+             process_id,
+             ProcessEntry {
++                turn_id: "fixture-turn".to_string(),
+                 process: if is_exited {
+                     Arc::clone(&exited_process)
+                 } else {
+@@ -606,3 +607,50 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
+         (None, MAX_UNIFIED_EXEC_PROCESSES)
+     );
+ }
++
++#[tokio::test]
++async fn interrupted_turn_terminates_only_its_owned_terminals() {
++    let manager = UnifiedExecProcessManager::default();
++    let mut processes = Vec::new();
++    for (id, turn_id) in [(1, "previous"), (2, "interrupted"), (3, "interrupted")] {
++        let process = Arc::new(
++            crate::unified_exec::process_tests::remote_process(
++                codex_exec_server::WriteStatus::Accepted,
++                /*terminate_error*/ None,
++                codex_sandboxing::SandboxType::None,
++            )
++            .await,
++        );
++        let mut store = manager.process_store.lock().await;
++        store.reserved_process_ids.insert(id);
++        store.processes.insert(
++            id,
++            ProcessEntry {
++                turn_id: turn_id.to_string(),
++                process: Arc::clone(&process),
++                plugin_metrics_sidecar: None,
++                call_id: format!("call-{id}"),
++                process_id: id,
++                cwd: PathUri::parse("file:///tmp").unwrap(),
++                initial_exec_command_active: Arc::new(AtomicBool::new(id == 2)),
++                hook_command: "fixture".to_string(),
++                tty: true,
++                network_approval: None,
++                session: std::sync::Weak::new(),
++                last_used: Instant::now(),
++            },
++        );
++        processes.push(process);
++    }
++    manager.terminate_turn_processes("interrupted").await;
++    let store = manager.process_store.lock().await;
++    assert_eq!(store.processes.keys().copied().collect::<Vec<_>>(), vec![1]);
++    assert_eq!(store.reserved_process_ids, HashSet::from([1]));
++    assert_eq!(
++        processes
++            .iter()
++            .map(|process| process.cancellation_token().is_cancelled())
++            .collect::<Vec<_>>(),
++        vec![false, true, true]
++    );
++}
+diff --git a/codex-rs/core/tests/suite/exec.rs b/codex-rs/core/tests/suite/exec.rs
+index 355711e..1f11349 100644
+--- a/codex-rs/core/tests/suite/exec.rs
++++ b/codex-rs/core/tests/suite/exec.rs
+@@ -37,9 +37,15 @@ where
+     let params = ExecParams {
+         command: command.into_iter().map(Into::into).collect(),
+         cwd: cwd.clone(),
+-        expiration: 1000.into(),
++        expiration: 5000.into(),
+         capture_policy: ExecCapturePolicy::ShellTool,
+-        env: HashMap::new(),
++        env: HashMap::from([
++            (String::from("HOME"), cwd.as_path().display().to_string()),
++            (
++                String::from("PATH"),
++                std::env::var("PATH").expect("test PATH"),
++            ),
++        ]),
+         network: None,
+         network_environment_id: None,
+         sandbox_permissions: SandboxPermissions::UseDefault,
+diff --git a/codex-rs/core/tests/suite/openai_file_mcp.rs b/codex-rs/core/tests/suite/openai_file_mcp.rs
+index 80cbbb5..ae7df9c 100644
+--- a/codex-rs/core/tests/suite/openai_file_mcp.rs
++++ b/codex-rs/core/tests/suite/openai_file_mcp.rs
+@@ -44,7 +44,6 @@ use serde_json::json;
+ use wiremock::Mock;
+ use wiremock::MockServer;
+ use wiremock::ResponseTemplate;
+-use wiremock::matchers::body_json;
+ use wiremock::matchers::body_partial_json;
+ use wiremock::matchers::header;
+ use wiremock::matchers::method;
+diff --git a/codex-rs/external-agent-migration/src/detect/sessions/cur_tests.rs b/codex-rs/external-agent-migration/src/detect/sessions/cur_tests.rs
+index eddaab4..04793f5 100644
+--- a/codex-rs/external-agent-migration/src/detect/sessions/cur_tests.rs
++++ b/codex-rs/external-agent-migration/src/detect/sessions/cur_tests.rs
+@@ -191,7 +191,16 @@ fn resolves_cur_project_names_with_common_separators() {
+         ("my-awesome-project", "my-awesome-project"),
+         ("my-awesome-cool-project", "my-awesome-cool-project"),
+     ] {
+-        let root = TempDir::new().expect("tempdir");
++        #[cfg(unix)]
++        let root = tempfile::Builder::new()
++            .prefix("curfixture")
++            .tempdir_in("/tmp")
++            .expect("tempdir");
++        #[cfg(not(unix))]
++        let root = tempfile::Builder::new()
++            .prefix("curfixture")
++            .tempdir()
++            .expect("tempdir");
+         let project = root.path().join(project_name);
+         fs::create_dir_all(&project).expect("project root");
+         let encoded = format!("{}-{encoded_name}", encode_project_path(root.path()));
+diff --git a/codex-rs/install-context/src/lib.rs b/codex-rs/install-context/src/lib.rs
+index a88e2e2..f876455 100644
+--- a/codex-rs/install-context/src/lib.rs
++++ b/codex-rs/install-context/src/lib.rs
+@@ -852,7 +852,10 @@ mod tests {
+     fn brew_is_detected_on_macos_prefixes() {
+         let context = InstallContext::from_exe_with_codex_home(
+             /*is_macos*/ true,
+-            /*current_exe*/ Some(Path::new("/opt/homebrew/bin/codex")),
++            /*current_exe*/
++            Some(Path::new(
++                "/opt/homebrew/Caskroom/codex/nonexistent-test-version/bin/codex",
++            )),
+             /*method_override*/ None,
+             /*codex_home*/ None,
+         );
+diff --git a/codex-rs/mcp-server/tests/common/mcp_process.rs b/codex-rs/mcp-server/tests/common/mcp_process.rs
+index f1ad725..2bb4a6d 100644
+--- a/codex-rs/mcp-server/tests/common/mcp_process.rs
++++ b/codex-rs/mcp-server/tests/common/mcp_process.rs
+@@ -163,7 +163,7 @@ impl McpProcess {
+                 "serverInfo": {
+                     "name": "codex-mcp-server",
+                     "title": "Codex",
+-                    "version": "0.0.0",
++                    "version": build_version,
+                     "user_agent": user_agent
+                 },
+                 "protocolVersion": ProtocolVersion::V_2025_03_26
+diff --git a/codex-rs/protocol/src/permission_profile_intersection_tests.rs b/codex-rs/protocol/src/permission_profile_intersection_tests.rs
+index 6245c79..f8db5b5 100644
+--- a/codex-rs/protocol/src/permission_profile_intersection_tests.rs
++++ b/codex-rs/protocol/src/permission_profile_intersection_tests.rs
+@@ -95,7 +95,11 @@ fn intersection(
+ 
+ #[test]
+ fn effective_workspace_intersection_preserves_network_metadata_and_temp() {
+-    let temp = TempDir::new().expect("workspace");
++    // Keep the workspace outside ambient TMPDIR, whose write grant is tested separately.
++    let temp = tempfile::Builder::new()
++        .prefix("permission-fixture")
++        .tempdir_in(std::env::current_dir().expect("cwd"))
++        .expect("workspace");
+     let root = canonical(&temp);
+     let project = root.join("project");
+     std::fs::create_dir(project.as_path()).expect("project directory");
+diff --git a/codex-rs/rmcp-client/src/oauth_http_client_security_tests.rs b/codex-rs/rmcp-client/src/oauth_http_client_security_tests.rs
+index 736ffc8..bdbe359 100644
+--- a/codex-rs/rmcp-client/src/oauth_http_client_security_tests.rs
++++ b/codex-rs/rmcp-client/src/oauth_http_client_security_tests.rs
+@@ -119,7 +119,7 @@ async fn same_origin_redirects_preserve_timeout_and_response_body_limits() -> Re
+         let redirect = if oversized_redirect_body {
+             redirect.set_body_bytes(vec![0; MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES + 1])
+         } else {
+-            redirect.set_delay(Duration::from_millis(/*millis*/ 400))
++            redirect.set_delay(Duration::from_secs(3))
+         };
+         Mock::given(method("POST"))
+             .and(path("/register"))
+@@ -129,9 +129,7 @@ async fn same_origin_redirects_preserve_timeout_and_response_body_limits() -> Re
+             .await;
+         Mock::given(method("POST"))
+             .and(path("/register/"))
+-            .respond_with(
+-                ResponseTemplate::new(201).set_delay(Duration::from_millis(/*millis*/ 400)),
+-            )
++            .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_secs(3)))
+             .expect(u64::from(!oversized_redirect_body))
+             .mount(&server)
+             .await;
+@@ -156,7 +154,7 @@ async fn same_origin_redirects_preserve_timeout_and_response_body_limits() -> Re
+                     .uri(format!("{}/register", server.uri()))
+                     .body(Vec::new())?,
+                 OAuthHttpRedirectPolicy::Follow,
+-                (!oversized_redirect_body).then_some(Duration::from_millis(/*millis*/ 700)),
++                (!oversized_redirect_body).then_some(Duration::from_secs(5)),
+             )
+             .await
+             .expect_err("redirects must preserve request timeout and response body limits");
+diff --git a/codex-rs/sandboxing/src/seatbelt_tests.rs b/codex-rs/sandboxing/src/seatbelt_tests.rs
+index 415358a..296647e 100644
+--- a/codex-rs/sandboxing/src/seatbelt_tests.rs
++++ b/codex-rs/sandboxing/src/seatbelt_tests.rs
+@@ -44,9 +44,9 @@ use tempfile::TempDir;
+ 
+ fn assert_seatbelt_denied(stderr: &[u8], path: &Path) {
+     let stderr = String::from_utf8_lossy(stderr);
+-    let expected = format!("bash: {}: Operation not permitted\n", path.display());
++    let expected = format!("{}: Operation not permitted\n", path.display());
+     assert!(
+-        stderr == expected
++        (stderr.starts_with("bash:") && stderr.ends_with(&expected))
+             || stderr.contains("sandbox-exec: sandbox_apply: Operation not permitted"),
+         "unexpected stderr: {stderr}"
+     );
+@@ -1309,21 +1309,21 @@ fn create_seatbelt_args_with_read_only_git_and_codex_subpaths() {
+             "-DWRITABLE_ROOT_0_EXCLUDED_0={}",
+             cwd.canonicalize()
+                 .expect("canonicalize cwd")
+-                .join(".codex")
++                .join(".git")
+                 .display()
+         ),
+         format!(
+             "-DWRITABLE_ROOT_0_EXCLUDED_1={}",
+             cwd.canonicalize()
+                 .expect("canonicalize cwd")
+-                .join(".git")
++                .join(".agents")
+                 .display()
+         ),
+         format!(
+             "-DWRITABLE_ROOT_0_EXCLUDED_2={}",
+             cwd.canonicalize()
+                 .expect("canonicalize cwd")
+-                .join(".agents")
++                .join(".codex")
+                 .display()
+         ),
+         format!(
+@@ -1920,19 +1920,19 @@ fn create_seatbelt_args_for_cwd_as_git_repo() {
+         "missing {expected_dot_git}: {args:#?}"
+     );
+     let expected_dot_codex = format!(
+-        "-DWRITABLE_ROOT_0_EXCLUDED_1={}",
++        "-DWRITABLE_ROOT_0_EXCLUDED_2={}",
+         dot_codex_canonical.to_string_lossy()
+     );
+     assert!(
+         args.contains(&expected_dot_codex),
+         "missing {expected_dot_codex}: {args:#?}"
+     );
+-    let unexpected_dot_agents = format!(
++    let expected_dot_agents = format!(
+         "-DWRITABLE_ROOT_0_EXCLUDED_1={}",
+         dot_agents_canonical.to_string_lossy()
+     );
+     assert!(
+-        !args.contains(&unexpected_dot_agents),
++        args.contains(&expected_dot_agents),
+         "missing .agents should be handled by regex rather than materialized as a path param: {args:#?}"
+     );
+     let expected_slash_tmp = format!("-DWRITABLE_ROOT_1={}", slash_tmp.to_string_lossy());
+diff --git a/codex-rs/tools/src/tool_config.rs b/codex-rs/tools/src/tool_config.rs
+index 990d4a3..39bd4bb 100644
+--- a/codex-rs/tools/src/tool_config.rs
++++ b/codex-rs/tools/src/tool_config.rs
+@@ -105,7 +105,7 @@ pub fn shell_type_for_model_and_features(
+         match unified_exec_feature_mode {
+             UnifiedExecFeatureMode::Disabled => shell_command_type,
+             UnifiedExecFeatureMode::Direct | UnifiedExecFeatureMode::ZshFork => {
+-                if codex_utils_pty::conpty_supported() {
++                if codex_utils_pty::interactive_pty_supported() {
+                     ConfigShellToolType::UnifiedExec
+                 } else {
+                     ConfigShellToolType::ShellCommand
+diff --git a/codex-rs/tools/src/tool_config_tests.rs b/codex-rs/tools/src/tool_config_tests.rs
+index 5bcc11f..2e99a4e 100644
+--- a/codex-rs/tools/src/tool_config_tests.rs
++++ b/codex-rs/tools/src/tool_config_tests.rs
+@@ -75,7 +75,7 @@ fn shell_type_is_derived_from_model_and_feature_gates() {
+     );
+ 
+     features.enable(Feature::UnifiedExec);
+-    let expected_unified_exec = if codex_utils_pty::conpty_supported() {
++    let expected_unified_exec = if codex_utils_pty::interactive_pty_supported() {
+         ConfigShellToolType::UnifiedExec
+     } else {
+         ConfigShellToolType::ShellCommand
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 490c069..9395d0f 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -2439,6 +2439,10 @@ mod tests {
+     #[cfg(unix)]
+     #[tokio::test]
+     async fn default_daemon_auto_connect_probes_socket_only() -> color_eyre::Result<()> {
++        // Keep the fixture's Unix socket below macOS SUN_LEN.
++        #[cfg(target_os = "macos")]
++        let codex_home = tempfile::tempdir_in("/tmp")?;
++        #[cfg(not(target_os = "macos"))]
+         let codex_home = TempDir::new()?;
+         let socket_path =
+             codex_app_server_client::app_server_control_socket_path(codex_home.path())?;
+diff --git a/codex-rs/tui/src/version.rs b/codex-rs/tui/src/version.rs
+index 8c8d108..4a8107d 100644
+--- a/codex-rs/tui/src/version.rs
++++ b/codex-rs/tui/src/version.rs
+@@ -1,2 +1,8 @@
+ /// The current Codex CLI version as embedded at compile time.
++#[cfg(not(test))]
+ pub const CODEX_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
++
++// Snapshot layouts already redact the version text. Freeze its width before
++// rendering too, so release-tag builds keep the same layout as source builds.
++#[cfg(test)]
++pub const CODEX_CLI_VERSION: &str = "0.0.0";
+diff --git a/codex-rs/utils/pty/Cargo.toml b/codex-rs/utils/pty/Cargo.toml
+index 84801f4..237c5c2 100644
+--- a/codex-rs/utils/pty/Cargo.toml
++++ b/codex-rs/utils/pty/Cargo.toml
+@@ -21,6 +21,7 @@ lazy_static = { workspace = true }
+ log = { workspace = true }
+ shared_library = "0.1.9"
+ winapi = { version = "0.3.9", features = [
++    "fileapi",
+     "handleapi",
+     "jobapi",
+     "jobapi2",
+diff --git a/codex-rs/utils/pty/src/lib.rs b/codex-rs/utils/pty/src/lib.rs
+index 24c667a..2f66639 100644
+--- a/codex-rs/utils/pty/src/lib.rs
++++ b/codex-rs/utils/pty/src/lib.rs
+@@ -35,6 +35,8 @@ pub type ExecCommandSession = ProcessHandle;
+ pub type SpawnedPty = SpawnedProcess;
+ /// Report whether ConPTY is available on this platform (Windows only).
+ pub use pty::conpty_supported;
++/// Report whether an installed backend supports interactive console execution.
++pub use pty::interactive_pty_supported;
+ /// Spawn a process attached to a PTY for interactive use.
+ pub use pty::spawn_process as spawn_pty_process;
+ #[cfg(windows)]
+@@ -44,4 +46,12 @@ pub use win::PsuedoCon;
+ #[cfg(windows)]
+ pub use win::conpty::RawConPty;
+ #[cfg(windows)]
++pub use win::legacy_windows_jobs;
++#[cfg(windows)]
++pub use win::winpty::WinPtySession;
++#[cfg(windows)]
++pub use win::winpty::WinPtySpawn;
++#[cfg(windows)]
++pub use win::winpty_driver::spawn_driver as spawn_winpty_driver;
++#[cfg(windows)]
+ pub use windows_input::WindowsTtyInputNormalizer;
+diff --git a/codex-rs/utils/pty/src/pipe.rs b/codex-rs/utils/pty/src/pipe.rs
+index 3715ba7..f899ef3 100644
+--- a/codex-rs/utils/pty/src/pipe.rs
++++ b/codex-rs/utils/pty/src/pipe.rs
+@@ -187,7 +187,17 @@ async fn spawn_process_with_stdin_mode(
+     command.stderr(Stdio::piped());
+ 
+     #[cfg(windows)]
+-    let job = crate::win::JobObject::create().map(Arc::new);
++    let legacy_job = crate::win::legacy_windows_jobs();
++    #[cfg(windows)]
++    let (mut child, job) = if legacy_job {
++        let job = Arc::new(crate::win::JobObject::create_without_breakaway()?);
++        let child = job.spawn_contained(&mut command)?;
++        (child, Ok(job))
++    } else {
++        let job = crate::win::JobObject::create().map(Arc::new);
++        (command.spawn()?, job)
++    };
++    #[cfg(not(windows))]
+     let mut child = command.spawn()?;
+     #[cfg(windows)]
+     let windows_terminator = {
+@@ -200,7 +210,9 @@ async fn spawn_process_with_stdin_mode(
+             let process_handle = child
+                 .raw_handle()
+                 .ok_or_else(|| io::Error::other("missing child process handle"))?;
+-            job.assign_process(process_handle)?;
++            if !legacy_job {
++                job.assign_process(process_handle)?;
++            }
+             Ok(job)
+         });
+         match assigned_job {
+diff --git a/codex-rs/utils/pty/src/pty.rs b/codex-rs/utils/pty/src/pty.rs
+index 182f96f..fa8cb24 100644
+--- a/codex-rs/utils/pty/src/pty.rs
++++ b/codex-rs/utils/pty/src/pty.rs
+@@ -50,6 +50,18 @@ pub fn conpty_supported() -> bool {
+     true
+ }
+ 
++/// Reports whether a usable interactive console backend is installed.
++pub fn interactive_pty_supported() -> bool {
++    #[cfg(windows)]
++    {
++        crate::win::conpty_supported() || crate::win::winpty::supported()
++    }
++    #[cfg(not(windows))]
++    {
++        true
++    }
++}
++
+ struct PtyChildTerminator {
+     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+     #[cfg(unix)]
+@@ -157,9 +169,6 @@ async fn spawn_process_portable(
+     arg0: &Option<String>,
+     size: TerminalSize,
+ ) -> Result<SpawnedProcess> {
+-    let pty_system = platform_native_pty_system();
+-    let pair = pty_system.openpty(size.into())?;
+-
+     let mut command_builder = CommandBuilder::new(arg0.as_ref().unwrap_or(&program.to_string()));
+     command_builder.cwd(cwd);
+     command_builder.env_clear();
+@@ -170,6 +179,24 @@ async fn spawn_process_portable(
+         command_builder.env(key, value);
+     }
+ 
++    #[cfg(windows)]
++    if !crate::win::conpty_supported() {
++        let job = Arc::new(crate::win::JobObject::create_without_breakaway()?);
++        let spawned = crate::win::winpty::WinPtySession::spawn(
++            command_builder,
++            /*token*/ None,
++            job,
++            size,
++            /*desktop*/ None,
++        )?;
++        return Ok(crate::win::winpty_driver::spawn_driver(
++            spawned, /*timeout_ms*/ None,
++        ));
++    }
++
++    let pty_system = platform_native_pty_system();
++    let pair = pty_system.openpty(size.into())?;
++
+     let mut child = pair.slave.spawn_command(command_builder)?;
+     #[cfg(unix)]
+     // portable-pty establishes the spawned PTY child as a new session leader on
+diff --git a/codex-rs/utils/pty/src/win/job.rs b/codex-rs/utils/pty/src/win/job.rs
+index b06035f..b3665f0 100644
+--- a/codex-rs/utils/pty/src/win/job.rs
++++ b/codex-rs/utils/pty/src/win/job.rs
+@@ -4,21 +4,26 @@ use std::os::windows::io::AsRawHandle;
+ use std::os::windows::io::FromRawHandle;
+ use std::os::windows::io::RawHandle;
+ use std::sync::Mutex;
++use std::sync::OnceLock;
+ use tokio::process::Child;
+ use tokio::process::Command;
+ use winapi::shared::ntdef::NT_SUCCESS;
+ use winapi::shared::ntdef::NTSTATUS;
+ use winapi::um::jobapi2::AssignProcessToJobObject;
+ use winapi::um::jobapi2::CreateJobObjectW;
++use winapi::um::jobapi2::QueryInformationJobObject;
+ use winapi::um::jobapi2::SetInformationJobObject;
+ use winapi::um::jobapi2::TerminateJobObject;
+ use winapi::um::processthreadsapi::OpenProcess;
+ use winapi::um::processthreadsapi::TerminateProcess;
++use winapi::um::winbase::CREATE_BREAKAWAY_FROM_JOB;
+ use winapi::um::winbase::CREATE_SUSPENDED;
+ use winapi::um::winnt::HANDLE;
+ use winapi::um::winnt::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+ use winapi::um::winnt::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++use winapi::um::winnt::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION;
+ use winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
++use winapi::um::winnt::JobObjectBasicAccountingInformation;
+ use winapi::um::winnt::JobObjectExtendedLimitInformation;
+ use winapi::um::winnt::PROCESS_SET_QUOTA;
+ use winapi::um::winnt::PROCESS_SUSPEND_RESUME;
+@@ -29,6 +34,16 @@ unsafe extern "system" {
+     fn NtResumeProcess(process_handle: HANDLE) -> NTSTATUS;
+ }
+ 
++/// Reports whether command jobs must cooperate with a non-nestable parent job.
++pub fn legacy_windows_jobs() -> bool {
++    super::psuedocon::windows_build_number().is_some_and(|build| build < 9200)
++}
++
++// A normally exited shell may leave a background server running. Keep its job
++// owned by this app-server on Win7, so app-server termination still kills it.
++// Reap completed jobs whenever a new background job is retained.
++static BACKGROUND_JOBS: OnceLock<Mutex<Vec<OwnedHandle>>> = OnceLock::new();
++
+ /// Owns a Windows Job Object used to terminate a spawned process tree.
+ #[derive(Debug)]
+ pub struct JobObject {
+@@ -123,7 +138,12 @@ impl JobObject {
+ 
+     /// Prevents a child from running before it can be assigned to this job.
+     pub fn prepare_suspended_spawn(&self, command: &mut Command) {
+-        command.creation_flags(CREATE_SUSPENDED).kill_on_drop(true);
++        let flags = if legacy_windows_jobs() {
++            CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB
++        } else {
++            CREATE_SUSPENDED
++        };
++        command.creation_flags(flags).kill_on_drop(true);
+     }
+ 
+     /// Assigns and resumes a suspended child, returning whether assignment succeeded.
+@@ -186,8 +206,10 @@ impl JobObject {
+ 
+     /// Allows contained descendants to keep running after the root exits normally.
+     ///
+-    /// This disables both explicit job termination and kill-on-close for this
+-    /// object. Calls race safely with [`Self::terminate`]: whichever operation
++    /// This disables explicit termination through this object. On Win7 the
++    /// app-server retains kill-on-close ownership; newer Windows releases let
++    /// descendants survive closing the handle. Calls race safely with
++    /// [`Self::terminate`]: whichever operation
+     /// acquires the state lock first determines whether the process tree is
+     /// preserved or terminated.
+     pub fn preserve_descendants(&self) -> io::Result<()> {
+@@ -199,7 +221,30 @@ impl JobObject {
+             return Ok(());
+         }
+ 
+-        Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_BREAKAWAY_OK)?;
++        if legacy_windows_jobs() {
++            let mut jobs = BACKGROUND_JOBS
++                .get_or_init(|| Mutex::new(Vec::new()))
++                .lock()
++                .map_err(|_| io::Error::other("background job registry poisoned"))?;
++            jobs.retain(|handle| {
++                let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
++                    unsafe { std::mem::zeroed() };
++                let queried = unsafe {
++                    QueryInformationJobObject(
++                        handle.as_raw_handle().cast(),
++                        JobObjectBasicAccountingInformation,
++                        std::ptr::addr_of_mut!(accounting).cast(),
++                        std::mem::size_of_val(&accounting) as u32,
++                        std::ptr::null_mut(),
++                    )
++                };
++                // A failed query must not release ownership of live processes.
++                queried == 0 || accounting.ActiveProcesses != 0
++            });
++            jobs.push(self.handle.try_clone().map_err(io::Error::other)?);
++        } else {
++            Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_BREAKAWAY_OK)?;
++        }
+         *preserve_descendants = true;
+         Ok(())
+     }
+diff --git a/codex-rs/utils/pty/src/win/mod.rs b/codex-rs/utils/pty/src/win/mod.rs
+index 05063cf..67e0f50 100644
+--- a/codex-rs/utils/pty/src/win/mod.rs
++++ b/codex-rs/utils/pty/src/win/mod.rs
+@@ -45,9 +45,12 @@ pub(crate) mod conpty;
+ mod job;
+ mod procthreadattr;
+ mod psuedocon;
++pub(crate) mod winpty;
++pub(crate) mod winpty_driver;
+ 
+ pub use conpty::ConPtySystem;
+ pub use job::JobObject;
++pub use job::legacy_windows_jobs;
+ pub use psuedocon::PsuedoCon;
+ pub use psuedocon::conpty_supported;
+ 
+diff --git a/codex-rs/utils/pty/src/win/psuedocon.rs b/codex-rs/utils/pty/src/win/psuedocon.rs
+index d4c3a41..07268b6 100644
+--- a/codex-rs/utils/pty/src/win/psuedocon.rs
++++ b/codex-rs/utils/pty/src/win/psuedocon.rs
+@@ -95,7 +95,7 @@ pub fn conpty_supported() -> bool {
+     windows_build_number().is_some_and(|build| build >= MIN_CONPTY_BUILD)
+ }
+ 
+-fn windows_build_number() -> Option<u32> {
++pub(super) fn windows_build_number() -> Option<u32> {
+     let ntdll = Ntdll::open(Path::new("ntdll.dll")).ok()?;
+     let mut info: OSVERSIONINFOW = unsafe { mem::zeroed() };
+     info.dwOSVersionInfoSize = mem::size_of::<OSVERSIONINFOW>() as u32;
+@@ -218,7 +218,7 @@ impl PsuedoCon {
+     }
+ }
+ 
+-fn resolve_current_directory(cmd: &CommandBuilder) -> Option<Vec<u16>> {
++pub(super) fn resolve_current_directory(cmd: &CommandBuilder) -> Option<Vec<u16>> {
+     let home = cmd
+         .get_env("USERPROFILE")
+         .and_then(|path| Path::new(path).is_dir().then(|| path.to_owned()));
+@@ -241,7 +241,7 @@ fn resolve_current_directory(cmd: &CommandBuilder) -> Option<Vec<u16>> {
+     Some(wide)
+ }
+ 
+-fn build_environment_block(cmd: &CommandBuilder) -> Vec<u16> {
++pub(super) fn build_environment_block(cmd: &CommandBuilder) -> Vec<u16> {
+     let mut block = Vec::new();
+     for (key, value) in cmd.iter_full_env_as_str() {
+         block.extend(OsStr::new(key).encode_wide());
+@@ -253,7 +253,7 @@ fn build_environment_block(cmd: &CommandBuilder) -> Vec<u16> {
+     block
+ }
+ 
+-fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
++pub(super) fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
+     let exe_os: OsString = if cmd.is_default_prog() {
+         cmd.get_env("ComSpec")
+             .unwrap_or(OsStr::new("cmd.exe"))
+diff --git a/codex-rs/windows-sandbox-rs/Cargo.toml b/codex-rs/windows-sandbox-rs/Cargo.toml
+index aa41ed5..da8bbf3 100644
+--- a/codex-rs/windows-sandbox-rs/Cargo.toml
++++ b/codex-rs/windows-sandbox-rs/Cargo.toml
+@@ -31,6 +31,7 @@ chrono = { version = "0.4.42", default-features = false, features = [
+ codex-utils-pty = { workspace = true }
+ codex-utils-absolute-path = { workspace = true }
+ codex-utils-string = { workspace = true }
++portable-pty = { workspace = true }
+ codex-otel = { workspace = true }
+ dunce = "1.0"
+ glob = { workspace = true }
+diff --git a/codex-rs/windows-sandbox-rs/src/desktop.rs b/codex-rs/windows-sandbox-rs/src/desktop.rs
+index 9182788..70bfbae 100644
+--- a/codex-rs/windows-sandbox-rs/src/desktop.rs
++++ b/codex-rs/windows-sandbox-rs/src/desktop.rs
+@@ -56,7 +56,7 @@ const DESKTOP_ALL_ACCESS: u32 = DESKTOP_READOBJECTS
+ 
+ pub struct LaunchDesktop {
+     _private_desktop: Option<PrivateDesktop>,
+-    startup_name: Vec<u16>,
++    pub(crate) startup_name: Vec<u16>,
+ }
+ 
+ impl LaunchDesktop {
+diff --git a/codex-rs/windows-sandbox-rs/src/process.rs b/codex-rs/windows-sandbox-rs/src/process.rs
+index c2f873f..4c7134f 100644
+--- a/codex-rs/windows-sandbox-rs/src/process.rs
++++ b/codex-rs/windows-sandbox-rs/src/process.rs
+@@ -8,6 +8,7 @@ use anyhow::Context;
+ use anyhow::Result;
+ use anyhow::anyhow;
+ use codex_utils_pty::JobObject;
++use codex_utils_pty::legacy_windows_jobs;
+ use std::collections::HashMap;
+ use std::ffi::c_void;
+ use std::os::windows::io::AsRawHandle;
+@@ -25,15 +26,20 @@ use windows_sys::Win32::System::Console::GetStdHandle;
+ use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
+ use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+ use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
++use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+ use windows_sys::Win32::System::Pipes::CreatePipe;
++use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
+ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
++use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+ use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
+ use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
+ use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
+ use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
++use windows_sys::Win32::System::Threading::ResumeThread;
+ use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
+ use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
+ use windows_sys::Win32::System::Threading::STARTUPINFOW;
++use windows_sys::Win32::System::Threading::TerminateProcess;
+ 
+ pub struct CreatedProcess {
+     pub process_info: PROCESS_INFORMATION,
+@@ -103,7 +109,7 @@ pub unsafe fn create_process_as_user(
+     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
+     let env_block = make_env_block(env_map);
+     let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
+-    let job = Arc::new(JobObject::create().context("create process job")?);
++    let job = Arc::new(JobObject::create_without_breakaway().context("create process job")?);
+     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+     let cwd_wide = to_wide(cwd);
+     let env_block_len = env_block.len();
+@@ -115,7 +121,14 @@ pub unsafe fn create_process_as_user(
+     };
+     let attr_count = if stdio.is_some() { 2 } else { 1 };
+     let mut attrs = ProcThreadAttributeList::new(attr_count)?;
+-    attrs.set_job(job.as_raw_handle() as HANDLE)?;
++    // Windows 7 has no JOB_LIST process attribute. A suspended child cannot
++    // run user code before explicit job assignment succeeds. Other failures
++    // remain fatal, including a parent job that forbids containment.
++    let suspended_job_assignment = match attrs.set_job(job.as_raw_handle() as HANDLE) {
++        Ok(()) => false,
++        Err(error) if error.raw_os_error() == Some(50) => true,
++        Err(error) => return Err(error.into()),
++    };
+ 
+     let mut si: STARTUPINFOEXW = std::mem::zeroed();
+     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+@@ -149,7 +162,17 @@ pub unsafe fn create_process_as_user(
+     }
+     si.lpAttributeList = attrs.as_mut_ptr();
+ 
+-    let creation_flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | console_flags;
++    let suspension_flags = if suspended_job_assignment && legacy_windows_jobs() {
++        CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB
++    } else if suspended_job_assignment {
++        CREATE_SUSPENDED
++    } else {
++        0
++    };
++    let creation_flags = CREATE_UNICODE_ENVIRONMENT
++        | EXTENDED_STARTUPINFO_PRESENT
++        | console_flags
++        | suspension_flags;
+     let ok = CreateProcessAsUserW(
+         h_token,
+         std::ptr::null(),
+@@ -179,6 +202,22 @@ pub unsafe fn create_process_as_user(
+         return Err(std::io::Error::from_raw_os_error(err)).context(msg);
+     }
+ 
++    if suspended_job_assignment {
++        let result = if AssignProcessToJobObject(job.as_raw_handle() as HANDLE, pi.hProcess) == 0 {
++            Err(std::io::Error::last_os_error()).context("assign suspended child to job")
++        } else if ResumeThread(pi.hThread) == u32::MAX {
++            Err(std::io::Error::last_os_error()).context("resume contained child")
++        } else {
++            Ok(())
++        };
++        if let Err(error) = result {
++            TerminateProcess(pi.hProcess, 1);
++            CloseHandle(pi.hThread);
++            CloseHandle(pi.hProcess);
++            return Err(error);
++        }
++    }
++
+     Ok(CreatedProcess {
+         process_info: pi,
+         startup_info: si.StartupInfo,
+diff --git a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
+index bcbb436..7042faa 100644
+--- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
++++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
+@@ -370,6 +370,38 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
+         },
+     )?;
+ 
++    if tty && !codex_utils_pty::conpty_supported() {
++        use std::os::windows::io::AsRawHandle;
++        use std::os::windows::io::FromRawHandle;
++
++        // The agent runs under this same restricted token, so its console
++        // commands cannot inherit the app-server's unrestricted identity.
++        let token =
++            unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(security.h_token as _) };
++        let desktop = LaunchDesktop::prepare(use_private_desktop, common.logs_base_dir.as_deref())?;
++        let job = Arc::new(JobObject::create_without_breakaway()?);
++        let mut builder = portable_pty::CommandBuilder::new(&command[0]);
++        builder.args(&command[1..]);
++        builder.cwd(cwd);
++        builder.env_clear();
++        for (key, value) in &env_map {
++            builder.env(key, value);
++        }
++        let mut spawned = codex_utils_pty::WinPtySession::spawn(
++            builder,
++            Some(token.as_raw_handle()),
++            job,
++            TerminalSize::default(),
++            Some(&desktop.startup_name),
++        )?;
++        spawned.owner = Some(Box::new(desktop));
++        let spawned = codex_utils_pty::spawn_winpty_driver(spawned, timeout_ms);
++        if !stdin_open {
++            spawned.session.close_stdin();
++        }
++        return Ok(spawned);
++    }
++
+     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
+     let (stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(256);
+     let stderr_rx = if tty {
+diff --git a/codex-rs/core/src/unified_exec/turn_cleanup.rs b/codex-rs/core/src/unified_exec/turn_cleanup.rs
+new file mode 100644
+index 0000000..fc52077
+--- /dev/null
++++ b/codex-rs/core/src/unified_exec/turn_cleanup.rs
+@@ -0,0 +1,27 @@
++//! Turn-scoped ownership for terminals on Windows without nested Job Objects.
++
++use super::UnifiedExecProcessManager;
++use super::process_manager::unregister_network_approval_for_entry;
++
++impl UnifiedExecProcessManager {
++    pub(crate) async fn terminate_turn_processes(&self, turn_id: &str) {
++        let entries = {
++            let mut store = self.process_store.lock().await;
++            // Snapshot IDs before remove() mutates both the process map and its
++            // reserved-ID set; a single iterator would borrow the store twice.
++            #[allow(clippy::needless_collect)]
++            let ids = store
++                .processes
++                .iter()
++                .filter_map(|(id, entry)| (entry.turn_id == turn_id).then_some(*id))
++                .collect::<Vec<_>>();
++            ids.into_iter()
++                .filter_map(|id| store.remove(id))
++                .collect::<Vec<_>>()
++        };
++        for entry in entries {
++            unregister_network_approval_for_entry(&entry).await;
++            entry.process.terminate();
++        }
++    }
++}
+diff --git a/codex-rs/utils/pty/src/win/winpty.rs b/codex-rs/utils/pty/src/win/winpty.rs
+new file mode 100644
+index 0000000..da513c0
+--- /dev/null
++++ b/codex-rs/utils/pty/src/win/winpty.rs
+@@ -0,0 +1,272 @@
++//! WinPTY console transport for systems without ConPTY.
++//!
++//! The bundled DLL extension starts its trusted console agent suspended under
++//! the requested token, then assigns the command job before allowing it to run.
++//! User commands inherit both the token and the non-breakaway job from that agent.
++
++use anyhow::Context;
++use anyhow::Result;
++use anyhow::bail;
++use filedescriptor::FileDescriptor;
++use portable_pty::CommandBuilder;
++use shared_library::shared_library;
++use std::ffi::c_void;
++use std::os::windows::io::AsRawHandle;
++use std::os::windows::io::FromRawHandle;
++use std::os::windows::io::OwnedHandle;
++use std::os::windows::io::RawHandle;
++use std::ptr;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::OnceLock;
++use winapi::um::fileapi::CreateFileW;
++use winapi::um::fileapi::OPEN_EXISTING;
++use winapi::um::handleapi::INVALID_HANDLE_VALUE;
++use winapi::um::winbase::CREATE_BREAKAWAY_FROM_JOB;
++use winapi::um::winnt::FILE_ATTRIBUTE_NORMAL;
++use winapi::um::winnt::GENERIC_READ;
++use winapi::um::winnt::GENERIC_WRITE;
++
++use crate::TerminalSize;
++use crate::win::JobObject;
++use crate::win::legacy_windows_jobs;
++use crate::win::psuedocon::build_cmdline;
++use crate::win::psuedocon::build_environment_block;
++use crate::win::psuedocon::resolve_current_directory;
++
++type Opaque = *mut c_void;
++
++shared_library!(WinPtyApi,
++    fn winpty_config_new(flags: u64, error: *mut Opaque) -> Opaque,
++    fn winpty_config_free(config: Opaque),
++    fn winpty_config_set_initial_size(config: Opaque, cols: i32, rows: i32),
++    fn winpty_config_set_spawn_context(config: Opaque, token: RawHandle, job: RawHandle, flags: u32, desktop: *const u16, cwd: *const u16, env: *const u16, env_len: u32, error: *mut Opaque) -> i32,
++    fn winpty_open(config: Opaque, error: *mut Opaque) -> Opaque,
++    fn winpty_conin_name(pty: Opaque) -> *const u16,
++    fn winpty_conout_name(pty: Opaque) -> *const u16,
++    fn winpty_spawn_config_new(flags: u64, app: *const u16, command: *const u16, cwd: *const u16, env: *const u16, error: *mut Opaque) -> Opaque,
++    fn winpty_spawn_config_free(config: Opaque),
++    fn winpty_spawn(pty: Opaque, config: Opaque, process: *mut RawHandle, thread: *mut RawHandle, create_error: *mut u32, error: *mut Opaque) -> i32,
++    fn winpty_set_size(pty: Opaque, cols: i32, rows: i32, error: *mut Opaque) -> i32,
++    fn winpty_error_msg(error: Opaque) -> *const u16,
++    fn winpty_error_free(error: Opaque),
++    fn winpty_free(pty: Opaque),
++);
++
++static API: OnceLock<std::result::Result<WinPtyApi, String>> = OnceLock::new();
++
++fn api() -> Result<&'static WinPtyApi> {
++    API.get_or_init(|| {
++        let path = std::env::current_exe()
++            .map_err(|error| error.to_string())?
++            .parent()
++            .context("missing executable directory")
++            .map_err(|error| error.to_string())?
++            .join("winpty.dll");
++        // Load only the library next to this executable. Never search the
++        // workspace, PATH, or a caller-provided environment override.
++        WinPtyApi::open(&path).map_err(|error| format!("{error:?}"))
++    })
++    .as_ref()
++    .map_err(|error| anyhow::anyhow!("WinPTY backend unavailable: {error}"))
++}
++
++pub fn supported() -> bool {
++    api().is_ok()
++}
++
++fn error(api: &WinPtyApi, raw: Opaque, operation: &str) -> anyhow::Error {
++    if raw.is_null() {
++        return anyhow::anyhow!("{operation} failed");
++    }
++    // The library owns a NUL-terminated message until winpty_error_free.
++    let message = unsafe {
++        let text = (api.winpty_error_msg)(raw);
++        let mut len = 0;
++        while *text.add(len) != 0 {
++            len += 1;
++        }
++        let message = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
++        (api.winpty_error_free)(raw);
++        message
++    };
++    anyhow::anyhow!("{operation}: {message}")
++}
++
++/// Owns an agent and serializes its control operations independently of pipe I/O.
++pub struct WinPtySession {
++    api: &'static WinPtyApi,
++    raw: Option<usize>,
++    pub(crate) job: Arc<JobObject>,
++}
++
++/// Handles transferred to the caller after a contained command has been started.
++pub struct WinPtySpawn {
++    pub session: Arc<Mutex<WinPtySession>>,
++    pub process: OwnedHandle,
++    pub thread: OwnedHandle,
++    pub input: FileDescriptor,
++    pub output: FileDescriptor,
++    /// Platform launch resources retained until process output has drained.
++    pub owner: Option<Box<dyn Send>>,
++    pub(crate) job: Arc<JobObject>,
++}
++
++impl WinPtySession {
++    /// Starts a console command with the requested token and an owned command job.
++    pub fn spawn(
++        command: CommandBuilder,
++        token: Option<RawHandle>,
++        job: Arc<JobObject>,
++        size: TerminalSize,
++        desktop: Option<&[u16]>,
++    ) -> Result<WinPtySpawn> {
++        if size.rows == 0
++            || size.cols == 0
++            || size.rows > i16::MAX as u16
++            || size.cols > i16::MAX as u16
++        {
++            bail!("invalid WinPTY terminal dimensions");
++        }
++        if desktop.is_some_and(|name| name.last() != Some(&0)) {
++            bail!("WinPTY desktop name must be NUL terminated");
++        }
++        let api = api()?;
++        let mut issue = ptr::null_mut();
++        let cfg = unsafe {
++            (api.winpty_config_new)(/*flags*/ 0, &mut issue)
++        };
++        if cfg.is_null() {
++            return Err(error(api, issue, "configure WinPTY"));
++        }
++        let cwd = resolve_current_directory(&command).unwrap_or_else(|| vec![0]);
++        let mut env = build_environment_block(&command);
++        if env.len() == 1 {
++            env.push(0);
++        }
++        let flags = if legacy_windows_jobs() {
++            CREATE_BREAKAWAY_FROM_JOB
++        } else {
++            0
++        };
++        let configured = unsafe {
++            (api.winpty_config_set_initial_size)(cfg, i32::from(size.cols), i32::from(size.rows));
++            (api.winpty_config_set_spawn_context)(
++                cfg,
++                token.unwrap_or(ptr::null_mut()),
++                job.as_raw_handle(),
++                flags,
++                desktop.map_or(ptr::null(), |name| name.as_ptr()),
++                cwd.as_ptr(),
++                env.as_ptr(),
++                env.len() as u32,
++                &mut issue,
++            )
++        };
++        if configured == 0 {
++            unsafe { (api.winpty_config_free)(cfg) };
++            return Err(error(api, issue, "configure contained WinPTY agent"));
++        }
++        let raw = unsafe { (api.winpty_open)(cfg, &mut issue) };
++        unsafe { (api.winpty_config_free)(cfg) };
++        if raw.is_null() {
++            return Err(error(api, issue, "start contained WinPTY agent"));
++        }
++        let session = Self {
++            api,
++            raw: Some(raw as usize),
++            job,
++        };
++        let open_pipe = |name, access| -> Result<FileDescriptor> {
++            let handle = unsafe {
++                CreateFileW(
++                    name,
++                    access,
++                    /*dwShareMode*/ 0,
++                    ptr::null_mut(),
++                    OPEN_EXISTING,
++                    FILE_ATTRIBUTE_NORMAL,
++                    ptr::null_mut(),
++                )
++            };
++            if handle == INVALID_HANDLE_VALUE {
++                return Err(std::io::Error::last_os_error()).context("connect WinPTY console pipe");
++            }
++            Ok(unsafe { FileDescriptor::from_raw_handle(handle.cast()) })
++        };
++        let input = open_pipe(unsafe { (api.winpty_conin_name)(raw) }, GENERIC_WRITE)?;
++        let output = open_pipe(unsafe { (api.winpty_conout_name)(raw) }, GENERIC_READ)?;
++        let (app, line) = build_cmdline(&command)?;
++        let spawn_cfg = unsafe {
++            (api.winpty_spawn_config_new)(
++                /*flags*/ 3,
++                app.as_ptr(),
++                line.as_ptr(),
++                cwd.as_ptr(),
++                env.as_ptr(),
++                &mut issue,
++            )
++        };
++        if spawn_cfg.is_null() {
++            return Err(error(api, issue, "configure WinPTY command"));
++        }
++        let mut process = ptr::null_mut();
++        let mut thread = ptr::null_mut();
++        let mut create_error = 0;
++        let spawned = unsafe {
++            (api.winpty_spawn)(
++                raw,
++                spawn_cfg,
++                &mut process,
++                &mut thread,
++                &mut create_error,
++                &mut issue,
++            )
++        };
++        unsafe { (api.winpty_spawn_config_free)(spawn_cfg) };
++        if spawned == 0 {
++            return Err(error(api, issue, "start restricted console command"));
++        }
++        Ok(WinPtySpawn {
++            job: Arc::clone(&session.job),
++            session: Arc::new(Mutex::new(session)),
++            process: unsafe { OwnedHandle::from_raw_handle(process) },
++            thread: unsafe { OwnedHandle::from_raw_handle(thread) },
++            input,
++            output,
++            owner: None,
++        })
++    }
++
++    pub fn resize(&mut self, size: TerminalSize) -> Result<()> {
++        let Some(raw) = self.raw else {
++            bail!("console session already closed")
++        };
++        let mut issue = ptr::null_mut();
++        if unsafe {
++            (self.api.winpty_set_size)(
++                raw as Opaque,
++                i32::from(size.cols),
++                i32::from(size.rows),
++                &mut issue,
++            )
++        } == 0
++        {
++            return Err(error(self.api, issue, "resize WinPTY console"));
++        }
++        Ok(())
++    }
++
++    pub fn close(&mut self) {
++        if let Some(raw) = self.raw.take() {
++            unsafe { (self.api.winpty_free)(raw as Opaque) };
++        }
++    }
++}
++
++impl Drop for WinPtySession {
++    fn drop(&mut self) {
++        let _ = self.job.terminate();
++        self.close();
++    }
++}
+diff --git a/codex-rs/utils/pty/src/win/winpty_driver.rs b/codex-rs/utils/pty/src/win/winpty_driver.rs
+new file mode 100644
+index 0000000..d3c627d
+--- /dev/null
++++ b/codex-rs/utils/pty/src/win/winpty_driver.rs
+@@ -0,0 +1,96 @@
++//! Adapt a contained WinPTY command to the shared asynchronous process driver.
++
++use std::io::Read;
++use std::io::Write;
++use std::os::windows::io::AsRawHandle;
++use std::sync::Arc;
++use tokio::sync::broadcast;
++use tokio::sync::mpsc;
++use tokio::sync::oneshot;
++use winapi::um::processthreadsapi::GetExitCodeProcess;
++use winapi::um::synchapi::WaitForSingleObject;
++use winapi::um::winbase::INFINITE;
++
++use crate::ProcessDriver;
++use crate::SpawnedProcess;
++use crate::WindowsTtyInputNormalizer;
++use crate::spawn_from_driver;
++use crate::win::winpty::WinPtySpawn;
++
++/// Owns all transport and launch resources through command exit and final output.
++pub fn spawn_driver(spawned: WinPtySpawn, timeout_ms: Option<u64>) -> SpawnedProcess {
++    let WinPtySpawn {
++        session,
++        process,
++        thread,
++        mut input,
++        mut output,
++        owner,
++        job,
++    } = spawned;
++    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
++    let (stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(256);
++    let output_join = std::thread::spawn(move || {
++        let mut bytes = [0u8; 8192];
++        loop {
++            match output.read(&mut bytes) {
++                Ok(0) => break,
++                Ok(count) => {
++                    let _ = stdout_tx.send(bytes[..count].to_vec());
++                }
++                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
++                Err(_) => break,
++            }
++        }
++    });
++    let writer_handle = tokio::task::spawn_blocking(move || {
++        let mut normalizer = WindowsTtyInputNormalizer::default();
++        while let Some(bytes) = writer_rx.blocking_recv() {
++            if input.write_all(&normalizer.normalize(&bytes)).is_err() || input.flush().is_err() {
++                break;
++            }
++        }
++    });
++    let (exit_tx, exit_rx) = oneshot::channel();
++    let wait_job = Arc::clone(&job);
++    let wait_session = Arc::clone(&session);
++    std::thread::spawn(move || {
++        let _owner = owner;
++        let _thread = thread;
++        let timeout = timeout_ms.map_or(INFINITE, |ms| ms.min(u64::from(u32::MAX - 1)) as u32);
++        let result = unsafe { WaitForSingleObject(process.as_raw_handle().cast(), timeout) };
++        let timed_out = result == 258;
++        if timed_out || result == u32::MAX {
++            let _ = wait_job.terminate();
++            unsafe { WaitForSingleObject(process.as_raw_handle().cast(), INFINITE) };
++        } else {
++            let _ = wait_job.preserve_descendants();
++        }
++        let mut exit_code = 1;
++        unsafe { GetExitCodeProcess(process.as_raw_handle().cast(), &mut exit_code) };
++        // AUTO_SHUTDOWN + EXIT_AFTER_SHUTDOWN make the agent emit the final
++        // console frame and close output before it exits. Do not free it early.
++        let _ = output_join.join();
++        if let Ok(mut console) = wait_session.lock() {
++            console.close();
++        }
++        let _ = exit_tx.send(if timed_out { 124 } else { exit_code as i32 });
++    });
++    spawn_from_driver(ProcessDriver {
++        writer_tx,
++        stdout_rx,
++        stderr_rx: None,
++        exit_rx,
++        terminator: Some(Box::new(move || {
++            let _ = job.terminate();
++        })),
++        writer_handle: Some(writer_handle),
++        resizer: Some(Box::new(move |size| {
++            session
++                .lock()
++                .map_err(|_| anyhow::anyhow!("WinPTY session lock poisoned"))?
++                .resize(size)
++        })),
++        tty: true,
++    })
++}
+diff --git a/codex-rs/windows-sandbox-rs/examples/win7_pty_probe.rs b/codex-rs/windows-sandbox-rs/examples/win7_pty_probe.rs
+new file mode 100644
+index 0000000..7747aaa
+--- /dev/null
++++ b/codex-rs/windows-sandbox-rs/examples/win7_pty_probe.rs
+@@ -0,0 +1,364 @@
++//! Native Windows console verification for the Win7 maintenance build.
++
++#[cfg(not(windows))]
++fn main() {
++    eprintln!("Run this probe on Windows.");
++}
++
++#[cfg(windows)]
++fn main() -> anyhow::Result<()> {
++    use std::io::Write;
++    use windows_sys::Win32::Foundation::CloseHandle;
++    use windows_sys::Win32::Security::IsTokenRestricted;
++    use windows_sys::Win32::Security::TOKEN_QUERY;
++    use windows_sys::Win32::System::Console::CONSOLE_SCREEN_BUFFER_INFO;
++    use windows_sys::Win32::System::Console::GetConsoleMode;
++    use windows_sys::Win32::System::Console::GetConsoleScreenBufferInfo;
++    use windows_sys::Win32::System::Console::GetStdHandle;
++    use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
++    use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
++    use windows_sys::Win32::System::Threading::GetCurrentProcess;
++    use windows_sys::Win32::System::Threading::OpenProcessToken;
++
++    let args = std::env::args().collect::<Vec<_>>();
++    if args.get(1).is_some_and(|arg| arg == "--wait-child") {
++        std::thread::sleep(std::time::Duration::from_secs(300));
++        return Ok(());
++    }
++    if args
++        .get(1)
++        .is_some_and(|arg| arg == "--console-child" || arg == "--console-tree")
++    {
++        let mut mode = 0;
++        anyhow::ensure!(
++            unsafe { GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut mode) } != 0,
++            "stdin is not a real Windows console"
++        );
++        let mut token = 0;
++        anyhow::ensure!(
++            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0,
++            "query child token"
++        );
++        let restricted = unsafe { IsTokenRestricted(token) } != 0;
++        unsafe { CloseHandle(token) };
++        anyhow::ensure!(
++            restricted,
++            "console child did not retain its restricted token"
++        );
++        std::fs::write("pty-inside.txt", "WIN7_PTY_INSIDE")?;
++        let outside = args.get(2).expect("outside write fixture path");
++        match std::fs::write(outside, "must be denied") {
++            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
++            result => anyhow::bail!("outside write was not denied: {result:?}"),
++        }
++        println!("WIN7_REAL_CONSOLE_READY RESTRICTED_TOKEN_OK OUTSIDE_WRITE_DENIED");
++        std::io::stdout().flush()?;
++        if args[1] == "--console-tree" {
++            let marker = std::path::PathBuf::from(args.get(3).expect("process marker path"));
++            let mut child = match std::process::Command::new(std::env::current_exe()?)
++                .arg("--wait-child")
++                .spawn()
++            {
++                Ok(child) => child,
++                Err(error) => {
++                    std::fs::write(marker.with_extension("error.txt"), error.to_string())?;
++                    return Err(error.into());
++                }
++            };
++            let mut pids = [0u32; 32];
++            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++            let count = loop {
++                let count = unsafe {
++                    windows_sys::Win32::System::Console::GetConsoleProcessList(
++                        pids.as_mut_ptr(),
++                        pids.len() as u32,
++                    )
++                };
++                if count >= 3 || std::time::Instant::now() >= deadline {
++                    break count;
++                }
++                if let Some(status) = child.try_wait()? {
++                    std::fs::write(
++                        marker.with_extension("error.txt"),
++                        format!("descendant exited during console attach: {status}"),
++                    )?;
++                    anyhow::bail!("descendant exited during console attach");
++                }
++                std::thread::sleep(std::time::Duration::from_millis(20));
++            };
++            if count < 3 {
++                std::fs::write(
++                    marker.with_extension("error.txt"),
++                    format!("console process list only has {count}: {pids:?}"),
++                )?;
++            }
++            anyhow::ensure!(
++                count >= 3 && count <= pids.len() as u32,
++                "console process tree count {count}"
++            );
++            std::fs::write(marker, serde_json::to_vec(&pids[..count as usize])?)?;
++            let _ = child.wait()?;
++            return Ok(());
++        }
++        loop {
++            let mut line = String::new();
++            if std::io::stdin().read_line(&mut line)? == 0 {
++                break;
++            }
++            let line = line.trim_end_matches(['\r', '\n']);
++            if line == "quit" {
++                println!("WIN7_PTY_BYE");
++                break;
++            }
++            if line == "size" {
++                let mut size: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
++                anyhow::ensure!(
++                    unsafe {
++                        GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut size)
++                    } != 0,
++                    "read console dimensions"
++                );
++                println!(
++                    "SIZE_{}x{}",
++                    size.srWindow.Right - size.srWindow.Left + 1,
++                    size.srWindow.Bottom - size.srWindow.Top + 1
++                );
++            } else {
++                println!("ECHO_{line}");
++            }
++            std::io::stdout().flush()?;
++        }
++        return Ok(());
++    }
++    let runtime = tokio::runtime::Builder::new_multi_thread()
++        .enable_all()
++        .build()?;
++    if args.get(1).is_some_and(|arg| arg == "--owner") {
++        return runtime.block_on(async {
++            let base = std::path::PathBuf::from(args.get(2).expect("owner base directory"));
++            let (_process, _outside) = launch(&base, "--console-tree", Some(300_000)).await?;
++            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
++            Ok(())
++        });
++    }
++    runtime.block_on(run())
++}
++
++#[cfg(windows)]
++async fn launch(
++    base: &std::path::Path,
++    mode: &str,
++    timeout_ms: Option<u64>,
++) -> anyhow::Result<(codex_utils_pty::SpawnedProcess, std::path::PathBuf)> {
++    use codex_protocol::models::PermissionProfile;
++    use codex_utils_absolute_path::AbsolutePathBuf;
++    let workspace = base.join("workspace");
++    let home = base.join("codex-home");
++    std::fs::create_dir_all(&workspace)?;
++    std::fs::create_dir_all(&home)?;
++    let outside = base.join("outside.txt");
++    let roots = vec![AbsolutePathBuf::from_absolute_path(workspace.clone())?];
++    let permission = PermissionProfile::workspace_write();
++    let command = vec![
++        std::env::current_exe()?.display().to_string(),
++        mode.to_string(),
++        outside.display().to_string(),
++        workspace.join("tree-pids.json").display().to_string(),
++    ];
++    let spawned = codex_windows_sandbox::spawn_windows_sandbox_session_legacy(
++        &permission,
++        &roots,
++        &home,
++        command,
++        &workspace,
++        std::env::vars().collect(),
++        timeout_ms,
++        &[],
++        &[],
++        /*tty*/ true,
++        /*stdin_open*/ true,
++        /*use_private_desktop*/ true,
++    )
++    .await?;
++    Ok((spawned, outside))
++}
++
++#[cfg(windows)]
++async fn run() -> anyhow::Result<()> {
++    use anyhow::Context;
++    use codex_utils_pty::SpawnedProcess;
++    use codex_utils_pty::TerminalSize;
++    use std::os::windows::io::AsRawHandle;
++    use std::os::windows::io::FromRawHandle;
++    use std::os::windows::io::OwnedHandle;
++    use std::path::Path;
++    use std::time::Duration;
++    use windows_sys::Win32::System::Threading::OpenProcess;
++    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
++    use windows_sys::Win32::System::Threading::WaitForSingleObject;
++
++    async fn expect(
++        spawned: &mut SpawnedProcess,
++        output: &mut Vec<u8>,
++        marker: &str,
++    ) -> anyhow::Result<()> {
++        tokio::time::timeout(Duration::from_secs(90), async {
++            loop {
++                if String::from_utf8_lossy(output).contains(marker) {
++                    return Ok(());
++                }
++                match spawned.stdout_rx.recv().await {
++                    Some(chunk) => output.extend(chunk),
++                    None => anyhow::bail!(
++                        "output ended before {marker}: {}",
++                        String::from_utf8_lossy(output)
++                    ),
++                }
++                anyhow::ensure!(
++                    output.len() < 1024 * 1024,
++                    "unexpected console output volume"
++                );
++            }
++        })
++        .await
++        .with_context(|| {
++            format!(
++                "waiting for {marker}; output={}",
++                String::from_utf8_lossy(output)
++            )
++        })?
++    }
++
++    let base = std::env::current_dir()?.join(format!("win7-pty-probe-{}", std::process::id()));
++    let (mut spawned, outside) =
++        launch(&base.join("interactive"), "--console-child", Some(120_000)).await?;
++    println!("PHASE interactive started");
++    let mut output = Vec::new();
++    expect(&mut spawned, &mut output, "OUTSIDE_WRITE_DENIED").await?;
++    spawned
++        .session
++        .writer_sender()
++        .send("你好_win7\n".as_bytes().to_vec())
++        .await?;
++    expect(&mut spawned, &mut output, "ECHO_你好_win7").await?;
++    spawned
++        .session
++        .writer_sender()
++        .send(b"abc\x1b[D\x7fZ\r".to_vec())
++        .await?;
++    expect(&mut spawned, &mut output, "ECHO_aZc").await?;
++    spawned.session.resize(TerminalSize {
++        cols: 120,
++        rows: 35,
++    })?;
++    spawned
++        .session
++        .writer_sender()
++        .send(b"size\r".to_vec())
++        .await?;
++    expect(&mut spawned, &mut output, "SIZE_120x35").await?;
++    spawned
++        .session
++        .writer_sender()
++        .send(b"quit\r".to_vec())
++        .await?;
++    expect(&mut spawned, &mut output, "WIN7_PTY_BYE").await?;
++    let exit = tokio::time::timeout(Duration::from_secs(30), &mut spawned.exit_rx).await??;
++    anyhow::ensure!(exit == 0, "console exit code {exit}");
++    anyhow::ensure!(!outside.exists(), "outside write escaped workspace");
++    println!("PHASE interactive passed");
++
++    let (mut interrupted, _) =
++        launch(&base.join("ctrl-c"), "--console-child", Some(120_000)).await?;
++    expect(&mut interrupted, &mut Vec::new(), "OUTSIDE_WRITE_DENIED").await?;
++    interrupted.session.writer_sender().send(vec![3]).await?;
++    println!("PHASE Ctrl+C sent");
++    let interrupt_exit = tokio::time::timeout(Duration::from_secs(30), &mut interrupted.exit_rx)
++        .await
++        .context("Ctrl+C console exit")??;
++    anyhow::ensure!(
++        interrupt_exit != 0,
++        "Ctrl+C did not interrupt the console process"
++    );
++    println!("PHASE Ctrl+C passed");
++
++    async fn track(path: &Path) -> anyhow::Result<Vec<OwnedHandle>> {
++        let pids: Vec<u32> = tokio::time::timeout(Duration::from_secs(60), async {
++            loop {
++                if let Ok(data) = std::fs::read(path) {
++                    return serde_json::from_slice(&data);
++                }
++                if let Ok(error) = std::fs::read_to_string(path.with_extension("error.txt")) {
++                    return Err(serde_json::Error::io(std::io::Error::other(error)));
++                }
++                tokio::time::sleep(Duration::from_millis(50)).await;
++            }
++        })
++        .await??;
++        anyhow::ensure!(pids.len() >= 3, "agent/command/descendant not all tracked");
++        let mut handles = Vec::new();
++        for pid in pids {
++            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
++            anyhow::ensure!(handle != 0, "open console process {pid}");
++            let handle = unsafe { OwnedHandle::from_raw_handle(handle as _) };
++            anyhow::ensure!(
++                unsafe { WaitForSingleObject(handle.as_raw_handle() as _, 0) } == 258,
++                "console process already exited"
++            );
++            handles.push(handle);
++        }
++        Ok(handles)
++    }
++
++    fn exited(handles: &[OwnedHandle]) -> anyhow::Result<()> {
++        for handle in handles {
++            anyhow::ensure!(
++                unsafe { WaitForSingleObject(handle.as_raw_handle() as _, 15000) } == 0,
++                "console agent or descendant survived"
++            );
++        }
++        Ok(())
++    }
++
++    for timed_out in [false, true] {
++        println!("PHASE tree timed_out={timed_out}");
++        let case = base.join(if timed_out { "timeout" } else { "cancel" });
++        let (mut tree, _) = launch(
++            &case,
++            "--console-tree",
++            Some(if timed_out { 15_000 } else { 120_000 }),
++        )
++        .await?;
++        let handles = track(&case.join("workspace/tree-pids.json")).await?;
++        if !timed_out {
++            tree.session.request_terminate();
++        }
++        let exit = tokio::time::timeout(Duration::from_secs(45), &mut tree.exit_rx)
++            .await
++            .context("tree exit")??;
++        anyhow::ensure!(
++            exit != 0 && (!timed_out || exit == 124),
++            "unexpected tree exit {exit}"
++        );
++        exited(&handles)?;
++    }
++
++    let case = base.join("owner-crash");
++    println!("PHASE owner crash");
++    std::fs::create_dir_all(&case)?;
++    let mut owner = std::process::Command::new(std::env::current_exe()?)
++        .arg("--owner")
++        .arg(&case)
++        .stdout(std::process::Stdio::null())
++        .stderr(std::fs::File::create(case.join("owner.log"))?)
++        .spawn()?;
++    let handles = track(&case.join("workspace/tree-pids.json")).await?;
++    owner.kill()?;
++    let _ = owner.wait()?;
++    exited(&handles)?;
++    println!(
++        "{}",
++        serde_json::json!({"passed":true,"exit":exit,"restricted_token":true,"outside_write_denied":true,"unicode_input":true,"line_editing":true,"resize":"120x35","ctrl_c":true,"cancel_tree":true,"timeout_tree":true,"owner_crash_tree":true,"output":String::from_utf8_lossy(&output)})
++    );
++    Ok(())
++}
+diff --git a/compat/win7/README.md b/compat/win7/README.md
+new file mode 100644
+index 0000000..4230060
+--- /dev/null
++++ b/compat/win7/README.md
+@@ -0,0 +1,85 @@
++# Win7 Codex 维护分支
++
++本分支基于上游 `rust-v0.149.1`，使用 Rust 1.95.0 的 `x86_64-win7-windows-msvc` 目标重新构建标准库。
++Go 服务使用 CSGClaw 仓库中的 Win7 兼容 Go 工具链构建。
++
++## 兼容实现
++
++`imports.c` 为六个可选 Windows API 提供动态解析和兼容返回值。
++Windows 7 SP1 需要 KB3063858 或包含相同安全加载功能的后续更新。
++不存在的 ConPTY 和 WinRT 能力返回不支持，不伪造成功。
++
++CSGClaw 在 Windows 7 上使用允许协作进程显式脱离的外层 Job。
++Codex 以挂起状态创建受限命令，并在恢复执行前将它加入禁止脱离的独立命令 Job。
++受限令牌和工作区 ACL 保持不变。
++加入命令 Job 失败时终止挂起进程。
++Windows 8 及以后继续使用原有嵌套 Job 路径。
++
++Windows 7 上，正常结束的命令可以留下后台任务，但 app-server 会保留这些后台 Job 的所有权。
++后续保留后台 Job 时会释放已经没有活动进程的 Job 句柄。
++app-server 被关闭或终止后，系统关闭其句柄并回收剩余后台任务。
++
++旧系统不支持原子的 JOB_LIST 创建属性。
++先挂起、再加入 Job 的方式仍有进程创建与加入之间的窗口，调用方异常终止时可能留下尚未执行用户代码的挂起进程。
++当前生命周期测试覆盖已经启动的命令树和后台命令，不证明该极短创建窗口内的崩溃行为。
++
++## WinPTY
++
++源码固定为 MIT 许可的 WinPTY 0.4.3，提交 `3e1ab962d5262dd76159870c6dc0724927ca6a9d`。
++`build-winpty.py` 校验源码归档 SHA-256 后应用 `winpty-sandbox.patch`，使用 Windows 7 SDK 目标和静态 CRT 构建。
++补丁让可信控制台 agent 使用实际受限令牌挂起启动，严格加入命令 Job 后恢复，用户命令继承相同约束。
++指定环境、工作目录和私有桌面同步传递，控制管道仅增加同一登录 SID 的访问权限。
++失败时不重试无沙箱进程。
++
++`winpty.dll` 只从当前 Codex 可执行文件同目录加载。
++交互式工具能力检查同时支持 ConPTY 和配套 WinPTY，现代 Windows 优先使用 ConPTY。
++输出以终端流传递，输入、行编辑、Ctrl+C 和窗口调整使用真实控制台。
++
++## 本机构建
++
++需要 Rust 1.95.0 的 rust-src、cargo-xwin 0.23.1、Homebrew LLVM 和 LLD，以及 cargo-xwin 下载的 Windows SDK。
++WinPTY 构建需要 Python 3.12 或更高版本。
++首次准备应运行 `rustup component add rust-src --toolchain 1.95.0`。
++若 windows_x86_64_msvc 0.48.5 的导入库搜索失败，LIB 需包含 Cargo registry 中该包的 lib 目录。
++
++```sh
++compat/win7/build-macos.sh
++# 使用开发构建以便快速迭代：
++WIN7_PROFILE=dev compat/win7/build-macos.sh
++```
++
++构建脚本把兼容对象文件放在系统导入库之前链接。
++默认使用 release 配置，开发验证也使用过 dev 配置。
++产物目录包含 `codex.exe`、`winpty.dll`、`winpty-agent.exe` 和 `LICENSE.winpty`，分发时必须一起携带。
++
++## 验证
++
++CSGClaw 的 `internal/runtime/codex/win7_sandbox_windows_test.go` 覆盖真实 Runtime 到此 Codex app-server 的调用。
++设置 `CSGCLAW_TEST_CODEX_BINARY` 指向构建产物后，在 Win7 原生运行对应 Windows 测试二进制。
++测试覆盖工作区写入、目录外写入拒绝、取消、超时、后台进程回收、app-server 崩溃回收，以及取消和超时后的继续对话。
++不要以 Mac 上的 Rust 测试代替 Windows 原生生命周期测试。
++
++`windows-sandbox-rs/examples/win7_pty_probe.rs` 是原生控制台探针。
++以同一 Win7 工具链构建后，与 DLL 和 agent 放在同目录运行。
++探针检查真实控制台、受限令牌、工作区边界、中文输入、行编辑、缩放、Ctrl+C、取消、超时及拥有者崩溃后的进程句柄终态。
++CSGClaw 的 `TestWindowsInteractiveCodexToolsE2E` 还通过确定性模型服务驱动真实 `exec_command` 和 `write_stdin`。
++该测试需设置 `CSGCLAW_TEST_CONSOLE_PROBE` 指向探针可执行文件。
++
++## 取消归属与维护检查
++
++旧 Windows 在回合中断时按 turn ID 终止该回合创建的交互终端，并在发送中断事件前完成清理。
++其他回合持有的后台服务不会被这一操作终止。
++CSGClaw 的原生测试和真实浏览器 Stop 操作均检查父子进程句柄退出，并验证同一会话还能继续使用。
++
++macOS 全仓测试可运行 `python3 compat/win7/test-macos.py`。
++脚本通过 `just test` 执行，隔离个人配置与桌面进程注入的代理、CLI 路径和 HOME，保留沙箱相关环境变量。
++它支持透传 nextest 参数，例如 `--test-threads 4`。
++V8 依赖须按仓库 setup-rusty-v8 工作流准备匹配的归档与绑定文件。
++测试 fixture 对 release 版本号、macOS 临时目录和本机已安装 Codex 路径作了确定性处理，不改变生产运行行为。
++
++## 当前边界
++
++这里维护的是 CLI/app-server，不是 Codex 桌面应用或 Electron。
++Win7 的交互式终端由配套 WinPTY 后端提供，ConPTY 探测仍如实返回不可用。
++不通过禁用 `unified_exec` 或放开默认工作区沙箱实现兼容。
++升级分发必须固定本分支的独立产物，不能被普通 Windows 最新二进制覆盖。
+diff --git a/compat/win7/build-macos.sh b/compat/win7/build-macos.sh
+new file mode 100755
+index 0000000..4aafe88
+--- /dev/null
++++ b/compat/win7/build-macos.sh
+@@ -0,0 +1,42 @@
++#!/bin/sh
++set -eu
++export PATH="/opt/homebrew/bin:$PATH"
++FORK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++WIN7_BUILD_DIR="$FORK_DIR/win7-build"
++XWIN_CACHE=${XWIN_CACHE:-"$HOME/Library/Caches/cargo-xwin/xwin"}
++CARGO_XWIN=${CARGO_XWIN:-cargo-xwin}
++WIN7_PROFILE=${WIN7_PROFILE:-release}
++mkdir -p "$WIN7_BUILD_DIR/bin"
++python3 "$FORK_DIR/compat/win7/build-winpty.py"
++LLVM_DIR=$(/opt/homebrew/bin/brew --prefix llvm)
++LLD_DIR=$(/opt/homebrew/bin/brew --prefix lld)
++"$LLVM_DIR/bin/clang-cl" --target=x86_64-pc-windows-msvc /c /O2 /W4 /WX \
++ "/imsvc$XWIN_CACHE/crt/include" "/imsvc$XWIN_CACHE/sdk/include/ucrt" "/imsvc$XWIN_CACHE/sdk/include/um" "/imsvc$XWIN_CACHE/sdk/include/shared" \
++ "/Fo$WIN7_BUILD_DIR/imports.obj" -- "$FORK_DIR/compat/win7/imports.c"
++cat > "$WIN7_BUILD_DIR/bin/lld-link" <<WRAPPER
++#!/bin/sh
++if [ "\${1:-}" = "-flavor" ]; then shift 2; fi
++exec "$LLD_DIR/bin/lld-link" -flavor link "$WIN7_BUILD_DIR/imports.obj" "\$@"
++WRAPPER
++cat > "$WIN7_BUILD_DIR/host-clang" <<WRAPPER
++#!/bin/sh
++exec "$LLVM_DIR/bin/clang" --ld-path="$LLD_DIR/bin/ld64.lld" "\$@"
++WRAPPER
++chmod +x "$WIN7_BUILD_DIR/bin/lld-link" "$WIN7_BUILD_DIR/host-clang"
++export PATH="$WIN7_BUILD_DIR/bin:$LLVM_DIR/bin:$LLD_DIR/bin:/opt/homebrew/bin:$PATH"
++export RUSTUP_TOOLCHAIN=1.95.0 RUSTC_BOOTSTRAP=1 CARGO_BUILD_JOBS=6
++export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="$WIN7_BUILD_DIR/host-clang"
++cd "$FORK_DIR/codex-rs"
++if [ -z "${LIB:-}" ]; then
++    for WIN7_IMPORT_LIB in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/windows_x86_64_msvc-0.48.5/lib; do
++        if [ -d "$WIN7_IMPORT_LIB" ]; then export LIB="$WIN7_IMPORT_LIB"; break; fi
++    done
++fi
++"$CARGO_XWIN" rustc --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort \
++ -p codex-cli --bin codex --profile "$WIN7_PROFILE" --config profile.dev.debug=0 --config profile.dev.strip='"none"' \
++ -- -C link-arg=/INCREMENTAL:NO
++WIN7_TARGET_DIR=${CARGO_TARGET_DIR:-"$FORK_DIR/codex-rs/target"}
++WIN7_OUTPUT_PROFILE=$WIN7_PROFILE
++if [ "$WIN7_OUTPUT_PROFILE" = dev ]; then WIN7_OUTPUT_PROFILE=debug; fi
++WIN7_OUTPUT_DIR="$WIN7_TARGET_DIR/x86_64-win7-windows-msvc/$WIN7_OUTPUT_PROFILE"
++cp "$WIN7_BUILD_DIR/winpty/winpty.dll" "$WIN7_BUILD_DIR/winpty/winpty-agent.exe" "$WIN7_BUILD_DIR/winpty/LICENSE.winpty" "$WIN7_OUTPUT_DIR/"
+diff --git a/compat/win7/build-winpty.py b/compat/win7/build-winpty.py
+new file mode 100644
+index 0000000..8b34bc5
+--- /dev/null
++++ b/compat/win7/build-winpty.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""Build the pinned WinPTY console backend with the restricted-token extension."""
++import ast
++import concurrent.futures
++import hashlib
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tarfile
++import urllib.request
++
++if sys.version_info < (3, 12):
++    raise SystemExit("WinPTY build requires Python 3.12 or later")
++
++HERE = Path(__file__).resolve().parent
++BUILD = HERE.parents[1] / "win7-build" / "winpty"
++COMMIT = "3e1ab962d5262dd76159870c6dc0724927ca6a9d"
++ARCHIVE_SHA256 = "9451dc39727d77156b6827358c7e4cd7385465f2b8a17b61c251ce80837b494f"
++BUILD.mkdir(parents=True, exist_ok=True)
++archive = BUILD / "source.tar.gz"
++if not archive.exists():
++    urllib.request.urlretrieve(
++        f"https://api.github.com/repos/rprichard/winpty/tarball/{COMMIT}", archive
++    )
++if hashlib.file_digest(archive.open("rb"), "sha256").hexdigest() != ARCHIVE_SHA256:
++    raise SystemExit("WinPTY source checksum mismatch")
++source = BUILD / "source"
++if source.exists():
++    shutil.rmtree(source)
++source.mkdir()
++with tarfile.open(archive) as stream:
++    for member in stream.getmembers():
++        member.name = "/".join(member.name.split("/")[1:])
++        if member.name:
++            stream.extract(member, source, filter="data")
++subprocess.run(["patch", "-p1", "-i", str(HERE / "winpty-sandbox.patch")], cwd=source, check=True)
++# Use the upstream generator rule rather than editing its generated header.
++(source / "config.mk").touch()
++subprocess.run(["make", f"COMMIT_HASH={COMMIT}", "build/gen/GenVersion.h"], cwd=source, check=True)
++sdk = Path(os.environ.get("XWIN_CACHE", Path.home() / "Library/Caches/cargo-xwin/xwin"))
++compiler = "/opt/homebrew/opt/llvm/bin/clang-cl"
++linker = "/opt/homebrew/opt/lld/bin/lld-link"
++includes = [sdk / "crt/include", sdk / "sdk/include/ucrt", sdk / "sdk/include/um", sdk / "sdk/include/shared"]
++targets = ast.literal_eval((source / "src/winpty.gyp").read_text())["targets"]
++for target in targets:
++    name = target["target_name"]
++    if name not in {"winpty", "winpty-agent"}:
++        continue
++    files = [source / "src" / path for path in target["sources"] if path.endswith(".cc")]
++    objects = BUILD / "obj" / name
++    objects.mkdir(parents=True, exist_ok=True)
++    defines = ["UNICODE", "_UNICODE", "NOMINMAX", "_WIN32_WINNT=0x0601", "_CRT_SECURE_NO_WARNINGS"] + target.get("defines", [])
++
++    def compile_file(path):
++        obj = objects / (path.stem + ".obj")
++        args = [compiler, "--target=x86_64-pc-windows-msvc", "/nologo", "/c", "/O2", "/EHsc", "/MT", "/std:c++14", "/W3"]
++        args += [f"/D{value}" for value in defines]
++        args += [f"/imsvc{value}" for value in includes]
++        args += [f"/I{source / 'src/include'}", f"/I{source / 'build/gen'}", f"/Fo{obj}", "--", str(path)]
++        subprocess.run(args, check=True)
++        return obj
++
++    print(f"Building {name}", flush=True)
++    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
++        compiled = list(pool.map(compile_file, files))
++    output = BUILD / (name + (".dll" if name == "winpty" else ".exe"))
++    args = [linker, "/nologo", "/machine:x64", "/subsystem:console,6.01", "/timestamp:0", f"/out:{output}"]
++    if name == "winpty":
++        args += ["/dll"]
++    args += [str(path) for path in compiled]
++    args += [f"/libpath:{path}" for path in [sdk / "crt/lib/x86_64", sdk / "sdk/lib/ucrt/x86_64", sdk / "sdk/lib/um/x86_64"]]
++    args += ["kernel32.lib", "advapi32.lib", "user32.lib", "shell32.lib"]
++    subprocess.run(args, check=True)
++shutil.copy2(source / "LICENSE", BUILD / "LICENSE.winpty")
++print(f"WinPTY outputs: {BUILD}")
+diff --git a/compat/win7/imports.c b/compat/win7/imports.c
+new file mode 100644
+index 0000000..3705b7e
+--- /dev/null
++++ b/compat/win7/imports.c
+@@ -0,0 +1,87 @@
++#define WIN32_LEAN_AND_MEAN
++#define _WIN32_WINNT 0x0601
++#include <Windows.h>
++
++/* Optional Windows 8/10 facilities are resolved at runtime.
++ * Required classic COM memory management is forwarded to ole32 on Windows 7.
++ * No sandbox permission checks or cryptographic routines are replaced here.
++ */
++typedef LONG (WINAPI *find_packages_fn)(const WCHAR *, UINT32, UINT32 *, WCHAR **, UINT32 *, WCHAR *, UINT32 *);
++typedef LONG (WINAPI *package_family_fn)(HANDLE, UINT32 *, WCHAR *);
++typedef HRESULT (WINAPI *resize_console_fn)(HANDLE, COORD);
++typedef HRESULT (WINAPI *increment_mta_fn)(void **);
++typedef HRESULT (WINAPI *activation_factory_fn)(void *, const GUID *, void **);
++typedef void (WINAPI *task_mem_free_fn)(void *);
++static INIT_ONCE api_once = INIT_ONCE_STATIC_INIT;
++static package_family_fn package_family;
++static find_packages_fn find_packages;
++static resize_console_fn resize_console;
++static increment_mta_fn increment_mta;
++static activation_factory_fn activation_factory;
++static task_mem_free_fn task_mem_free;
++
++static BOOL CALLBACK load_system_apis(PINIT_ONCE once, PVOID parameter, PVOID *context) {
++    (void)once; (void)parameter; (void)context;
++    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
++    HMODULE ole = LoadLibraryExW(L"ole32.dll", NULL, 0x800);
++    HMODULE combase = LoadLibraryExW(L"combase.dll", NULL, 0x800);
++    HMODULE winrt = LoadLibraryExW(L"api-ms-win-core-winrt-l1-1-0.dll", NULL, 0x800);
++    package_family = (package_family_fn)GetProcAddress(kernel, "GetPackageFamilyName");
++    find_packages = (find_packages_fn)GetProcAddress(kernel, "FindPackagesByPackageFamily");
++    resize_console = (resize_console_fn)GetProcAddress(kernel, "ResizePseudoConsole");
++    if (ole) task_mem_free = (task_mem_free_fn)GetProcAddress(ole, "CoTaskMemFree");
++    if (combase) increment_mta = (increment_mta_fn)GetProcAddress(combase, "CoIncrementMTAUsage");
++    if (winrt) activation_factory = (activation_factory_fn)GetProcAddress(winrt, "RoGetActivationFactory");
++    return TRUE;
++}
++
++LONG WINAPI GetPackageFamilyName(HANDLE process, UINT32 *length, WCHAR *family) {
++    InitOnceExecuteOnce(&api_once, load_system_apis, NULL, NULL);
++    if (package_family) return package_family(process, length, family);
++    if (length) *length = 0;
++    return 15700; /* APPMODEL_ERROR_NO_PACKAGE: Win7 has no app-package identity. */
++}
++HRESULT WINAPI ResizePseudoConsole(HANDLE console, COORD size) {
++    InitOnceExecuteOnce(&api_once, load_system_apis, NULL, NULL);
++    if (resize_console) return resize_console(console, size);
++    return (HRESULT)0x80004001L; /* E_NOTIMPL; no fake PTY success. */
++}
++HRESULT WINAPI CoIncrementMTAUsage(void **cookie) {
++    InitOnceExecuteOnce(&api_once, load_system_apis, NULL, NULL);
++    if (increment_mta) return increment_mta(cookie);
++    if (cookie) *cookie = NULL;
++    return (HRESULT)0x80004001L;
++}
++HRESULT WINAPI RoGetActivationFactory(void *class_name, const GUID *iid, void **factory) {
++    InitOnceExecuteOnce(&api_once, load_system_apis, NULL, NULL);
++    if (activation_factory) return activation_factory(class_name, iid, factory);
++    if (factory) *factory = NULL;
++    return (HRESULT)0x80004001L;
++}
++void WINAPI CoTaskMemFree(void *memory) {
++    if (!memory) return;
++    InitOnceExecuteOnce(&api_once, load_system_apis, NULL, NULL);
++    if (!task_mem_free) {
++        /* KB3063858 (or a superseding update) is a required loader baseline. */
++        TerminateProcess(GetCurrentProcess(), 0xc0000135UL);
++        return;
++    }
++    task_mem_free(memory);
++}
++
++/* Strong import-pointer definitions take precedence over modern import libs. */
++package_family_fn __imp_GetPackageFamilyName = GetPackageFamilyName;
++resize_console_fn __imp_ResizePseudoConsole = ResizePseudoConsole;
++increment_mta_fn __imp_CoIncrementMTAUsage = CoIncrementMTAUsage;
++activation_factory_fn __imp_RoGetActivationFactory = RoGetActivationFactory;
++task_mem_free_fn __imp_CoTaskMemFree = CoTaskMemFree;
++
++LONG WINAPI FindPackagesByPackageFamily(const WCHAR *family, UINT32 filters, UINT32 *count, WCHAR **names, UINT32 *length, WCHAR *buffer, UINT32 *properties) {
++    InitOnceExecuteOnce(&api_once, load_system_apis, NULL, NULL);
++    if (find_packages) return find_packages(family, filters, count, names, length, buffer, properties);
++    if (!count || !length) return ERROR_INVALID_PARAMETER;
++    *count = 0;
++    *length = 0;
++    return ERROR_SUCCESS; /* Windows 7 has no MSIX package registrations. */
++}
++find_packages_fn __imp_FindPackagesByPackageFamily = FindPackagesByPackageFamily;
+diff --git a/compat/win7/test-macos.py b/compat/win7/test-macos.py
+new file mode 100755
+index 0000000..a7f326b
+--- /dev/null
++++ b/compat/win7/test-macos.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""Run the full Rust suite without desktop-app state leaking into fixtures."""
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++env = os.environ.copy()
++original_home = Path.home()
++just = shutil.which("just")
++if not just:
++    raise SystemExit("Install just before running the Rust tests")
++for name in (
++    "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_APP_TOOLS_PIPE_PATH",
++    "CODEX_CI", "CODEX_CLI_PATH", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
++    "CODEX_MCP_NODE_PATH", "CODEX_PERMISSION_PROFILE", "CODEX_VERSION",
++    "CODEX_SAGE_BACKFILL_TRACKER_TAB_REUSE", "CODEX_SESSION_ID",
++    "CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY", "CODEX_TECTONIC_PATH", "CODEX_THREAD_ID",
++):
++    env.pop(name, None)
++env.setdefault("CARGO_HOME", str(original_home / ".cargo"))
++env.setdefault("RUSTUP_HOME", str(original_home / ".rustup"))
++for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
++    env.pop(name, None)
++env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost,::1"
++paths = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
++if node_bin := env.get("CODEX_WIN7_TEST_NODE_BIN"):
++    paths.insert(0, node_bin)
++env["PATH"] = os.pathsep.join(paths + [env["PATH"]])
++original_tmp = str(Path(tempfile.gettempdir()).resolve())
++with tempfile.TemporaryDirectory(prefix="cw7-", dir="/private/var/tmp") as temporary:
++    sandbox = Path(temporary)
++    for name in ("home", "tmp", "codex-home"):
++        (sandbox / name).mkdir()
++    test_bin = sandbox / "bin"
++    test_bin.mkdir()
++    (test_bin / "python3").symlink_to(Path(sys.executable).resolve())
++    env["PATH"] = str(test_bin) + os.pathsep + env["PATH"]
++    env["HOME"] = str(sandbox / "home")
++    env["TMPDIR"] = original_tmp
++    env["CODEX_HOME"] = str(sandbox / "codex-home")
++    result = subprocess.run(
++        [just, "test", "--features", "codex-v8-poc/sandbox", *sys.argv[1:]], cwd=root, env=env,
++    )
++raise SystemExit(result.returncode)
+diff --git a/compat/win7/winpty-sandbox.patch b/compat/win7/winpty-sandbox.patch
+new file mode 100644
+index 0000000..dbcae28
+--- /dev/null
++++ b/compat/win7/winpty-sandbox.patch
+@@ -0,0 +1,222 @@
++--- a/src/libwinpty/WinptyInternal.h
+++++ b/src/libwinpty/WinptyInternal.h
++@@ -47,6 +47,12 @@
++     int rows = 25;
++     int mouseMode = WINPTY_MOUSE_MODE_AUTO;
++     DWORD timeoutMs = 30000;
+++    HANDLE sandboxToken = nullptr;
+++    HANDLE sandboxJob = nullptr;
+++    DWORD sandboxFlags = 0;
+++    std::wstring sandboxDesktop;
+++    std::wstring sandboxCwd;
+++    std::wstring sandboxEnv;
++ };
++ 
++ struct winpty_s {
++--- a/src/include/winpty.h
+++++ b/src/include/winpty.h
++@@ -93,6 +93,14 @@
++ 
++ /* Free the cfg object after passing it to winpty_open. */
++ WINPTY_API void winpty_config_free(winpty_config_t *cfg);
+++
+++/* CSGClaw Win7: configure the trusted agent before any user code runs.
+++ * token and job are borrowed until winpty_open returns. A null token retains
+++ * the caller token; a non-null token MUST be used without fallback. */
+++WINPTY_API BOOL winpty_config_set_spawn_context(
+++    winpty_config_t *cfg, HANDLE token, HANDLE job, DWORD flags,
+++    LPCWSTR desktop, LPCWSTR cwd, LPCWSTR env, DWORD envLength,
+++    winpty_error_ptr_t *err);
++ 
++ WINPTY_API void
++ winpty_config_set_initial_size(winpty_config_t *cfg, int cols, int rows);
++--- a/src/libwinpty/winpty.cc
+++++ b/src/libwinpty/winpty.cc
++@@ -470,6 +470,7 @@
++ }
++ 
++ static OwnedHandle startAgentProcess(
+++        const winpty_config_t *cfg,
++         const std::wstring &desktop,
++         const std::wstring &controlPipeName,
++         const std::wstring &params,
++@@ -495,14 +496,20 @@
++         sui.wShowWindow = SW_HIDE;
++     }
++     PROCESS_INFORMATION pi = {};
++-    const BOOL success =
++-        CreateProcessW(exePath.c_str(),
++-                       cmdlineV.data(),
++-                       nullptr, nullptr,
++-                       /*bInheritHandles=*/FALSE,
++-                       /*dwCreationFlags=*/creationFlags,
++-                       nullptr, nullptr,
++-                       &sui, &pi);
+++    const bool contained = cfg->sandboxJob != nullptr;
+++    if (contained) {
+++        creationFlags |= CREATE_SUSPENDED | cfg->sandboxFlags |
+++                         CREATE_UNICODE_ENVIRONMENT;
+++    }
+++    void *environment = cfg->sandboxEnv.empty() ? nullptr :
+++        const_cast<wchar_t*>(cfg->sandboxEnv.data());
+++    const wchar_t *cwd = cfg->sandboxCwd.empty() ? nullptr :
+++        cfg->sandboxCwd.c_str();
+++    const BOOL success = cfg->sandboxToken != nullptr ?
+++        CreateProcessAsUserW(cfg->sandboxToken, exePath.c_str(), cmdlineV.data(),
+++            nullptr, nullptr, FALSE, creationFlags, environment, cwd, &sui, &pi) :
+++        CreateProcessW(exePath.c_str(), cmdlineV.data(), nullptr, nullptr, FALSE,
+++            creationFlags, environment, cwd, &sui, &pi);
++     if (!success) {
++         const DWORD lastError = GetLastError();
++         const auto errStr =
++@@ -511,6 +518,18 @@
++                 << L"' err=0x" << whexOfInt(lastError)).str_moved();
++         throw LibWinptyException(
++             WINPTY_ERROR_AGENT_CREATION_FAILED, errStr.c_str());
+++    }
+++    if (contained) {
+++        const BOOL assigned = AssignProcessToJobObject(cfg->sandboxJob, pi.hProcess);
+++        const DWORD resumed = assigned ? ResumeThread(pi.hThread) : DWORD(-1);
+++        if (!assigned || resumed == DWORD(-1)) {
+++            const DWORD error = GetLastError();
+++            TerminateProcess(pi.hProcess, 1);
+++            WaitForSingleObject(pi.hProcess, INFINITE);
+++            CloseHandle(pi.hThread);
+++            CloseHandle(pi.hProcess);
+++            throwWindowsError(L"contain/resume winpty agent", error);
+++        }
++     }
++     CloseHandle(pi.hThread);
++     TRACE("Created agent successfully, pid=%u, cmdline=%s",
++@@ -556,7 +575,7 @@
++ 
++     DWORD agentPid = 0;
++     wp->agentProcess = startAgentProcess(
++-        desktop, pipeName, params, creationFlags, agentPid);
+++        cfg, desktop, pipeName, params, creationFlags, agentPid);
++     connectControlPipe(*wp.get());
++     verifyPipeClientPid(wp->controlPipe.get(), agentPid);
++ 
++@@ -638,6 +657,24 @@
++     }
++ }
++ 
+++WINPTY_API BOOL winpty_config_set_spawn_context(
+++        winpty_config_t *cfg, HANDLE token, HANDLE job, DWORD flags,
+++        LPCWSTR desktop, LPCWSTR cwd, LPCWSTR env, DWORD envLength,
+++        winpty_error_ptr_t *err) {
+++    API_TRY {
+++        if (cfg == nullptr || job == nullptr || env == nullptr || envLength < 2) {
+++            throwWinptyException(L"invalid contained winpty spawn context");
+++        }
+++        cfg->sandboxToken = token;
+++        cfg->sandboxJob = job;
+++        cfg->sandboxFlags = flags;
+++        cfg->sandboxDesktop = desktop == nullptr ? L"" : desktop;
+++        cfg->sandboxCwd = cwd == nullptr ? L"" : cwd;
+++        cfg->sandboxEnv.assign(env, envLength);
+++        return TRUE;
+++    } API_CATCH(FALSE)
+++}
+++
++ WINPTY_API winpty_t *
++ winpty_open(const winpty_config_t *cfg,
++             winpty_error_ptr_t *err /*OPTIONAL*/) {
++@@ -648,7 +685,8 @@
++ 
++         // Setup a background desktop for the agent.
++         auto desktop = setupBackgroundDesktop(cfg);
++-        const auto desktopName = desktop ? desktop->name() : std::wstring();
+++        const auto desktopName = cfg->sandboxJob != nullptr ? cfg->sandboxDesktop :
+++            (desktop ? desktop->name() : std::wstring());
++ 
++         // Start the primary agent session.
++         const auto params =
++@@ -674,7 +712,8 @@
++         // spawn a child process from the agent, it will need to be explicitly
++         // placed back onto the original desktop.
++         if (!desktopName.empty()) {
++-            wp->spawnDesktopName = getCurrentDesktopName();
+++            wp->spawnDesktopName = cfg->sandboxJob != nullptr ? desktopName :
+++                getCurrentDesktopName();
++         }
++ 
++         // Get the CONIN/CONOUT pipe names.
++--- a/src/shared/WindowsSecurity.cc
+++++ b/src/shared/WindowsSecurity.cc
++@@ -209,6 +209,26 @@
++     return std::move(sd);
++ }
++ 
+++static Sid getLogonSid() {
+++    struct Impl : Sid::Impl { std::vector<char> buffer; };
+++    auto token = openSecurityTokenForQuery();
+++    DWORD length = 0;
+++    GetTokenInformation(token.get(), TokenGroups, nullptr, 0, &length);
+++    std::unique_ptr<Impl> impl(new Impl);
+++    impl->buffer.resize(length);
+++    if (!GetTokenInformation(token.get(), TokenGroups, impl->buffer.data(),
+++                             length, &length)) {
+++        throwWindowsError(L"query logon SID for private console pipe");
+++    }
+++    const auto groups = reinterpret_cast<TOKEN_GROUPS*>(impl->buffer.data());
+++    for (DWORD i = 0; i < groups->GroupCount; ++i) {
+++        if ((groups->Groups[i].Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID) {
+++            return Sid(groups->Groups[i].Sid, std::move(impl));
+++        }
+++    }
+++    throwWinptyException(L"missing logon SID for private console pipe");
+++}
+++
++ // Create a security descriptor that grants full control to the local system
++ // account, built-in administrators, and the owner.
++ SecurityDescriptor
++@@ -218,7 +238,8 @@
++         Sid localSystem;
++         Sid builtinAdmins;
++         Sid owner;
++-        std::array<EXPLICIT_ACCESSW, 3> daclEntries = {};
+++        Sid logon;
+++        std::array<EXPLICIT_ACCESSW, 4> daclEntries = {};
++         Acl dacl;
++         SecurityDescriptor value;
++     };
++@@ -227,6 +248,7 @@
++     impl->localSystem = localSystemSid();
++     impl->builtinAdmins = builtinAdminsSid();
++     impl->owner = getOwnerSid();
+++    impl->logon = getLogonSid();
++ 
++     for (auto &ea : impl->daclEntries) {
++         ea.grfAccessPermissions = GENERIC_ALL;
++@@ -241,6 +263,8 @@
++     impl->daclEntries[2].Trustee.ptstrName =
++         reinterpret_cast<LPWSTR>(impl->owner.get());
++ 
+++    impl->daclEntries[3].Trustee.ptstrName =
+++        reinterpret_cast<LPWSTR>(impl->logon.get());
++     impl->value = finishSecurityDescriptor(
++         impl->daclEntries.size(),
++         impl->daclEntries.data(),
++--- a/src/shared/WindowsSecurity.cc
+++++ b/src/shared/WindowsSecurity.cc
++@@ -22,6 +22,7 @@
++ #include "WindowsSecurity.h"
++ 
++ #include <array>
+++#include <vector>
++ 
++ #include "DebugClient.h"
++ #include "OsModule.h"
++--- a/src/shared/WinptyException.h
+++++ b/src/shared/WinptyException.h
++@@ -43,7 +43,7 @@
++     virtual ~WinptyException() {}
++ };
++ 
++-void throwWinptyException(const wchar_t *what);
++-void throwWindowsError(const wchar_t *prefix, DWORD error=GetLastError());
+++[[noreturn]] void throwWinptyException(const wchar_t *what);
+++[[noreturn]] void throwWindowsError(const wchar_t *prefix, DWORD error=GetLastError());
++ 
++ #endif // WINPTY_EXCEPTION_H

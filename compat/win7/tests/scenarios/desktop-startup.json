@@ -1,0 +1,26 @@
+[
+  {
+    "action": "start",
+    "name": "attach-fresh-user-data"
+  },
+  {
+    "action": "wait",
+    "name": "fresh-desktop-ui",
+    "timeout": 120,
+    "script": "return !!window.csgclawDesktop&&document.body.innerText.includes(\"CSGClaw\")&&document.body.innerText.includes(\"新建任务\")"
+  },
+  {
+    "action": "script",
+    "name": "fresh-default-backend-and-authenticated-UI",
+    "script": "return Promise.all([window.csgclawDesktop.getRuntimeInfo(),fetch(\"/api/v1/bootstrap\",{signal:AbortSignal.timeout(10000)}).then(r=>{if(r.status!==200)throw new Error(\"fresh desktop authorization failed\");return r.status})]).then(([runtime,status])=>({runtime,bootstrap:status,viewport:[innerWidth,innerHeight],errors:document.body.innerText.includes(\"Unexpected Application Error\")}))"
+  },
+  {
+    "action": "script",
+    "name": "native-light-dark-theme-IPC",
+    "script": "return window.csgclawDesktop.setThemeSource(\"light\").then(()=>window.csgclawDesktop.getWindowState()).then(light=>window.csgclawDesktop.setThemeSource(\"dark\").then(()=>window.csgclawDesktop.getWindowState()).then(dark=>({light,dark})))"
+  },
+  {
+    "action": "screenshot",
+    "path": "electron-fresh-default-startup.png"
+  }
+]

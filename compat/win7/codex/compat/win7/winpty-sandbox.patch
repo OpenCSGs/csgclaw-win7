@@ -1,0 +1,222 @@
+--- a/src/libwinpty/WinptyInternal.h
++++ b/src/libwinpty/WinptyInternal.h
+@@ -47,6 +47,12 @@
+     int rows = 25;
+     int mouseMode = WINPTY_MOUSE_MODE_AUTO;
+     DWORD timeoutMs = 30000;
++    HANDLE sandboxToken = nullptr;
++    HANDLE sandboxJob = nullptr;
++    DWORD sandboxFlags = 0;
++    std::wstring sandboxDesktop;
++    std::wstring sandboxCwd;
++    std::wstring sandboxEnv;
+ };
+ 
+ struct winpty_s {
+--- a/src/include/winpty.h
++++ b/src/include/winpty.h
+@@ -93,6 +93,14 @@
+ 
+ /* Free the cfg object after passing it to winpty_open. */
+ WINPTY_API void winpty_config_free(winpty_config_t *cfg);
++
++/* CSGClaw Win7: configure the trusted agent before any user code runs.
++ * token and job are borrowed until winpty_open returns. A null token retains
++ * the caller token; a non-null token MUST be used without fallback. */
++WINPTY_API BOOL winpty_config_set_spawn_context(
++    winpty_config_t *cfg, HANDLE token, HANDLE job, DWORD flags,
++    LPCWSTR desktop, LPCWSTR cwd, LPCWSTR env, DWORD envLength,
++    winpty_error_ptr_t *err);
+ 
+ WINPTY_API void
+ winpty_config_set_initial_size(winpty_config_t *cfg, int cols, int rows);
+--- a/src/libwinpty/winpty.cc
++++ b/src/libwinpty/winpty.cc
+@@ -470,6 +470,7 @@
+ }
+ 
+ static OwnedHandle startAgentProcess(
++        const winpty_config_t *cfg,
+         const std::wstring &desktop,
+         const std::wstring &controlPipeName,
+         const std::wstring &params,
+@@ -495,14 +496,20 @@
+         sui.wShowWindow = SW_HIDE;
+     }
+     PROCESS_INFORMATION pi = {};
+-    const BOOL success =
+-        CreateProcessW(exePath.c_str(),
+-                       cmdlineV.data(),
+-                       nullptr, nullptr,
+-                       /*bInheritHandles=*/FALSE,
+-                       /*dwCreationFlags=*/creationFlags,
+-                       nullptr, nullptr,
+-                       &sui, &pi);
++    const bool contained = cfg->sandboxJob != nullptr;
++    if (contained) {
++        creationFlags |= CREATE_SUSPENDED | cfg->sandboxFlags |
++                         CREATE_UNICODE_ENVIRONMENT;
++    }
++    void *environment = cfg->sandboxEnv.empty() ? nullptr :
++        const_cast<wchar_t*>(cfg->sandboxEnv.data());
++    const wchar_t *cwd = cfg->sandboxCwd.empty() ? nullptr :
++        cfg->sandboxCwd.c_str();
++    const BOOL success = cfg->sandboxToken != nullptr ?
++        CreateProcessAsUserW(cfg->sandboxToken, exePath.c_str(), cmdlineV.data(),
++            nullptr, nullptr, FALSE, creationFlags, environment, cwd, &sui, &pi) :
++        CreateProcessW(exePath.c_str(), cmdlineV.data(), nullptr, nullptr, FALSE,
++            creationFlags, environment, cwd, &sui, &pi);
+     if (!success) {
+         const DWORD lastError = GetLastError();
+         const auto errStr =
+@@ -511,6 +518,18 @@
+                 << L"' err=0x" << whexOfInt(lastError)).str_moved();
+         throw LibWinptyException(
+             WINPTY_ERROR_AGENT_CREATION_FAILED, errStr.c_str());
++    }
++    if (contained) {
++        const BOOL assigned = AssignProcessToJobObject(cfg->sandboxJob, pi.hProcess);
++        const DWORD resumed = assigned ? ResumeThread(pi.hThread) : DWORD(-1);
++        if (!assigned || resumed == DWORD(-1)) {
++            const DWORD error = GetLastError();
++            TerminateProcess(pi.hProcess, 1);
++            WaitForSingleObject(pi.hProcess, INFINITE);
++            CloseHandle(pi.hThread);
++            CloseHandle(pi.hProcess);
++            throwWindowsError(L"contain/resume winpty agent", error);
++        }
+     }
+     CloseHandle(pi.hThread);
+     TRACE("Created agent successfully, pid=%u, cmdline=%s",
+@@ -556,7 +575,7 @@
+ 
+     DWORD agentPid = 0;
+     wp->agentProcess = startAgentProcess(
+-        desktop, pipeName, params, creationFlags, agentPid);
++        cfg, desktop, pipeName, params, creationFlags, agentPid);
+     connectControlPipe(*wp.get());
+     verifyPipeClientPid(wp->controlPipe.get(), agentPid);
+ 
+@@ -638,6 +657,24 @@
+     }
+ }
+ 
++WINPTY_API BOOL winpty_config_set_spawn_context(
++        winpty_config_t *cfg, HANDLE token, HANDLE job, DWORD flags,
++        LPCWSTR desktop, LPCWSTR cwd, LPCWSTR env, DWORD envLength,
++        winpty_error_ptr_t *err) {
++    API_TRY {
++        if (cfg == nullptr || job == nullptr || env == nullptr || envLength < 2) {
++            throwWinptyException(L"invalid contained winpty spawn context");
++        }
++        cfg->sandboxToken = token;
++        cfg->sandboxJob = job;
++        cfg->sandboxFlags = flags;
++        cfg->sandboxDesktop = desktop == nullptr ? L"" : desktop;
++        cfg->sandboxCwd = cwd == nullptr ? L"" : cwd;
++        cfg->sandboxEnv.assign(env, envLength);
++        return TRUE;
++    } API_CATCH(FALSE)
++}
++
+ WINPTY_API winpty_t *
+ winpty_open(const winpty_config_t *cfg,
+             winpty_error_ptr_t *err /*OPTIONAL*/) {
+@@ -648,7 +685,8 @@
+ 
+         // Setup a background desktop for the agent.
+         auto desktop = setupBackgroundDesktop(cfg);
+-        const auto desktopName = desktop ? desktop->name() : std::wstring();
++        const auto desktopName = cfg->sandboxJob != nullptr ? cfg->sandboxDesktop :
++            (desktop ? desktop->name() : std::wstring());
+ 
+         // Start the primary agent session.
+         const auto params =
+@@ -674,7 +712,8 @@
+         // spawn a child process from the agent, it will need to be explicitly
+         // placed back onto the original desktop.
+         if (!desktopName.empty()) {
+-            wp->spawnDesktopName = getCurrentDesktopName();
++            wp->spawnDesktopName = cfg->sandboxJob != nullptr ? desktopName :
++                getCurrentDesktopName();
+         }
+ 
+         // Get the CONIN/CONOUT pipe names.
+--- a/src/shared/WindowsSecurity.cc
++++ b/src/shared/WindowsSecurity.cc
+@@ -209,6 +209,26 @@
+     return std::move(sd);
+ }
+ 
++static Sid getLogonSid() {
++    struct Impl : Sid::Impl { std::vector<char> buffer; };
++    auto token = openSecurityTokenForQuery();
++    DWORD length = 0;
++    GetTokenInformation(token.get(), TokenGroups, nullptr, 0, &length);
++    std::unique_ptr<Impl> impl(new Impl);
++    impl->buffer.resize(length);
++    if (!GetTokenInformation(token.get(), TokenGroups, impl->buffer.data(),
++                             length, &length)) {
++        throwWindowsError(L"query logon SID for private console pipe");
++    }
++    const auto groups = reinterpret_cast<TOKEN_GROUPS*>(impl->buffer.data());
++    for (DWORD i = 0; i < groups->GroupCount; ++i) {
++        if ((groups->Groups[i].Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID) {
++            return Sid(groups->Groups[i].Sid, std::move(impl));
++        }
++    }
++    throwWinptyException(L"missing logon SID for private console pipe");
++}
++
+ // Create a security descriptor that grants full control to the local system
+ // account, built-in administrators, and the owner.
+ SecurityDescriptor
+@@ -218,7 +238,8 @@
+         Sid localSystem;
+         Sid builtinAdmins;
+         Sid owner;
+-        std::array<EXPLICIT_ACCESSW, 3> daclEntries = {};
++        Sid logon;
++        std::array<EXPLICIT_ACCESSW, 4> daclEntries = {};
+         Acl dacl;
+         SecurityDescriptor value;
+     };
+@@ -227,6 +248,7 @@
+     impl->localSystem = localSystemSid();
+     impl->builtinAdmins = builtinAdminsSid();
+     impl->owner = getOwnerSid();
++    impl->logon = getLogonSid();
+ 
+     for (auto &ea : impl->daclEntries) {
+         ea.grfAccessPermissions = GENERIC_ALL;
+@@ -241,6 +263,8 @@
+     impl->daclEntries[2].Trustee.ptstrName =
+         reinterpret_cast<LPWSTR>(impl->owner.get());
+ 
++    impl->daclEntries[3].Trustee.ptstrName =
++        reinterpret_cast<LPWSTR>(impl->logon.get());
+     impl->value = finishSecurityDescriptor(
+         impl->daclEntries.size(),
+         impl->daclEntries.data(),
+--- a/src/shared/WindowsSecurity.cc
++++ b/src/shared/WindowsSecurity.cc
+@@ -22,6 +22,7 @@
+ #include "WindowsSecurity.h"
+ 
+ #include <array>
++#include <vector>
+ 
+ #include "DebugClient.h"
+ #include "OsModule.h"
+--- a/src/shared/WinptyException.h
++++ b/src/shared/WinptyException.h
+@@ -43,7 +43,7 @@
+     virtual ~WinptyException() {}
+ };
+ 
+-void throwWinptyException(const wchar_t *what);
+-void throwWindowsError(const wchar_t *prefix, DWORD error=GetLastError());
++[[noreturn]] void throwWinptyException(const wchar_t *what);
++[[noreturn]] void throwWindowsError(const wchar_t *prefix, DWORD error=GetLastError());
+ 
+ #endif // WINPTY_EXCEPTION_H

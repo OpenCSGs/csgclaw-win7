@@ -1,0 +1,62 @@
+[
+  {
+    "action": "start",
+    "name": "attach-running-desktop"
+  },
+  {
+    "action": "wait",
+    "name": "offline-manager-with-pending-config",
+    "timeout": 60,
+    "script": "return fetch('/api/v1/agents/agent-manager').then(r=>r.json()).then(a=>a.runtime?.state!=='running'&&a.model_config?.env_restart_required===true)"
+  },
+  {
+    "action": "script",
+    "name": "new-isolated-configured-manager-chat",
+    "script": "return fetch('/api/v1/rooms/',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:'Win7 Manager recovery '+Date.now(),creator_id:'user-admin',member_ids:['user-manager'],is_direct:true,task_session:true,client_request_id:crypto.randomUUID(),locale:'zh',configuration:{model_provider_id:'win7-manager-relay',model_id:'deepseek-flash'}})}).then(async r=>{const room=await r.json();if(!r.ok)throw Error(JSON.stringify(room));window.__recoveryRoom=room.id;location.hash='#/dms/'+room.id;return {roomID:room.id}})"
+  },
+  {
+    "action": "wait",
+    "name": "composer-ready",
+    "timeout": 60,
+    "script": "return !!document.querySelector('.composer-editor')&&!document.querySelector('.composer-working-stop')"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-editor"
+  },
+  {
+    "action": "insertText",
+    "text": "请只回复 WIN7_MANAGER_AUTO_RECOVERY_OK，不调用任何工具。"
+  },
+  {
+    "action": "click",
+    "selector": ".composer-send-button"
+  },
+  {
+    "action": "wait",
+    "name": "manager-recovered-without-app-restart",
+    "timeout": 180,
+    "script": "return fetch('/api/v1/agents/agent-manager').then(r=>r.json()).then(a=>a.runtime?.state==='running'&&!a.model_config?.env_restart_required)"
+  },
+  {
+    "action": "wait",
+    "name": "real-model-reply-succeeded",
+    "timeout": 180,
+    "script": "const id=window.__recoveryRoom;return fetch('/api/v1/messages/?room_id='+id).then(r=>r.json()).then(ms=>{window.__recoveryReply=ms.find(m=>m.metadata?.csgclaw?.turn_progress?.status==='succeeded'&&m.content.includes('WIN7_MANAGER_AUTO_RECOVERY_OK'));return !!window.__recoveryReply})"
+  },
+  {
+    "action": "wait",
+    "name": "composer-restored",
+    "timeout": 30,
+    "script": "return !document.querySelector('.composer-working-stop')"
+  },
+  {
+    "action": "script",
+    "name": "recovery-evidence",
+    "script": "return {status:window.__recoveryReply.metadata.csgclaw.turn_progress.status,reply:window.__recoveryReply.content,offlineComposerError:document.body.innerText.includes('启动后再发送消息')}"
+  },
+  {
+    "action": "screenshot",
+    "path": "win7-manager-auto-recovery.png"
+  }
+]
