@@ -5,7 +5,7 @@ See [the desktop build and acceptance guide](README.zh.md) for the complete Win7
 The repository root retains the CSGClaw upstream directory layout and sources.
 Win7 changes live here and are applied to an ignored build tree, rather than moving or duplicating application directories.
 The imported CSGClaw commit, Codex commit, patch digests and previously verified runtime digests are recorded in `sources.lock.json`.
-The current CSGClaw baseline is upstream main `0daf76b1f453fc8765d00cf83163df0544905b49` (2026-10-28).
+The current CSGClaw baseline is upstream main `f365f4550b20b0e76b09c6125f20eddf35bfa09b` (2026-10-30, `v0.10.0-beta.3`).
 HTTP OpenCSG login and its regression tests come directly from upstream PR #787; no duplicate compatibility patch is applied.
 Unrelated local work in the original CSGClaw checkout is excluded.
 
@@ -44,7 +44,7 @@ The prepared Codex tree contains `compat/win7/build-macos.sh` and the pinned Win
 The Go toolchain is XTLS/go-win7 `patched-1.27.2`; current Go dependencies are retained.
 The verified runtime set is Codex `rust-v0.149.1` plus our Win7 patch and matching WinPTY DLL/agent/license.
 The backend records the application version, source commit and build time.
-Its `+local` suffix preserves the upstream custom-install guard; the desktop application reports version `0.9.0`.
+Its `+local` suffix preserves the upstream custom-install guard; the desktop application reports version `0.10.0-beta.3`.
 
 ## Merge future CSGClaw updates
 

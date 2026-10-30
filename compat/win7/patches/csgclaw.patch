@@ -359,18 +359,17 @@ index 00000000..a917cc84
 +	}
 +}
 diff --git a/internal/runtime/codex/appserver_manager.go b/internal/runtime/codex/appserver_manager.go
-index 993f2f5f..cc04aa11 100644
 --- a/internal/runtime/codex/appserver_manager.go
 +++ b/internal/runtime/codex/appserver_manager.go
-@@ -167,7 +167,7 @@ func (m *appServerManager) Start(ctx context.Context, spec SessionSpec) (*Sessio
- 		_ = stderrFile.Close()
- 		return nil, fmt.Errorf("codex app-server stdout pipe: %w", err)
+@@ -168,7 +168,7 @@
  	}
 -	if err := processgroup.Start(cmd); err != nil {
 +	if err := processgroup.StartWithChildJobs(cmd); err != nil {
  		_ = stderrFile.Close()
+ 		diagnostics.ReportFailure(ctx, "runtime.process_start", err, map[string]any{"runtime_id": spec.RuntimeID, "stderr_path": spec.StderrPath})
  		return nil, fmt.Errorf("start codex app-server: %w", err)
  	}
+ 
 diff --git a/internal/runtime/codex/win7_features_windows_test.go b/internal/runtime/codex/win7_features_windows_test.go
 new file mode 100644
 index 00000000..858c3e77
