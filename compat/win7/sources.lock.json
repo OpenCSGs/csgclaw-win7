@@ -1,7 +1,7 @@
 {
   "csgclaw": {
     "repository": "https://github.com/OpenCSGs/csgclaw.git",
-    "commit": "0daf76b1f453fc8765d00cf83163df0544905b49"
+    "commit": "f365f4550b20b0e76b09c6125f20eddf35bfa09b"
   },
   "codex": {
     "repository": "https://github.com/openai/codex.git",
@@ -11,7 +11,7 @@
   },
   "previous_port_commit": "edf39aba2e307766913e97ddcf1a0cbaa21463ed",
   "patches": {
-    "csgclaw.patch": "a95733130ee427aab3c3150c5cac2731f55a9910cad6051e16e908e32f556169",
+    "csgclaw.patch": "c99f139469761de4551e95f6ee394b4e2db5db203a271ab2008b2a35131ba1cd",
     "codex.patch": "c7d7927c1344bda05f8c81cce719a33c52e4b6e3901cf3728db281985d4a0342",
     "previous-desktop-port.patch": "27e44e27c96fb8004eb7690286305d14002d037b167a947a33e6305463491c04",
     "test-stability.patch": "155eda8954af363fdfc64846795ae0589a7b86a65998211fd4af1db30a4731e9",
@@ -92,7 +92,7 @@
     "compiler": "NSIS",
     "version": "3.13"
   },
-  "app_version": "0.9.0",
+  "app_version": "0.10.0-beta.3",
   "emoji_font": {
     "repository": "https://github.com/googlefonts/noto-emoji",
     "commit": "e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e",
