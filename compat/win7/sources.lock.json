@@ -17,7 +17,8 @@
     "test-stability.patch": "155eda8954af363fdfc64846795ae0589a7b86a65998211fd4af1db30a4731e9",
     "runtime-metadata-win7.patch": "2577ccfe6be26fe0ec59a438c30627bd3f003a7544e3662d71af008419e0cc25",
     "manager-skills-win7.patch": "daa498d0635d177e48d369729ab7b26ca8bf9a4b2dc7c510f0632a6334c88aa4",
-    "inherited-job.patch": "bfe4416dcd80d8830fcdaa2c89e37509a4717a26905b775af57ff19d127fc903"
+    "inherited-job.patch": "bfe4416dcd80d8830fcdaa2c89e37509a4717a26905b775af57ff19d127fc903",
+    "windows-workflows.patch": "389cbfe662af2c32552ff8b481ee7afe0ba8f991930ad4fa9dbf9150892bc2d2"
   },
   "runtime": {
     "codex.exe": {
@@ -86,7 +87,8 @@
     "test-stability.patch",
     "runtime-metadata-win7.patch",
     "manager-skills-win7.patch",
-    "inherited-job.patch"
+    "inherited-job.patch",
+    "windows-workflows.patch"
   ],
   "installer": {
     "compiler": "NSIS",
@@ -103,5 +105,10 @@
       "noto-color-emoji.woff2": "2328570f49f63a72bcd139dbca5085cefc974e457bfbc1ebeef799d77050799e",
       "LICENSE.noto-emoji": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
     }
+  },
+  "feishu_cli": {
+    "version": "1.0.97",
+    "url": "https://codeload.github.com/larksuite/cli/tar.gz/refs/tags/v1.0.97",
+    "sha256": "58e9a73c321d404098c06ab8646d65f8b00c7d970963193bba58a504145c9388"
   }
 }

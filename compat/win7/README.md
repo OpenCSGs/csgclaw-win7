@@ -44,6 +44,8 @@ The prepared Codex tree contains `compat/win7/build-macos.sh` and the pinned Win
 The Go toolchain is XTLS/go-win7 `patched-1.27.2`; current Go dependencies are retained.
 The verified runtime set is Codex `rust-v0.149.1` plus our Win7 patch and matching WinPTY DLL/agent/license.
 The backend records the application version, source commit and build time.
+The installer also includes Feishu CLI `1.0.97`, rebuilt from its checksum-pinned official source with the same Win7 Go SDK, and its pinned Skills.
+The connector imports this verified local package before trying an online download, so first connection does not depend on GitHub access or an incompatible ordinary Windows CLI.
 Its `+local` suffix preserves the upstream custom-install guard; the desktop application reports version `0.10.0-beta.3`.
 
 ## Merge future CSGClaw updates
@@ -65,5 +67,7 @@ The adaptation commits contain the compatibility overlays, adapted Codex source,
 The current upstream baseline includes the shared fixes from PRs #721 and #722.
 History cleanup is not a new native acceptance run; older results retain their original tested revisions.
 DSH/Node remains a separately tracked dependency; a desktop shell using Electron's Node runtime does not validate the independent DSH engine.
+Local DSH context and memory plugins use escaped `file:` URLs so Windows drive letters and filename characters remain valid Node ESM module references.
+DSH initialization allows up to two minutes for cold profile loading, while still respecting caller cancellation and earlier deadlines.
 
 See [native desktop acceptance](DESKTOP-ACCEPTANCE.zh.md) and [fixture replay instructions](tests/README.zh.md).
