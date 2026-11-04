@@ -1,0 +1,574 @@
+--- a/web/app/src/components/business/AgentDetails/AgentView/AgentView.css
++++ b/web/app/src/components/business/AgentDetails/AgentView/AgentView.css
+@@ -125,8 +125,8 @@
+ }
+ 
+ :root[data-theme="dark"] .csg-dialog-content.agent-delete-dialog {
+-  border-color: color-mix(in oklab, var(--line) 75%, transparent);
+-  background: color-mix(in oklab, var(--panel) 94%, #020617 6%);
++  border: 1px solid var(--line);
++  background: var(--panel);
+   color: var(--text);
+   box-shadow:
+     0 24px 36px -12px rgba(2, 6, 23, 0.6),
+@@ -151,8 +151,8 @@
+ }
+ 
+ :root[data-theme="dark"] .csg-dialog-content.agent-delete-dialog .agent-delete-actions .btn-secondary-gray {
+-  border-color: color-mix(in oklab, var(--line) 80%, transparent);
+-  background: color-mix(in oklab, var(--panel) 88%, #020617 12%);
++  border-color: var(--line);
++  background: var(--panel-soft);
+   color: var(--text);
+ }
+ 
+@@ -164,20 +164,20 @@
+   .csg-dialog-content.agent-delete-dialog
+   .agent-delete-actions
+   .btn-secondary-gray:focus-visible {
+-  border-color: color-mix(in oklab, var(--line) 80%, transparent);
+-  background: color-mix(in oklab, var(--panel) 80%, #020617 20%);
++  border-color: var(--line);
++  background: var(--gray-700);
+   color: var(--text);
+ }
+ 
+ :root[data-theme="dark"] .csg-dialog-content.agent-delete-dialog .agent-delete-actions .btn-danger {
+   border-color: var(--error-600);
+-  background: color-mix(in oklab, var(--error-600) 88%, #020617 12%);
++  background: var(--error-600);
+   color: var(--white);
+ }
+ 
+ :root[data-theme="dark"] .csg-dialog-content.agent-delete-dialog .agent-delete-actions .btn-danger:hover:not(:disabled),
+ :root[data-theme="dark"] .csg-dialog-content.agent-delete-dialog .agent-delete-actions .btn-danger:focus-visible {
+   border-color: var(--error-700);
+-  background: color-mix(in oklab, var(--error-600) 78%, #020617 22%);
++  background: var(--error-700);
+   color: var(--white);
+ }
+--- a/internal/runtime/dsh/runtime.go
++++ b/internal/runtime/dsh/runtime.go
+@@ -327,7 +327,7 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	patch := fmt.Sprintf("- id: llm-deepseek\n  config: %s\n- id: acp\n  config:\n    provider: deepseek-official\n    model: %q\n- id: compaction-basic\n  config:\n    thresholdRatio: 0.75\n    maxOverflowRetries: 1\n    auto: %t\n- insert:\n    - id: csgclaw-context\n      name: %q\n", providerConfig, profile.ModelID, enabled, bridgePath)
++	patch := fmt.Sprintf("- id: llm-deepseek\n  config: %s\n- id: acp\n  config:\n    provider: deepseek-official\n    model: %q\n- id: compaction-basic\n  config:\n    thresholdRatio: 0.75\n    maxOverflowRetries: 1\n    auto: %t\n- insert:\n    - id: csgclaw-context\n      name: %q\n", providerConfig, profile.ModelID, enabled, moduleFileURL(bridgePath))
+ 	if err := os.WriteFile(filepath.Join(filepath.Dir(path), contextPatchFileName), []byte(patch), 0o600); err != nil {
+ 		return err
+ 	}
+--- a/internal/runtime/dsh/memory.go
++++ b/internal/runtime/dsh/memory.go
+@@ -152,7 +152,7 @@
+ 			return err
+ 		}
+ 	}
+-	patch := fmt.Sprintf("- insert:\n    - id: csgclaw-memory\n      name: %q\n      config:\n        enabled: %t\n        model: %q\n        checkpointIntervalMs: %d\n        checkpointIdleMs: %d\n        retryDelayMs: %d\n        requestTimeoutMs: %d\n", filepath.Join(root, "memory.mjs"), opts.MemoryMode == MemoryModeEnabled, profile.ModelID, timing.CheckpointInterval.Milliseconds(), timing.CheckpointIdle.Milliseconds(), timing.RetryDelay.Milliseconds(), timing.RequestTimeout.Milliseconds())
++	patch := fmt.Sprintf("- insert:\n    - id: csgclaw-memory\n      name: %q\n      config:\n        enabled: %t\n        model: %q\n        checkpointIntervalMs: %d\n        checkpointIdleMs: %d\n        retryDelayMs: %d\n        requestTimeoutMs: %d\n", moduleFileURL(filepath.Join(root, "memory.mjs")), opts.MemoryMode == MemoryModeEnabled, profile.ModelID, timing.CheckpointInterval.Milliseconds(), timing.CheckpointIdle.Milliseconds(), timing.RetryDelay.Milliseconds(), timing.RequestTimeout.Milliseconds())
+ 	return os.WriteFile(filepath.Join(root, memoryPatchFileName), []byte(patch), 0o600)
+ }
+ 
+--- a/internal/apps/cli_install.go
++++ b/internal/apps/cli_install.go
+@@ -13,7 +13,13 @@
+ 	if s.options.CLI != nil && s.options.CLI.Install != nil {
+ 		return s.options.CLI.Install(ctx, root, progress)
+ 	}
+-	return (connectorcli.Installer{Root: root, Spec: spec, PreinstalledDir: os.Getenv("CSGCLAW_CONNECTOR_PACKAGES_DIR")}).Install(ctx, progress)
++	preinstalled := os.Getenv("CSGCLAW_CONNECTOR_PACKAGES_DIR")
++	if preinstalled == "" {
++		if executable, err := os.Executable(); err == nil {
++			preinstalled = filepath.Join(filepath.Dir(executable), "connector-packages")
++		}
++	}
++	return (connectorcli.Installer{Root: root, Spec: spec, PreinstalledDir: preinstalled}).Install(ctx, progress)
+ }
+ 
+ // PrepareCLIPackage 使用当前内置声明生成镜像预装包。
+--- a/internal/runtime/dsh/runtime.go
++++ b/internal/runtime/dsh/runtime.go
+@@ -521,7 +521,9 @@
+ 			} `json:"mcpCapabilities"`
+ 		} `json:"agentCapabilities"`
+ 	}
+-	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
++	// Cold profile loading can exceed 15 seconds on older Windows hosts.
++	// Retain the caller deadline and cancellation while allowing initialization.
++	initCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+ 	defer cancel()
+ 	if err := client.call(initCtx, "initialize", map[string]any{"protocolVersion": 1, "clientCapabilities": map[string]any{}}, &initialized, nil); err != nil {
+ 		_ = terminateProcessTree(cmd.Process.Pid, true)
+--- a/internal/runtime/dsh/context_e2e_test.go
++++ b/internal/runtime/dsh/context_e2e_test.go
+@@ -63,7 +63,7 @@
+ 		return AgentRef{ID: "alice", RuntimeID: "rt-alice", Profile: profile}, nil
+ 	}, AgentHome: func(string) (string, error) { return filepath.Join(root, "agent"), nil }})
+ 	defer rt.Close()
+-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+ 	defer cancel()
+ 	if err := rt.Provision(ctx, agentruntime.ProvisionRequest{RuntimeID: "rt-alice", AgentID: "alice", Profile: profile}); err != nil {
+ 		t.Fatal(err)
+--- a/internal/connectorcli/install.go
++++ b/internal/connectorcli/install.go
+@@ -158,7 +158,13 @@
+ 	if actual != expected {
+ 		return errors.New("installed package checksum mismatch")
+ 	}
+-	check, cancel := context.WithTimeout(ctx, 10*time.Second)
++	// A cold Windows CLI can take longer than ten seconds to start. Keep the
++	// check bounded while honoring an earlier installation deadline or cancel.
++	check, cancel := context.WithTimeout(ctx, time.Minute)
+ 	defer cancel()
+-	data, err = exec.CommandContext(check, p.Executable, p.VersionArgs...).Output()
++	command := exec.CommandContext(check, p.Executable, p.VersionArgs...)
++	if runtime.GOOS == "windows" {
++		configureCommand(command)
++	}
++	data, err = command.Output()
+ 	if err != nil || !strings.Contains(string(data), p.Version) {
+diff --git a/internal/apps/builtin/feishu/cli.json b/internal/apps/builtin/feishu/cli.json
+index a528e1a6..6dd2c5dc 100644
+--- a/internal/apps/builtin/feishu/cli.json
++++ b/internal/apps/builtin/feishu/cli.json
+@@ -27,11 +27,11 @@
+         "sha256": "497641f0a4bd53952a36bca9b452018df2259bdf32902d1f3de7803385516913"
+       },
+       "windows-amd64": {
+-        "url": "https://github.com/larksuite/cli/releases/download/v1.0.97/lark-cli-1.0.97-windows-amd64.zip",
++        "url": "https://registry.npmmirror.com/-/binary/lark-cli/v1.0.97/lark-cli-1.0.97-windows-amd64.zip",
+         "sha256": "88ee81ec73be12432b2297df010098b5069e5ff0403123e1cd308ad0061f1397"
+       },
+       "windows-arm64": {
+-        "url": "https://github.com/larksuite/cli/releases/download/v1.0.97/lark-cli-1.0.97-windows-arm64.zip",
++        "url": "https://registry.npmmirror.com/-/binary/lark-cli/v1.0.97/lark-cli-1.0.97-windows-arm64.zip",
+         "sha256": "4fef85e999fc54de1234b0bb622766f096870db2b86a396545e01a4156abfb3b"
+       }
+     },
+@@ -61,6 +61,7 @@
+         "zh"
+       ],
+       "stage": "app_authorization",
++      "authorization_url_pattern": "^https://open[.]feishu[.]cn/page/cli[?]user_code=[^&#[:space:]]+([&#]|$)",
+       "unless": {
+         "args": [
+           "auth",
+diff --git a/internal/apps/cli.go b/internal/apps/cli.go
+index 13be1c37..7c4646dc 100644
+--- a/internal/apps/cli.go
++++ b/internal/apps/cli.go
+@@ -253,6 +253,7 @@ func (s *Service) StartCLI(_ context.Context, id string, in CLIRequest) (CLIOper
+ 		next.CLI.Recovery = copyJSON(old)
+ 	}
+ 	next.CLI.Operation = op
++	next.LastError, next.LastErrorCode, next.LastErrorHTTPStatus = "", "", 0
+ 	if err = s.persistLocked(id, &next); err != nil {
+ 		return CLIOperation{}, err
+ 	}
+diff --git a/internal/apps/cli_authorization.go b/internal/apps/cli_authorization.go
+index da353631..cbb8a80c 100644
+--- a/internal/apps/cli_authorization.go
++++ b/internal/apps/cli_authorization.go
+@@ -43,7 +43,7 @@ func (s *Service) checkCLIStatus(ctx context.Context, id string, r record) (bool
+ 	return r.Package.CLI.ReadStatus(data)
+ }
+ func (s *Service) authorizeCLI(ctx context.Context, id string, r record) (bool, json.RawMessage, error) {
+-	spec := r.Package.CLI
++	spec := s.currentCLIAuthorizationSpec(r.AppID, r.Package.CLI)
+ 	stage := func(value string) error {
+ 		return s.editCLI(id, func(r *record) error { r.CLI.Operation.Stage = value; r.CLI.Operation.URL = ""; return nil })
+ 	}
+diff --git a/internal/apps/cli_package_authorization_test.go b/internal/apps/cli_package_authorization_test.go
+index 81db2d5d..d3ccf6a5 100644
+--- a/internal/apps/cli_package_authorization_test.go
++++ b/internal/apps/cli_package_authorization_test.go
+@@ -33,7 +33,10 @@ func TestFeishuPackageAuthorizationPermissions(t *testing.T) {
+ 		if !slices.Equal(args, []string{"config", "init", "--new", "--brand", "feishu", "--lang", "zh"}) {
+ 			t.Fatalf("init command=%v", args)
+ 		}
++		c.URL("https://accounts.feishu.cn/open-apis/application/v6/larksuite_cli_app/registration")
++		c.URL("https://open.feishu.cn/page/cli")
+ 		c.URL("https://open.feishu.cn/page/cli?user_code=test&from=cli&addons=old")
++		c.URL("https://accounts.feishu.cn/open-apis/application/v6/larksuite_cli_app/registration")
+ 		return nil, nil
+ 	}}}
+ 	if err := workflow.Run(context.Background(), spec.Init); err != nil {
+@@ -43,7 +46,7 @@ func TestFeishuPackageAuthorizationPermissions(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if u.Path != "/page/launcher" || u.Query().Get("user_code") != "test" || u.Query().Get("tp") != "sdk" || u.Query().Get("from") != "sdk" {
++	if u.Host != "open.feishu.cn" || u.Path != "/page/launcher" || u.Query().Get("user_code") != "test" || u.Query().Get("tp") != "sdk" || u.Query().Get("from") != "sdk" {
+ 		t.Fatal("application registration parameters changed")
+ 	}
+ 	compressed, err := base64.RawURLEncoding.DecodeString(u.Query().Get("addons"))
+diff --git a/internal/apps/cli_status_test.go b/internal/apps/cli_status_test.go
+index e6812f6e..16d14a24 100644
+--- a/internal/apps/cli_status_test.go
++++ b/internal/apps/cli_status_test.go
+@@ -87,6 +87,38 @@ func TestFeishuCLICancellationClearsResourceErrors(t *testing.T) {
+ 	}
+ }
+ 
++func TestFeishuCLIRetryClearsPreviousResourceError(t *testing.T) {
++	s, fixture, id := newCLIFixture(t)
++	entered := make(chan struct{})
++	fixture.wait = func(ctx context.Context) error {
++		close(entered)
++		<-ctx.Done()
++		return ctx.Err()
++	}
++	if err := s.editCLI(id, func(r *record) error {
++		r.LastError, r.LastErrorCode, r.LastErrorHTTPStatus = "previous failure", "cli_operation_failed", 500
++		return nil
++	}); err != nil {
++		t.Fatal(err)
++	}
++	op := startCLITest(t, s, id, "connect", "retry-connect")
++	select {
++	case <-entered:
++	case <-time.After(3 * time.Second):
++		t.Fatal("retry did not start authorization")
++	}
++	item, err := s.Get(t.Context(), "", id)
++	if err != nil || item.Status != "connecting" || item.LastErrorCode != "" || item.LastError != "" || item.LastErrorHTTPStatus != 0 {
++		t.Fatalf("retry retained a previous failure: %+v, %v", item, err)
++	}
++	if _, err := s.CancelCLI(t.Context(), id, op.SessionID); err != nil {
++		t.Fatal(err)
++	}
++	if got := waitCLIOperation(t, s, id, op); got.Status != "cancelled" {
++		t.Fatalf("retry cancellation: %+v", got)
++	}
++}
++
+ func TestLoadResourcesRepairsCancelledCLIErrors(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name          string
+diff --git a/internal/apps/feishu_cli_test.go b/internal/apps/feishu_cli_test.go
+index 65d7d2e7..7775ffd4 100644
+--- a/internal/apps/feishu_cli_test.go
++++ b/internal/apps/feishu_cli_test.go
+@@ -17,6 +17,21 @@ import (
+ 	skill "csgclaw/internal/skill/state"
+ )
+ 
++func TestFeishuWindowsPackagesUseVerifiedDomesticMirror(t *testing.T) {
++	packages, err := loadPackages()
++	if err != nil {
++		t.Fatal(err)
++	}
++	spec := packages["feishu"].CLI.Install
++	for _, arch := range []string{"amd64", "arm64"} {
++		archive := spec.Releases["windows-"+arch]
++		want := "https://registry.npmmirror.com/-/binary/lark-cli/v" + spec.Version + "/lark-cli-" + spec.Version + "-windows-" + arch + ".zip"
++		if archive.URL != want || len(archive.SHA256) != 64 {
++			t.Fatalf("windows-%s package = %+v", arch, archive)
++		}
++	}
++}
++
+ type cliRuntimeStub struct {
+ 	mu          sync.Mutex
+ 	running     map[string]bool
+diff --git a/internal/connectorcli/client.go b/internal/connectorcli/client.go
+index 41a68504..86e7d086 100644
+--- a/internal/connectorcli/client.go
++++ b/internal/connectorcli/client.go
+@@ -83,7 +83,7 @@ type commandOutput struct {
+ 	data    bytes.Buffer
+ 	domains []string
+ 	notify  func(string)
+-	last    string
++	seen    map[string]bool
+ }
+ 
+ func (w *commandOutput) Write(data []byte) (int, error) {
+@@ -96,8 +96,11 @@ func (w *commandOutput) Write(data []byte) (int, error) {
+ 	if w.notify != nil {
+ 		for _, raw := range urlPattern.FindAllString(w.data.String(), -1) {
+ 			raw = strings.TrimRight(raw, ".,);]")
+-			if AllowedAuthorizationURL(raw, w.domains) && raw != w.last {
+-				w.last = raw
++			if AllowedAuthorizationURL(raw, w.domains) && !w.seen[raw] {
++				if w.seen == nil {
++					w.seen = make(map[string]bool)
++				}
++				w.seen[raw] = true
+ 				w.notify(raw)
+ 			}
+ 		}
+diff --git a/internal/connectorcli/client_test.go b/internal/connectorcli/client_test.go
+index a860398b..ca8c9f7a 100644
+--- a/internal/connectorcli/client_test.go
++++ b/internal/connectorcli/client_test.go
+@@ -20,3 +20,16 @@ func TestAuthorizationURLAndErrorCodes(t *testing.T) {
+ 		t.Fatalf("error=%v", err)
+ 	}
+ }
++
++func TestCommandOutputPublishesEachURLOnce(t *testing.T) {
++	var urls []string
++	w := &commandOutput{domains: []string{"example.com"}, notify: func(value string) { urls = append(urls, value) }}
++	for _, chunk := range []string{"Open https://example.com/authorize?code=first\n", "Polling https://example.com/poll\n", "Still waiting\n"} {
++		if _, err := w.Write([]byte(chunk)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if len(urls) != 2 || urls[0] != "https://example.com/authorize?code=first" || urls[1] != "https://example.com/poll" {
++		t.Fatalf("repeated or changed URLs: %v", urls)
++	}
++}
+diff --git a/internal/connectorcli/commands.go b/internal/connectorcli/commands.go
+index e279cd02..1bf494f0 100644
+--- a/internal/connectorcli/commands.go
++++ b/internal/connectorcli/commands.go
+@@ -38,14 +38,15 @@ type DeviceFlow struct {
+ 	AcceptErrorJSON JSONMatch `json:"accept_error_json,omitempty"`
+ }
+ type Command struct {
+-	Args            []string    `json:"args"`
+-	Stage           string      `json:"stage,omitempty"`
+-	When            *Check      `json:"when,omitempty"`
+-	Unless          *Check      `json:"unless,omitempty"`
+-	MatchJSON       JSONMatch   `json:"match_json,omitempty"`
+-	AcceptErrorJSON JSONMatch   `json:"accept_error_json,omitempty"`
+-	URLRewrite      *URLRewrite `json:"url_rewrite,omitempty"`
+-	DeviceFlow      *DeviceFlow `json:"device_flow,omitempty"`
++	Args                    []string    `json:"args"`
++	Stage                   string      `json:"stage,omitempty"`
++	When                    *Check      `json:"when,omitempty"`
++	Unless                  *Check      `json:"unless,omitempty"`
++	MatchJSON               JSONMatch   `json:"match_json,omitempty"`
++	AcceptErrorJSON         JSONMatch   `json:"accept_error_json,omitempty"`
++	URLRewrite              *URLRewrite `json:"url_rewrite,omitempty"`
++	AuthorizationURLPattern string      `json:"authorization_url_pattern,omitempty"`
++	DeviceFlow              *DeviceFlow `json:"device_flow,omitempty"`
+ }
+ 
+ // Commands also accepts a single argument array for simple connectors.
+@@ -150,6 +151,11 @@ func (c Commands) Validate() error {
+ 		if len(command.Args) == 0 {
+ 			return errors.New("CLI command requires arguments")
+ 		}
++		if command.AuthorizationURLPattern != "" {
++			if _, err := regexp.Compile(command.AuthorizationURLPattern); err != nil {
++				return errors.New("invalid authorization URL pattern")
++			}
++		}
+ 		if err := command.MatchJSON.Validate(); err != nil {
+ 			return err
+ 		}
+@@ -329,6 +335,14 @@ func (w *Workflow) completeStage(ctx context.Context, command Command) error {
+ }
+ func (w *Workflow) run(ctx context.Context, command Command) error {
+ 	client := w.Client
++	var pattern *regexp.Regexp
++	if command.AuthorizationURLPattern != "" {
++		var err error
++		pattern, err = regexp.Compile(command.AuthorizationURLPattern)
++		if err != nil {
++			return err
++		}
++	}
+ 	var urlErr error
+ 	notify := client.URL
+ 	commandCtx, cancel := context.WithCancel(ctx)
+@@ -339,6 +353,9 @@ func (w *Workflow) run(ctx context.Context, command Command) error {
+ 			cancel()
+ 			return
+ 		}
++		if pattern != nil && !pattern.MatchString(raw) {
++			return
++		}
+ 		if command.URLRewrite != nil {
+ 			raw, urlErr = command.URLRewrite.Apply(raw)
+ 			if urlErr != nil {
+@@ -371,6 +388,10 @@ func (w *Workflow) run(ctx context.Context, command Command) error {
+ }
+ func (w *Workflow) deviceFlow(ctx context.Context, client Client, command Command, args []string) error {
+ 	flow := command.DeviceFlow
++	notify := client.URL
++	// Structured device flows publish their validated verification URL, rather
++	// than URLs embedded in request diagnostics or polling output.
++	client.URL = nil
+ 	encoded, _ := json.Marshal(struct {
+ 		Command Command
+ 		Scopes  string
+@@ -401,8 +422,8 @@ func (w *Workflow) deviceFlow(ctx context.Context, client Client, command Comman
+ 			return err
+ 		}
+ 	}
+-	if client.URL != nil {
+-		client.URL(device.URL)
++	if notify != nil {
++		notify(device.URL)
+ 	}
+ 	poll := w.args(flow.PollArgs)
+ 	for i, arg := range poll {
+diff --git a/internal/connectorcli/commands_test.go b/internal/connectorcli/commands_test.go
+index 60d1ed09..ec61a6e5 100644
+--- a/internal/connectorcli/commands_test.go
++++ b/internal/connectorcli/commands_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
+@@ -119,6 +120,36 @@ func TestDeviceAuthorizationRejectsUnexpectedResults(t *testing.T) {
+ 		}
+ 	}
+ }
++func TestDeviceAuthorizationIgnoresDiagnosticURLs(t *testing.T) {
++	for _, valid := range []bool{false, true} {
++		t.Run(fmt.Sprint(valid), func(t *testing.T) {
++			var shown []string
++			workflow := Workflow{Client: Client{AuthorizationDomains: []string{"example.com"}, URL: func(value string) { shown = append(shown, value) }, Runner: func(_ context.Context, c Client, _ io.Reader, args ...string) ([]byte, error) {
++				output := &commandOutput{domains: c.AuthorizationDomains, notify: c.URL}
++				_, _ = output.Write([]byte("Request https://example.com/api/token\n"))
++				response := `{"event":"authorization_complete"}`
++				if args[0] == "login" {
++					code := ""
++					if valid {
++						code = "test-code"
++					}
++					response = fmt.Sprintf(`{"device_code":%q,"verification_url":"https://example.com/device","expires_in":60}`, code)
++				}
++				_, _ = output.Write([]byte(response + "\n"))
++				return output.data.Bytes(), nil
++			}}}
++			err := workflow.Run(t.Context(), Commands{testDeviceCommand()})
++			if valid {
++				if err != nil || !reflect.DeepEqual(shown, []string{"https://example.com/device"}) {
++					t.Fatalf("validated URLs=%v, error=%v", shown, err)
++				}
++			} else if err == nil || len(shown) != 0 {
++				t.Fatalf("invalid device response published URLs=%v, error=%v", shown, err)
++			}
++		})
++	}
++}
++
+ func TestDeviceAuthorizationUsesActualProcessOutput(t *testing.T) {
+ 	if runtime.GOOS == "windows" {
+ 		t.Skip("POSIX shell fixture")
+diff --git a/web/app/src/components/business/Apps/CLIDialog/CLIDialog.test.tsx b/web/app/src/components/business/Apps/CLIDialog/CLIDialog.test.tsx
+index 258356c0..a0897c36 100644
+--- a/web/app/src/components/business/Apps/CLIDialog/CLIDialog.test.tsx
++++ b/web/app/src/components/business/Apps/CLIDialog/CLIDialog.test.tsx
+@@ -439,6 +439,24 @@ describe("Feishu CLI authorization", () => {
+     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+     expect(screen.getByRole("link", { name: "Authorize account" })).toBeInTheDocument();
+   });
++  it("clears the previous failure while retrying the connection", async () => {
++    const failed: AppInstallation = {
++      ...resource,
++      status: "error",
++      last_error_code: "cli_operation_failed",
++      operation: undefined,
++    };
++    vi.mocked(fetchAppResource).mockResolvedValue(failed);
++    vi.mocked(startCLIOperation).mockImplementation(async () => {
++      vi.mocked(fetchAppResource).mockResolvedValue({ ...failed, operation: resource.operation });
++      return resource.operation!;
++    });
++    render(<CLIDialog definition={definition} existing={failed} t={t} onClose={vi.fn()} onChanged={vi.fn()} />);
++    expect(await screen.findByRole("alert")).toBeInTheDocument();
++    await userEvent.setup().click(screen.getByRole("button", { name: "Connect Feishu" }));
++    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
++    expect(screen.getByRole("link", { name: "Authorize account" })).toBeInTheDocument();
++  });
+ });
+ 
+ it("creates and authorizes the selected CLI package", async () => {
+diff --git a/web/app/src/components/business/Apps/CLIDialog/CLIDialog.tsx b/web/app/src/components/business/Apps/CLIDialog/CLIDialog.tsx
+index 66c08602..190e75cc 100644
+--- a/web/app/src/components/business/Apps/CLIDialog/CLIDialog.tsx
++++ b/web/app/src/components/business/Apps/CLIDialog/CLIDialog.tsx
+@@ -175,7 +175,7 @@ export function CLIDialog({ definition, existing, t, onClose, onChanged }: Props
+     removing_configuration: "cliRemovingConfiguration",
+   };
+   const requestError = error ? localizeAPIError(error, t) || errorMessage(error) : "";
+-  const storedError = resource ? appConnectionError(resource, t) : "";
++  const storedError = resource && !active ? appConnectionError(resource, t) : "";
+   return (
+     <DialogRoot
+       open
+--- a/internal/apps/cli_install.go
++++ b/internal/apps/cli_install.go
+@@ -19,7 +19,7 @@
+ 			preinstalled = filepath.Join(filepath.Dir(executable), "connector-packages")
+ 		}
+ 	}
+-	return (connectorcli.Installer{Root: root, Spec: spec, PreinstalledDir: preinstalled}).Install(ctx, progress)
++	return (connectorcli.Installer{Root: root, Spec: s.currentCLIInstallSpec(spec), PreinstalledDir: preinstalled}).Install(ctx, progress)
+ }
+ 
+ // PrepareCLIPackage 使用当前内置声明生成镜像预装包。
+diff --git a/internal/connectorcli/process_windows.go b/internal/connectorcli/process_windows.go
+index 3e278489..35733dc4 100644
+--- a/internal/connectorcli/process_windows.go
++++ b/internal/connectorcli/process_windows.go
+@@ -7,16 +7,32 @@ import (
+ 	"errors"
+ 	"os/exec"
+ 	"strconv"
+-	"strings"
++	"syscall"
++
++	"golang.org/x/sys/windows"
+ )
+ 
+-func configureCommand(*exec.Cmd) {}
++func configureCommand(cmd *exec.Cmd) {
++	if cmd.SysProcAttr == nil {
++		cmd.SysProcAttr = &syscall.SysProcAttr{}
++	}
++	cmd.SysProcAttr.HideWindow = true
++	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NO_WINDOW
++}
+ func processStarted(pid int) string {
+-	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", "(Get-Process -Id "+strconv.Itoa(pid)+" -ErrorAction Stop).StartTime.ToUniversalTime().Ticks").Output()
++	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+ 	if err != nil {
+ 		return ""
+ 	}
+-	return strings.TrimSpace(string(out))
++	defer windows.CloseHandle(handle)
++	var created, exited, kernel, user windows.Filetime
++	if err := windows.GetProcessTimes(handle, &created, &exited, &kernel, &user); err != nil {
++		return ""
++	}
++	// FILETIME uses 1601 as its epoch; the persisted .NET ticks use year 1.
++	const epochOffset = uint64(504911232000000000)
++	ticks := uint64(created.HighDateTime)<<32 | uint64(created.LowDateTime)
++	return strconv.FormatUint(ticks+epochOffset, 10)
+ }
+ func stopCommand(pid int) error { return processgroup.Stop(pid, true) }
+ func RecoverProcess(ref ProcessRef) error {
+diff --git a/internal/runtime/dsh/runtime_test.go b/internal/runtime/dsh/runtime_test.go
+index 65e1e03c..5c0948e1 100644
+--- a/internal/runtime/dsh/runtime_test.go
++++ b/internal/runtime/dsh/runtime_test.go
+@@ -15,6 +15,7 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"csgclaw/internal/activity"
+ 	"csgclaw/internal/agentengine/contract"
+@@ -716,6 +717,9 @@ func TestDSHHelperProcess(t *testing.T) {
+ 		}
+ 		switch frame.Method {
+ 		case "initialize":
++			if delay, err := time.ParseDuration(os.Getenv("DSH_TEST_INITIALIZE_DELAY")); err == nil {
++				time.Sleep(delay)
++			}
+ 			respond(map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{
+ 				"promptCapabilities": map[string]any{"image": true},
+ 				"mcpCapabilities":    map[string]any{"http": true},
