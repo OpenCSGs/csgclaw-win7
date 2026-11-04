@@ -35,6 +35,21 @@ def replace(path, before, after):
 
 
 def main():
+    for original in (COMPAT / 'dsh').glob('*.go'):
+        target = SOURCE / 'internal/runtime/dsh' / original.name
+        if target.exists():
+            raise ValueError('Win7 DSH overlay conflicts with upstream: ' + str(target.relative_to(SOURCE)))
+        shutil.copy2(original, target)
+    for original in (COMPAT / 'apps').glob('*.go'):
+        target = SOURCE / 'internal/apps' / original.name
+        if target.exists():
+            raise ValueError('Win7 apps overlay conflicts with upstream: ' + str(target.relative_to(SOURCE)))
+        shutil.copy2(original, target)
+    for original in (COMPAT / 'connectorcli').glob('*.go'):
+        target = SOURCE / 'internal/connectorcli' / original.name
+        if target.exists():
+            raise ValueError('Win7 connector overlay conflicts with upstream: ' + str(target.relative_to(SOURCE)))
+        shutil.copy2(original, target)
     for original in (COMPAT / 'go').glob('*.go'):
         target = SOURCE / 'internal/runtime/codex' / original.name
         if target.exists():
