@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPAT = ROOT / 'compat/win7'
@@ -44,6 +45,8 @@ def main():
         if digest != lock['runtime'][name]['sha256']:
             raise ValueError(f'Runtime hash mismatch: {name}; native validation is required before replacing it')
         shutil.copy2(original, output / name)
+    subprocess.run([sys.executable, str(COMPAT / 'build-connectors.py'), '--go', str(args.go.resolve()),
+                    '--output', str(output / 'connector-packages')], check=True)
     for source, name in [(ROOT / 'LICENSE', 'LICENSE.csgclaw'), (args.go.resolve().parent.parent / 'LICENSE', 'LICENSE.go'), (ROOT / '.cache/win7/codex/LICENSE', 'LICENSE.codex'), (ROOT / '.cache/win7/codex/NOTICE', 'NOTICE.codex')]:
         shutil.copy2(source, output.parent / name)
     print(output.parent)

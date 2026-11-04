@@ -32,8 +32,11 @@ Git 历史保留完整主仓库历史，后续兼容改动单独使用 `win7` sc
 构建主机使用 Python 3.12、Node 24、pnpm 11.1.3、make 和 `sources.lock.json` 固定的 NSIS 3.13。
 macOS 可通过 `brew install makensis` 安装 NSIS。
 服务与 CLI 使用 XTLS/go-win7 `patched-1.27.2` 工具链，不降级业务依赖。
+飞书 CLI `1.0.97` 也使用同一工具链从校验值固定的官方源码构建，并与固定版本的配套技能一起预装。
+连接器优先导入安装目录中的已校验包，首次连接不再依赖 GitHub 下载或普通 Windows CLI 的系统要求。
 桌面运行时固定为 Electron 22.3.27，Codex 的适配源码完整保存在 `compat/win7/codex`，上游基线为 `rust-v0.149.1`。
 具体来源、补丁和运行时校验值见 `sources.lock.json`。
+DSH 初始化最多等待两分钟，以容纳较慢的首次配置加载，并继续遵守调用方的取消和更早的截止时间。
 
 ```sh
 python3.12 compat/win7/build-app.py \
