@@ -60,6 +60,7 @@ jobs:
       CGO_ENABLED: '0'
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       PYTHONUTF8: '1'
+      TZ: Asia/Shanghai
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v4

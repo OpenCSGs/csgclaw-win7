@@ -1237,7 +1237,7 @@ new file mode 100644
 +      if (original) Object.defineProperty(Promise, "withResolvers", original);
 +      else Reflect.deleteProperty(Promise, "withResolvers");
 +    }
-+  });
++  }, 60000);
 +});
 diff --git a/web/packages/app/vite.config.ts b/web/packages/app/vite.config.ts
 --- a/web/packages/app/vite.config.ts
