@@ -14,7 +14,8 @@ GitHub Actions 入口为 `.github/workflows/release.yml`，具体构建、依赖
 
 Release 同时包含 SHA-256 校验表、Win7 构建记录和麒麟 ELF 审计记录。
 预发布 tag 生成 prerelease，稳定 tag 生成普通 Release。
-手动运行同一 workflow 可以指定版本，运行结果仅保留为 Actions artifacts，不创建 tag 或 Release。
+手动运行同一 workflow 可以指定版本及单个构建目标，运行结果仅保留为 Actions artifacts，不创建 tag 或 Release。
+版本 tag 所指的提交必须包含本工作流；首次接入可先合入维护分支，或直接从包含此配置的任务分支打 tag。
 不需要为每个 tag 修改 `sources.lock.json` 的默认版本；CI 通过 `CSGCLAW_WIN7_VERSION` 传递已校验版本，源码来源及校验值保持不变。
 
 ## 固定依赖
@@ -37,3 +38,6 @@ DEB 的 control/data 使用 xz 压缩，兼容旧版 dpkg。
 
 两个兼容目标均保留本地构建升级保护；麒麟桌面使用系统包管理器更新，Win7 继续使用兼容安装包。
 本流水线不上传主仓库 OSS 更新渠道、不构建云端镜像，也不修改 CSGHub PVC 的服务包和升级路径。
+
+Windows 构建明确选择 Git for Windows 的 Bash，使用 UTF-8，并在源码导出和补丁应用时固定 LF 行尾。
+测试进程在启动时固定为 Asia/Shanghai，避免 Windows worker 线程中的动态 TZ 设置影响日期断言。
