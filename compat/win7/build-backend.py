@@ -11,6 +11,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from compat.win7.version import app_version
 COMPAT = ROOT / 'compat/win7'
 
 
@@ -34,7 +36,7 @@ def main():
     built = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     # This custom desktop bundle retains the upstream local-install guard;
     # it must not opt into the ordinary Windows release updater.
-    flags = (f'-s -w -X csgclaw/internal/version.Version=v{lock["app_version"]}+local '
+    flags = (f'-s -w -X csgclaw/internal/version.Version=v{app_version(lock)}+local '
              f'-X csgclaw/internal/version.Commit={commit} '
              f'-X csgclaw/internal/version.BuildTime={built}')
     for name in ('csgclaw', 'csgclaw-cli'):

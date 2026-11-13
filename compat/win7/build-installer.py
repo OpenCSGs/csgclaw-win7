@@ -9,10 +9,13 @@ from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from compat.win7.version import app_version
 COMPAT = ROOT / 'compat/win7'
 REQUIRED = {
     'CSGClaw.exe', 'ffmpeg.dll', 'libEGL.dll', 'libGLESv2.dll', 'LICENSE.noto-emoji',
@@ -109,7 +112,7 @@ def main():
     application = args.application.resolve()
     manifest, files = verified_files(application)
     lock = json.loads((COMPAT / 'sources.lock.json').read_text())
-    if manifest['version'] != lock['app_version']:
+    if manifest['version'] != app_version(lock):
         parser.error('Desktop version differs from sources.lock.json; rebuild the desktop first')
     for name, record in lock['runtime'].items():
         if digest(application / 'resources/backend/csgclaw/bin' / name) != record['sha256']:
@@ -119,7 +122,7 @@ def main():
         parser.error('Desktop manifest must contain its real full source commit')
     source_order = int(subprocess.check_output(['git', 'show', '-s', '--format=%ct', commit], cwd=ROOT, text=True))
     now = datetime.now(ZoneInfo('Asia/Shanghai'))
-    version = lock['app_version'] + '-' + now.strftime('%Y%m%d') + '-' + commit[:8]
+    version = app_version(lock) + '-' + now.strftime('%Y%m%d') + '-' + commit[:8]
     dirty = bool(manifest.get('source_dirty')) or bool(subprocess.check_output(
         ['git', 'status', '--porcelain', '--', 'compat/win7'], cwd=ROOT, text=True).strip())
     if dirty and not args.allow_dirty:
