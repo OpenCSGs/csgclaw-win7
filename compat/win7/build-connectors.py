@@ -2,6 +2,7 @@
 """Bundle the pinned Feishu CLI with the same Win7 Go SDK as the service."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,9 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[2]
 COMPAT = ROOT / 'compat/win7'
 CACHE = ROOT / '.cache/win7/connectors'
+_configure_spec = importlib.util.spec_from_file_location('win7_configure', COMPAT / 'configure.py')
+_configure = importlib.util.module_from_spec(_configure_spec)
+_configure_spec.loader.exec_module(_configure)
 
 
 def digest(path):
@@ -81,6 +85,13 @@ def main():
     roots = list(tree.iterdir())
     if len(roots) != 1 or not (roots[0] / 'go.mod').is_file():
         raise ValueError('Unexpected Feishu source archive layout')
+    patch = COMPAT / 'patches/feishu-tls.patch'
+    if digest(patch) != lock['patches']['feishu-tls.patch']:
+        raise ValueError('Feishu HTTPS patch checksum mismatch')
+    patch_env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(roots[0].parent))
+    for arguments in (['--check'], []):
+        subprocess.run(['git', 'apply', *arguments, str(patch)], cwd=roots[0], env=patch_env, check=True)
+    _configure.configure_http_trust(roots[0])
     target = args.output.resolve() / spec['executable'] / spec['version']
     if target.exists():
         shutil.rmtree(target)
@@ -109,6 +120,7 @@ def main():
                 'executable_sha256': digest(executable), 'skills_sha256': directory_digest(skills)}
     (target / 'package.json').write_text(json.dumps(manifest, indent=2) + '\n')
     shutil.copy2(roots[0] / 'LICENSE', target / 'LICENSE')
+    shutil.copy2(COMPAT / 'httptrust/LICENSE.MPL-2.0', target / 'LICENSE.ca-certificates')
     print('Bundled Win7 Feishu CLI and pinned Skills: ' + str(target))
 
 

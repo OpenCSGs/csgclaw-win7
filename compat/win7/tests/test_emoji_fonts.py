@@ -19,9 +19,9 @@ class EmojiFontsTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(dir=cache)
         self.addCleanup(self.temporary.cleanup)
         self.source = Path(self.temporary.name)
-        self.web = self.source / 'web/app'
+        self.web = self.source / 'web/packages/app'
         styles = self.web / 'src/shared/styles'
-        shutil.copytree(ROOT / 'web/app/src/shared/styles', styles)
+        shutil.copytree(ROOT / 'web/packages/app/src/shared/styles', styles)
 
     def test_fallback_keeps_text_fonts_and_copies_local_assets(self):
         with patch.object(configure, 'SOURCE', self.source):

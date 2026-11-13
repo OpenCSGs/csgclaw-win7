@@ -1,0 +1,37 @@
+diff --git a/desktop/src/main/htmlPreviewServer.ts b/desktop/src/main/htmlPreviewServer.ts
+--- a/desktop/src/main/htmlPreviewServer.ts
++++ b/desktop/src/main/htmlPreviewServer.ts
+@@ -1,11 +1,13 @@
+ import { randomBytes } from "node:crypto";
+ import { createServer, type Server } from "node:http";
++import type { Socket } from "node:net";
+ 
+ // Preview documents are served outside the application origin. Source identities
+ // let the native browser assign storage and request permissions per source file.
+ export class HTMLPreviewServer {
+   private readonly documents = new Map<string, { path: string; html: string; sourceKey: string }>();
+   private server?: Server;
++  private readonly sockets = new Set<Socket>();
+   private origin?: Promise<string>;
+   private disposed = false;
+ 
+@@ -61,6 +63,10 @@
+       });
+       response.end(request.method === "HEAD" ? undefined : document.html);
+     });
++    server.on("connection", (socket) => {
++      this.sockets.add(socket);
++      socket.once("close", () => this.sockets.delete(socket));
++    });
+     this.server = server;
+     this.origin = new Promise((resolve, reject) => {
+       server.once("error", reject);
+@@ -80,6 +86,7 @@
+     this.disposed = true;
+     this.clear();
+     this.server?.close();
+-    this.server?.closeAllConnections();
++    for (const socket of this.sockets) socket.destroy();
++    this.sockets.clear();
+   }
+ }

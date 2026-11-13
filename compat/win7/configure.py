@@ -10,6 +10,17 @@ COMPAT = ROOT / 'compat/win7'
 SOURCE = ROOT / '.cache/win7/csgclaw'
 
 
+def configure_http_trust(source):
+    lock = json.loads((COMPAT / 'sources.lock.json').read_text())
+    for name, expected in lock['http_trust']['files'].items():
+        if hashlib.sha256((COMPAT / 'httptrust' / name).read_bytes()).hexdigest() != expected:
+            raise ValueError('Win7 HTTPS trust checksum mismatch: ' + name)
+    target = source / 'internal/win7httptrust'
+    if target.exists():
+        raise ValueError('Win7 HTTPS trust overlay conflicts with upstream')
+    shutil.copytree(COMPAT / 'httptrust', target)
+
+
 def configure_emoji_fonts(web):
     lock = json.loads((COMPAT / 'sources.lock.json').read_text())
     fonts = COMPAT / 'web/fonts'
@@ -35,21 +46,13 @@ def replace(path, before, after):
 
 
 def main():
-    for original in (COMPAT / 'dsh').glob('*.go'):
-        target = SOURCE / 'internal/runtime/dsh' / original.name
-        if target.exists():
-            raise ValueError('Win7 DSH overlay conflicts with upstream: ' + str(target.relative_to(SOURCE)))
-        shutil.copy2(original, target)
-    for original in (COMPAT / 'apps').glob('*.go'):
-        target = SOURCE / 'internal/apps' / original.name
-        if target.exists():
-            raise ValueError('Win7 apps overlay conflicts with upstream: ' + str(target.relative_to(SOURCE)))
-        shutil.copy2(original, target)
-    for original in (COMPAT / 'connectorcli').glob('*.go'):
-        target = SOURCE / 'internal/connectorcli' / original.name
-        if target.exists():
-            raise ValueError('Win7 connector overlay conflicts with upstream: ' + str(target.relative_to(SOURCE)))
-        shutil.copy2(original, target)
+    configure_http_trust(SOURCE)
+    for overlay, destination in [('api', 'internal/api'), ('connectorcli', 'internal/connectorcli')]:
+        for original in (COMPAT / overlay).glob('*.go'):
+            target = SOURCE / destination / original.name
+            if target.exists():
+                raise ValueError('Win7 overlay conflicts with upstream: ' + str(target.relative_to(SOURCE)))
+            shutil.copy2(original, target)
     for original in (COMPAT / 'go').glob('*.go'):
         target = SOURCE / 'internal/runtime/codex' / original.name
         if target.exists():
@@ -99,7 +102,7 @@ def main():
     replace(browser, 'contents.navigationHistory.goToIndex(\n          contents.navigationHistory.getActiveIndex() + 1,\n        )', 'contents.goForward()')
     replace(browser, 'contents.navigationHistory.getActiveIndex() > 0', 'contents.canGoBack()')
     replace(browser, 'contents.navigationHistory.getActiveIndex() + 1 <\n        contents.navigationHistory.length()', 'contents.canGoForward()')
-    web = SOURCE / 'web/app'
+    web = SOURCE / 'web/packages/app'
     configure_emoji_fonts(web)
     package = json.loads((web / 'package.json').read_text())
     package['devDependencies'].pop('@tailwindcss/vite')
@@ -111,10 +114,10 @@ def main():
     replace(web / 'vite.config.ts', '    tailwindcss(),\n', '')
     replace(web / 'vite.config.ts', '  build: {\n', '  build: {\n    target: "chrome108",\n    cssTarget: "chrome108",\n')
     replace(web / 'src/shared/styles/globals.css', '@layer theme, utilities;\n\n@import "tailwindcss/theme.css" layer(theme);\n@import "tailwindcss/utilities.css" layer(utilities);\n', '')
-    replace(web / 'src/shared/styles/globals.css', '@import "./inputs.css";\n', '@import "./inputs.css";\n\n@tailwind utilities;\n')
-    for directory in ('desktop', 'web/app'):
-        overlay = 'desktop' if directory == 'desktop' else 'web'
-        shutil.copy2(COMPAT / overlay / 'pnpm-lock.yaml', SOURCE / directory / 'pnpm-lock.yaml')
+    with (web / 'src/shared/styles/globals.css').open('a') as styles:
+        styles.write('\n@tailwind utilities;\n')
+    for directory in ('desktop', 'web'):
+        shutil.copy2(COMPAT / directory / 'pnpm-lock.yaml', SOURCE / directory / 'pnpm-lock.yaml')
     print('Configured isolated Electron 22 / Chromium 108 build')
 
 
