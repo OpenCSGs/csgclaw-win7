@@ -9,6 +9,11 @@ on:
         description: 'Build version, e.g. v0.10.1-beta.1 (manual runs upload artifacts only)'
         type: string
         required: true
+      target:
+        description: 'Manual build target; tag pushes always build all three'
+        type: choice
+        default: all
+        options: [all, win7-amd64, kylin-v10-amd64, kylin-v10-arm64]
 
 permissions:
   contents: read
@@ -37,7 +42,8 @@ jobs:
         id: metadata
         env:
           RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
-        run: python compat/win7/ci.py metadata --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
+          RELEASE_TARGET: ${{ github.event_name == 'push' && 'all' || inputs.target || 'all' }}
+        run: python compat/win7/ci.py metadata --version "$RELEASE_VERSION" --target "$RELEASE_TARGET" --output "$GITHUB_OUTPUT"
       - name: Check compatibility build helpers
         run: python -m unittest discover -s compat/win7/tests -p 'test_*.py'
 
@@ -53,6 +59,7 @@ jobs:
       GOWORK: 'off'
       CGO_ENABLED: '0'
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      PYTHONUTF8: '1'
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +91,7 @@ jobs:
         if: ${{ matrix.target == 'win7-amd64' }}
         shell: pwsh
         run: |
-          choco install nsis --version=3.13 --yes --no-progress --allow-downgrade
+          choco upgrade nsis --version=3.13 --yes --no-progress --allow-downgrade
           $nsisRoot = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
           $nsisRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install Linux packaging tools

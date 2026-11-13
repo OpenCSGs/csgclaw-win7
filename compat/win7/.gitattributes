@@ -1,4 +1,5 @@
-patches/*.patch -whitespace
-
-# Keep imported upstream source and whitespace-sensitive fixtures byte-for-byte.
-codex/** -whitespace
+# These inputs are checksum-pinned; native Windows checkout must preserve bytes.
+patches/*.patch text eol=lf
+httptrust/cacert.pem text eol=lf
+httptrust/LICENSE.MPL-2.0 text eol=lf
+web/fonts/LICENSE.noto-emoji text eol=lf
