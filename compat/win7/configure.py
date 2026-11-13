@@ -42,7 +42,7 @@ def replace(path, before, after):
     text = path.read_text()
     if text.count(before) != 1:
         raise ValueError(f'Compatibility context changed in {path.relative_to(SOURCE)}: {before[:60]}')
-    path.write_text(text.replace(before, after))
+    path.write_text(text.replace(before, after), encoding='utf-8', newline='\n')
 
 
 def main():
@@ -69,12 +69,12 @@ def main():
     package['devDependencies']['@types/node'] = '16.18.126'
     package['devDependencies']['@types/node-host'] = 'npm:@types/node@24.9.0'
     package['scripts']['test'] = package['scripts']['test'].replace('pnpm run build &&', 'pnpm run build && tsc -p tsconfig.test.json &&') + ' dist/main/updater.test.js dist/main/legacyWebContentsView.test.js dist/main/legacyViewportFit.test.js'
-    (desktop / 'package.json').write_text(json.dumps(package, indent=2) + '\n')
+    (desktop / 'package.json').write_text(json.dumps(package, indent=2) + '\n', encoding='utf-8', newline='\n')
     replace(desktop / 'pnpm-workspace.yaml', 'allowBuilds:\n', 'allowBuilds:\n  electron: false\n')
     config = json.loads((desktop / 'tsconfig.json').read_text())
     config['compilerOptions'].update(target='ES2021', lib=['ES2021', 'DOM'])
     config['exclude'] = ['src/**/*.test.ts']
-    (desktop / 'tsconfig.json').write_text(json.dumps(config, indent=2) + '\n')
+    (desktop / 'tsconfig.json').write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8', newline='\n')
     for name, target in [('updater.ts','src/main/updater.ts'),('updater.test.ts','src/main/updater.test.ts'),('tsconfig.test.json','tsconfig.test.json')]:
         shutil.copy2(COMPAT / 'desktop' / name, desktop / target)
     replace(desktop / 'src/main/sidecar/childEnvironment.ts', 'path.join(homeDirectory, ".docker", "bin")', 'path.posix.join(homeDirectory, ".docker", "bin")')
@@ -107,14 +107,14 @@ def main():
     package = json.loads((web / 'package.json').read_text())
     package['devDependencies'].pop('@tailwindcss/vite')
     package['devDependencies'].update(tailwindcss='3.4.17', postcss='8.5.6', autoprefixer='10.4.21')
-    (web / 'package.json').write_text(json.dumps(package, indent=2) + '\n')
+    (web / 'package.json').write_text(json.dumps(package, indent=2) + '\n', encoding='utf-8', newline='\n')
     for name in ['postcss.config.js','tailwind.config.js']:
         shutil.copy2(COMPAT / 'web' / name, web / name)
     replace(web / 'vite.config.ts', 'import tailwindcss from "@tailwindcss/vite";\n', '')
     replace(web / 'vite.config.ts', '    tailwindcss(),\n', '')
     replace(web / 'vite.config.ts', '  build: {\n', '  build: {\n    target: "chrome108",\n    cssTarget: "chrome108",\n')
     replace(web / 'src/shared/styles/globals.css', '@layer theme, utilities;\n\n@import "tailwindcss/theme.css" layer(theme);\n@import "tailwindcss/utilities.css" layer(utilities);\n', '')
-    with (web / 'src/shared/styles/globals.css').open('a') as styles:
+    with (web / 'src/shared/styles/globals.css').open('a', encoding='utf-8', newline='\n') as styles:
         styles.write('\n@tailwind utilities;\n')
     for directory in ('desktop', 'web'):
         shutil.copy2(COMPAT / directory / 'pnpm-lock.yaml', SOURCE / directory / 'pnpm-lock.yaml')

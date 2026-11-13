@@ -60,6 +60,12 @@ class PrepareTest(unittest.TestCase):
             prepare.materialize(self.repo, 'HEAD:missing-codex', destination, [])
         self.assertEqual((destination / 'previous').read_text(), 'keep\n')
 
+    def test_windows_autocrlf_does_not_change_prepared_source_bytes(self):
+        subprocess.run(['git', 'config', 'core.autocrlf', 'true'], cwd=self.repo, check=True)
+        destination = prepare.CACHE / 'canonical'
+        prepare.materialize(self.repo, 'HEAD', destination, [])
+        self.assertEqual((destination / 'main.go').read_bytes(), b'package main\n')
+
 
 if __name__ == '__main__':
     unittest.main()

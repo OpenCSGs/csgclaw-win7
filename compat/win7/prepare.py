@@ -19,7 +19,7 @@ def materialize(repository, ref, destination, patches, exclude_prefixes=()):
     destination = Path(destination)
     if destination.parent != CACHE:
         raise ValueError('Prepared sources must be direct children of the owned cache')
-    raw = subprocess.check_output(['git', 'archive', ref], cwd=repository)
+    raw = subprocess.check_output(['git', '-c', 'core.autocrlf=false', 'archive', ref], cwd=repository)
     temporary = destination.with_name(destination.name + '.preparing')
     if temporary.exists():
         shutil.rmtree(temporary)
