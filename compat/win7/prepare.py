@@ -33,7 +33,7 @@ def materialize(repository, ref, destination, patches, exclude_prefixes=()):
         env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(temporary.parent))
         for patch in patches:
             for arguments in (['--check'], []):
-                subprocess.run(['git', 'apply', '--whitespace=nowarn', *arguments, str(patch)], cwd=temporary, env=env, check=True)
+                subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', '--whitespace=nowarn', *arguments, str(patch)], cwd=temporary, env=env, check=True)
         if destination.exists():
             shutil.rmtree(destination)
         temporary.rename(destination)
