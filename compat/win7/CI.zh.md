@@ -15,7 +15,7 @@ GitHub Actions 入口为 `.github/workflows/release.yml`，具体构建、依赖
 Release 同时包含 SHA-256 校验表、Win7 构建记录和麒麟 ELF 审计记录。
 预发布 tag 生成 prerelease，稳定 tag 生成普通 Release。
 手动运行同一 workflow 可以指定版本及单个构建目标，运行结果仅保留为 Actions artifacts，不创建 tag 或 Release。
-版本 tag 所指的提交必须包含本工作流；首次接入可先合入维护分支，或直接从包含此配置的任务分支打 tag。
+Win7 仓库统一在 `main` 维护适配、连接修复和发布工作流，版本 tag 从已验证的 `main` 提交创建。
 不需要为每个 tag 修改 `sources.lock.json` 的默认版本；CI 通过 `CSGCLAW_WIN7_VERSION` 传递已校验版本，源码来源及校验值保持不变。
 
 ## 固定依赖
