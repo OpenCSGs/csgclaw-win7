@@ -8,7 +8,7 @@ GitHub Actions 入口为 `.github/workflows/release.yml`，具体构建、依赖
 
 | 目标 | 产物 | 构建环境 |
 | --- | --- | --- |
-| Win7 SP1 x64 | `csgclaw-desktop_<tag>_win7_amd64.exe` | Windows 2025，固定 Win7 Go SDK、Electron 22、定制 Codex/WinPTY、NSIS 3.13 |
+| Win7 SP1 x64 | `csgclaw-desktop_<tag>_win7_amd64.exe` | macOS 15 交叉编译，固定 Win7 Go SDK、Electron 22、定制 Codex/WinPTY、NSIS 3.13 |
 | 麒麟 V10 amd64 | `csgclaw-desktop_<tag>_kylin-v10_amd64.deb` | Ubuntu 24.04 amd64 |
 | 麒麟 V10 arm64 | `csgclaw-desktop_<tag>_kylin-v10_arm64.deb` | Ubuntu 24.04 arm64 |
 
@@ -39,6 +39,7 @@ DEB 的 control/data 使用 xz 压缩，兼容旧版 dpkg。
 两个兼容目标均保留本地构建升级保护；麒麟桌面使用系统包管理器更新，Win7 继续使用兼容安装包。
 本流水线不上传主仓库 OSS 更新渠道、不构建云端镜像，也不修改 CSGHub PVC 的服务包和升级路径。
 
-Windows 构建明确选择 Git for Windows 的 Bash，使用 UTF-8，并在源码导出和补丁应用时固定 LF 行尾。
-测试进程在启动时固定为 Asia/Shanghai，Windows runner 同时设置系统时区，避免 worker 线程中的动态 TZ 设置影响日期断言。
-Windows Python 安装固定版本的 tzdata，供安装包的日期和来源记录使用。
+源码导出和补丁应用固定 LF 行尾，校验输入在原生 Windows checkout 时也保持固定字节。
+测试进程在启动时固定为 Asia/Shanghai。
+Win7 使用已验证的 macOS 构建主机执行全量 Go、前端与桌面测试，再以固定 Win7 SDK 交叉编译。
+这不会将现代 Windows runner 的测试误称为 Win7 原生验收。
