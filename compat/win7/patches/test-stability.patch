@@ -35,3 +35,29 @@ diff --git a/internal/skill/builtin/python_cache_test.go b/internal/skill/builti
  			cmd.Dir = filepath.Join(dst, "scripts")
  			for _, env := range os.Environ() {
  				key, _, _ := strings.Cut(env, "=")
+diff --git a/internal/llm/tool_reasoning_test.go b/internal/llm/tool_reasoning_test.go
+--- a/internal/llm/tool_reasoning_test.go
++++ b/internal/llm/tool_reasoning_test.go
+@@ -9,6 +9,7 @@
+ 	"testing"
+ 
+ 	agent "csgclaw/internal/agentengine/agents"
++	"csgclaw/internal/cliproxy"
+ 	"csgclaw/internal/config"
+ )
+ 
+@@ -33,9 +34,12 @@
+ 		io.WriteString(w, `{"object":"response","status":"completed","output":[]}`)
+ 	}))
+ 	defer upstream.Close()
+-	old := embeddedCLIProxyProviderBaseURL
++	old, oldAuth := embeddedCLIProxyProviderBaseURL, embeddedCLIProxyAuthStatus
+ 	embeddedCLIProxyProviderBaseURL = func(context.Context, string) (string, error) { return upstream.URL, nil }
+-	defer func() { embeddedCLIProxyProviderBaseURL = old }()
++	defer func() { embeddedCLIProxyProviderBaseURL, embeddedCLIProxyAuthStatus = old, oldAuth }()
++	embeddedCLIProxyAuthStatus = func(context.Context, string) (cliproxy.AuthStatus, error) {
++		return cliproxy.AuthStatus{Authenticated: true}, nil
++	}
+ 	service := NewService(config.ModelConfig{}, nil)
+ 	response, err := service.forwardRemoteResponses(context.Background(), agent.AgentProfile{Provider: agent.ProviderCodex, ModelID: "gpt-6-luna"}, []byte(`{"input":"OK","reasoning":{"effort":"minimal"},"tools":[{"type":"web_search"},{"type":"function","name":"lookup"}]}`))
+ 	if err != nil {
