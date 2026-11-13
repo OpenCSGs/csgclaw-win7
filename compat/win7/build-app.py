@@ -9,11 +9,22 @@ import shutil
 import subprocess
 import sys
 import urllib.request
-from distribution import write_distribution
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from compat.win7.distribution import write_distribution
 COMPAT = ROOT / 'compat/win7'
 CACHE = ROOT / '.cache/win7'
+
+
+def git_bash(git):
+    # Native Python resolves System32/bash.exe (WSL) before Git Bash on hosted
+    # Windows. Locate Bash within the Git installation instead.
+    for parent in Path(git).resolve().parents:
+        candidate = parent / 'bin/bash.exe'
+        if candidate.is_file():
+            return candidate
+    raise ValueError('Git for Windows Bash is required for the package scripts')
 
 
 def run(arguments, cwd=ROOT, env=None):
@@ -50,6 +61,7 @@ def main():
     run([sys.executable, COMPAT / 'prepare.py', '--codex'])
     run([sys.executable, COMPAT / 'configure.py'])
     source = CACHE / 'csgclaw'
+    bash = git_bash(shutil.which('git')) if os.name == 'nt' else 'bash'
     electron = CACHE / 'electron' / lock['electron']['archive']
     electron.parent.mkdir(parents=True, exist_ok=True)
     if args.electron_archive:
@@ -66,9 +78,9 @@ def main():
     # The packaged binary is supplied explicitly; no host Electron download is needed.
     env['ELECTRON_OVERRIDE_DIST_PATH'] = str(electron.parent)
     for script in ('desktop-pnpm.sh', 'web-pnpm.sh'):
-        run(['bash', source / 'scripts' / script, 'install', '--frozen-lockfile'], cwd=source, env=env)
-    run(['bash', source / 'scripts/web-pnpm.sh', 'check'], cwd=source, env=env)
-    run(['bash', source / 'scripts/desktop-pnpm.sh', 'test'], cwd=source, env=env)
+        run([bash, (source / 'scripts' / script).as_posix(), 'install', '--frozen-lockfile'], cwd=source, env=env)
+    run([bash, (source / 'scripts/web-pnpm.sh').as_posix(), 'check'], cwd=source, env=env)
+    run([bash, (source / 'scripts/desktop-pnpm.sh').as_posix(), 'test'], cwd=source, env=env)
     # Server tests exercise embedded UI responses; a pristine archive contains
     # only the generated directory placeholder until the web build completes.
     if os.name == 'nt':
