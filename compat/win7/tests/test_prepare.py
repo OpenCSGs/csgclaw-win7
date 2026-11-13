@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('win7_prepare', ROOT / 'compat/win7/prepare.py')
@@ -62,9 +63,14 @@ class PrepareTest(unittest.TestCase):
 
     def test_windows_autocrlf_does_not_change_prepared_source_bytes(self):
         subprocess.run(['git', 'config', 'core.autocrlf', 'true'], cwd=self.repo, check=True)
+        global_config = self.repo / 'gitconfig'
+        global_config.write_text('[core]\n    autocrlf = true\n')
+        adaptation = self.repo / 'adapt.patch'
+        adaptation.write_text('--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+// prepared\n')
         destination = prepare.CACHE / 'canonical'
-        prepare.materialize(self.repo, 'HEAD', destination, [])
-        self.assertEqual((destination / 'main.go').read_bytes(), b'package main\n')
+        with patch.dict('os.environ', {'GIT_CONFIG_GLOBAL': str(global_config)}):
+            prepare.materialize(self.repo, 'HEAD', destination, [adaptation])
+        self.assertEqual((destination / 'main.go').read_bytes(), b'package main\n// prepared\n')
 
 
 if __name__ == '__main__':
