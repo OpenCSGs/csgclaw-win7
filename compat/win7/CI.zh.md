@@ -40,4 +40,5 @@ DEB 的 control/data 使用 xz 压缩，兼容旧版 dpkg。
 本流水线不上传主仓库 OSS 更新渠道、不构建云端镜像，也不修改 CSGHub PVC 的服务包和升级路径。
 
 Windows 构建明确选择 Git for Windows 的 Bash，使用 UTF-8，并在源码导出和补丁应用时固定 LF 行尾。
-测试进程在启动时固定为 Asia/Shanghai，避免 Windows worker 线程中的动态 TZ 设置影响日期断言。
+测试进程在启动时固定为 Asia/Shanghai，Windows runner 同时设置系统时区，避免 worker 线程中的动态 TZ 设置影响日期断言。
+Windows Python 安装固定版本的 tzdata，供安装包的日期和来源记录使用。
