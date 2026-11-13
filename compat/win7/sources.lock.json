@@ -11,7 +11,7 @@
   },
   "previous_port_commit": "edf39aba2e307766913e97ddcf1a0cbaa21463ed",
   "patches": {
-    "csgclaw.patch": "016f28bea2b1f060967dcbe0aec3263ddf851a30a95ff63b06b2e89700e91811",
+    "csgclaw.patch": "f2716f4f3dfc67e1e2303a9b7fdf36456d8950f7b5439b27d4cae18a304e1d6d",
     "codex.patch": "c7d7927c1344bda05f8c81cce719a33c52e4b6e3901cf3728db281985d4a0342",
     "previous-desktop-port.patch": "27e44e27c96fb8004eb7690286305d14002d037b167a947a33e6305463491c04",
     "test-stability.patch": "2c49c1f1a94c7a0e2aab0873a429b359ad30de8c7d2ca150fe1884905277d04b",
