@@ -23,7 +23,7 @@ from compat.win7.version import normalize
 COMPAT = ROOT / 'compat/win7'
 CACHE = ROOT / '.cache/compat-ci'
 OUTPUT = ROOT / 'dist/compat-release'
-TARGETS = {'win7-amd64': 'windows-2025', 'kylin-v10-amd64': 'ubuntu-24.04', 'kylin-v10-arm64': 'ubuntu-24.04-arm'}
+TARGETS = {'win7-amd64': 'macos-15', 'kylin-v10-amd64': 'ubuntu-24.04', 'kylin-v10-arm64': 'ubuntu-24.04-arm'}
 
 
 def run(args, cwd=ROOT, env=None, **kwargs):

@@ -88,15 +88,12 @@ jobs:
             .cache/win7/electron/*.zip
             .cache/win7/connectors/*.tar.gz
           key: compat-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compat/win7/sources.lock.json', 'compat/win7/ci-lock.json') }}
-      - name: Install pinned NSIS compiler
+      - name: Install NSIS compiler for Win7 cross-build
         if: ${{ matrix.target == 'win7-amd64' }}
-        shell: pwsh
         run: |
-          Set-TimeZone -Id 'China Standard Time'
-          python -m pip install tzdata==2025.2
-          choco upgrade nsis --version=3.13 --yes --no-progress --allow-downgrade
-          $nsisRoot = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
-          $nsisRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          brew update
+          brew install nsis
+          makensis -VERSION
       - name: Install Linux packaging tools
         if: ${{ startsWith(matrix.target, 'kylin-') }}
         run: |
