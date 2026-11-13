@@ -49,6 +49,7 @@ def main():
                     '--output', str(output / 'connector-packages')], check=True)
     for source, name in [(ROOT / 'LICENSE', 'LICENSE.csgclaw'), (args.go.resolve().parent.parent / 'LICENSE', 'LICENSE.go'), (ROOT / '.cache/win7/codex/LICENSE', 'LICENSE.codex'), (ROOT / '.cache/win7/codex/NOTICE', 'NOTICE.codex')]:
         shutil.copy2(source, output.parent / name)
+    shutil.copy2(COMPAT / 'httptrust/LICENSE.MPL-2.0', output.parent / 'LICENSE.ca-certificates')
     print(output.parent)
 
 

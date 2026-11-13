@@ -1,6 +1,7 @@
+diff --git a/internal/api/agent_sessions_test.go b/internal/api/agent_sessions_test.go
 --- a/internal/api/agent_sessions_test.go
 +++ b/internal/api/agent_sessions_test.go
-@@ -603,7 +603,20 @@
+@@ -834,7 +834,20 @@
  	recorder := httptest.NewRecorder()
  	stream := newAgentSessionEventStream(recorder)
  	stream.startHeartbeat(5 * time.Millisecond)
@@ -22,3 +23,15 @@
  	stream.stopHeartbeat()
  	body := recorder.Body.String()
  	if count := strings.Count(body, ": heartbeat\n\n"); count < 2 {
+diff --git a/internal/skill/builtin/python_cache_test.go b/internal/skill/builtin/python_cache_test.go
+--- a/internal/skill/builtin/python_cache_test.go
++++ b/internal/skill/builtin/python_cache_test.go
+@@ -50,7 +50,7 @@
+ 			}
+ 			// Import the actual bundled module, generating its normal bytecode cache.
+ 			// Importing defines functions only; it does not run LibreOffice or install dependencies.
+-			cmd := exec.Command(python, "-c", `import office.soffice; from pathlib import Path; assert list(Path('office/__pycache__').glob('soffice.*.pyc'))`)
++			cmd := exec.Command(python, "-c", `import sys; sys.pycache_prefix = None; import office.soffice; from pathlib import Path; assert list(Path('office/__pycache__').glob('soffice.*.pyc'))`)
+ 			cmd.Dir = filepath.Join(dst, "scripts")
+ 			for _, env := range os.Environ() {
+ 				key, _, _ := strings.Cut(env, "=")

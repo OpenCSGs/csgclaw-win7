@@ -1,7 +1,7 @@
 diff --git a/internal/api/workspace_open.go b/internal/api/workspace_open.go
 --- a/internal/api/workspace_open.go
 +++ b/internal/api/workspace_open.go
-@@ -55,7 +55,7 @@
+@@ -44,7 +44,7 @@
  		targets = append(targets, workspaceOpenTarget{ID: "system"}, workspaceOpenTarget{ID: "terminal"})
  	case "windows":
  		targets = append(targets, workspaceOpenTarget{ID: "system"})
@@ -10,7 +10,7 @@ diff --git a/internal/api/workspace_open.go b/internal/api/workspace_open.go
  			targets = append(targets, workspaceOpenTarget{ID: "terminal"})
  		}
  	case "linux":
-@@ -221,6 +221,12 @@
+@@ -210,6 +210,12 @@
  }
  
  func openWorkspacePath(ctx context.Context, path, target string, directory bool) error {
@@ -25,7 +25,6 @@ diff --git a/internal/api/workspace_open.go b/internal/api/workspace_open.go
  		return err
 diff --git a/internal/api/workspace_terminal_other.go b/internal/api/workspace_terminal_other.go
 new file mode 100644
-index 00000000..ddb7073a
 --- /dev/null
 +++ b/internal/api/workspace_terminal_other.go
 @@ -0,0 +1,14 @@
@@ -45,7 +44,6 @@ index 00000000..ddb7073a
 +}
 diff --git a/internal/api/workspace_terminal_windows.go b/internal/api/workspace_terminal_windows.go
 new file mode 100644
-index 00000000..5deae9ac
 --- /dev/null
 +++ b/internal/api/workspace_terminal_windows.go
 @@ -0,0 +1,79 @@
@@ -130,7 +128,6 @@ index 00000000..5deae9ac
 +}
 diff --git a/internal/api/workspace_terminal_windows_test.go b/internal/api/workspace_terminal_windows_test.go
 new file mode 100644
-index 00000000..ecb2b1ce
 --- /dev/null
 +++ b/internal/api/workspace_terminal_windows_test.go
 @@ -0,0 +1,45 @@
@@ -180,10 +177,9 @@ index 00000000..ecb2b1ce
 +	}
 +}
 diff --git a/internal/processgroup/process_unix.go b/internal/processgroup/process_unix.go
-index 80f69a4d..6406a952 100644
 --- a/internal/processgroup/process_unix.go
 +++ b/internal/processgroup/process_unix.go
-@@ -20,6 +20,10 @@ func Start(cmd *exec.Cmd) error {
+@@ -20,6 +20,10 @@
  	cmd.SysProcAttr.Setpgid = true
  	return cmd.Start()
  }
@@ -238,7 +234,6 @@ diff --git a/internal/processgroup/process_windows.go b/internal/processgroup/pr
  			// An exited process can still be opened while another caller owns
 diff --git a/internal/processgroup/process_win7_windows_test.go b/internal/processgroup/process_win7_windows_test.go
 new file mode 100644
-index 00000000..a917cc84
 --- /dev/null
 +++ b/internal/processgroup/process_win7_windows_test.go
 @@ -0,0 +1,116 @@
@@ -358,21 +353,8 @@ index 00000000..a917cc84
 +		t.Fatalf("stopping an already-exited process launched taskkill: %v", err)
 +	}
 +}
-diff --git a/internal/runtime/codex/appserver_manager.go b/internal/runtime/codex/appserver_manager.go
---- a/internal/runtime/codex/appserver_manager.go
-+++ b/internal/runtime/codex/appserver_manager.go
-@@ -168,7 +168,7 @@
- 	}
--	if err := processgroup.Start(cmd); err != nil {
-+	if err := processgroup.StartWithChildJobs(cmd); err != nil {
- 		_ = stderrFile.Close()
- 		diagnostics.ReportFailure(ctx, "runtime.process_start", err, map[string]any{"runtime_id": spec.RuntimeID, "stderr_path": spec.StderrPath})
- 		return nil, fmt.Errorf("start codex app-server: %w", err)
- 	}
- 
 diff --git a/internal/runtime/codex/win7_features_windows_test.go b/internal/runtime/codex/win7_features_windows_test.go
 new file mode 100644
-index 00000000..858c3e77
 --- /dev/null
 +++ b/internal/runtime/codex/win7_features_windows_test.go
 @@ -0,0 +1,95 @@
@@ -473,7 +455,6 @@ index 00000000..858c3e77
 +}
 diff --git a/internal/runtime/codex/win7_interactive_windows_test.go b/internal/runtime/codex/win7_interactive_windows_test.go
 new file mode 100644
-index 00000000..c61ae1dc
 --- /dev/null
 +++ b/internal/runtime/codex/win7_interactive_windows_test.go
 @@ -0,0 +1,205 @@
@@ -684,7 +665,6 @@ index 00000000..c61ae1dc
 +}
 diff --git a/internal/runtime/codex/win7_sandbox_windows_test.go b/internal/runtime/codex/win7_sandbox_windows_test.go
 new file mode 100644
-index 00000000..501f7ea5
 --- /dev/null
 +++ b/internal/runtime/codex/win7_sandbox_windows_test.go
 @@ -0,0 +1,340 @@
@@ -1028,11 +1008,10 @@ index 00000000..501f7ea5
 +		})
 +	}
 +}
-diff --git a/web/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.css b/web/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.css
-index ebc308c4..94375edf 100644
---- a/web/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.css
-+++ b/web/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.css
-@@ -291,7 +291,7 @@
+diff --git a/web/packages/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.module.css b/web/packages/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.module.css
+--- a/web/packages/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.module.css
++++ b/web/packages/app/src/components/business/DocumentPreviewPanel/DocumentPreviewPanel.module.css
+@@ -283,7 +283,7 @@
  .document-preview-html-frame-wrap {
    min-width: 0;
    min-height: 0;
@@ -1041,7 +1020,7 @@ index ebc308c4..94375edf 100644
    background: var(--surface);
  }
  
-@@ -484,10 +484,15 @@
+@@ -498,11 +498,16 @@
    text-align: center;
  }
  
@@ -1054,15 +1033,16 @@ index ebc308c4..94375edf 100644
    width: 960px;
    min-height: 540px;
 -  margin: 0 auto;
+-  /* Keep zoomed slide text painted when Chromium switches application themes. */
 +  transform-origin: top left;
++  /* Keep scaled slide text painted when Chromium switches application themes. */
+   transform: translateZ(0);
  }
  
- @media (max-width: 960px) {
-diff --git a/web/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx b/web/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
-index 603c5225..532377ec 100644
---- a/web/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
-+++ b/web/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
-@@ -90,14 +90,14 @@ function sanitizedHTMLFragment(source: string): string {
+diff --git a/web/packages/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx b/web/packages/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
+--- a/web/packages/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
++++ b/web/packages/app/src/components/business/DocumentPreviewPanel/HtmlPreview.tsx
+@@ -93,14 +93,14 @@
    return `${safeStyles ? `<style>${safeStyles}</style>` : ""}${template.innerHTML}`;
  }
  
@@ -1079,19 +1059,19 @@ index 603c5225..532377ec 100644
    html { min-height: 100%; background: #fff; color: #111827; }
    body { min-height: 100%; margin: 0; padding: 24px; box-sizing: border-box; overflow-wrap: anywhere; }
    img, video { max-width: 100%; height: auto; }
-@@ -109,7 +109,7 @@ function htmlPreviewDocument(source: string, scale: number): string {
- 
- export default function HtmlPreview({ scale, text, t }: { scale: number; text: string; t: (key: string) => string }) {
+@@ -114,7 +114,7 @@
    const [mode, setMode] = useState<"preview" | "source">("preview");
+   const [wrap, setWrap] = useState(true);
+   const [copyResult, setCopyResult] = useState<{ text: string; ok: boolean }>();
 -  const srcDoc = useMemo(() => htmlPreviewDocument(text, scale), [scale, text]);
 +  const srcDoc = useMemo(() => htmlPreviewDocument(text), [text]);
+   const copied = copyResult?.text === text ? copyResult.ok : undefined;
+   const copyStatus = copied === undefined ? "" : t(copied ? "copiedToClipboard" : "copyTextFailed");
  
-   return (
-     <div className="document-preview-html-shell">
-@@ -130,6 +130,13 @@ export default function HtmlPreview({ scale, text, t }: { scale: number; text: s
-         <div className="document-preview-html-frame-wrap">
+@@ -175,6 +175,13 @@
+         <div className={documentPreviewPanelStyles["document-preview-html-frame-wrap"]}>
            <iframe
-             className="document-preview-html-frame"
+             className={documentPreviewPanelStyles["document-preview-html-frame"]}
 +            style={{
 +              width: `${100 / scale}%`,
 +              height: `${100 / scale}%`,
@@ -1102,11 +1082,10 @@ index 603c5225..532377ec 100644
              referrerPolicy="no-referrer"
              sandbox=""
              srcDoc={srcDoc}
-diff --git a/web/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx b/web/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
-index ba6d097e..76867d90 100644
---- a/web/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
-+++ b/web/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
-@@ -2,7 +2,7 @@ import { useCallback, useLayoutEffect, useMemo, useRef, useState, type UIEvent }
+diff --git a/web/packages/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx b/web/packages/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
+--- a/web/packages/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
++++ b/web/packages/app/src/components/business/DocumentPreviewPanel/PdfPreview.tsx
+@@ -3,7 +3,7 @@
  import { ChevronLeft, ChevronRight } from "lucide-react";
  import { Document, Page, pdfjs } from "react-pdf";
  import { Button, TextInput } from "@/components/ui";
@@ -1115,11 +1094,10 @@ index ba6d097e..76867d90 100644
  import { copyPreviewBuffer } from "./previewBuffer";
  import "react-pdf/dist/Page/AnnotationLayer.css";
  import "react-pdf/dist/Page/TextLayer.css";
-diff --git a/web/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx b/web/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
-index 98351db1..558feb2a 100644
---- a/web/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
-+++ b/web/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
-@@ -25,6 +25,20 @@ export default function PowerPointPreview({
+diff --git a/web/packages/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx b/web/packages/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
+--- a/web/packages/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
++++ b/web/packages/app/src/components/business/DocumentPreviewPanel/PowerPointPreview.tsx
+@@ -26,6 +26,20 @@
    const [slide, setSlide] = useState(1);
    const [error, setError] = useState(false);
    const [fittedScale, setFittedScale] = useState(1);
@@ -1140,38 +1118,43 @@ index 98351db1..558feb2a 100644
  
    useLayoutEffect(() => {
      const container = scrollRef.current;
-@@ -116,7 +130,12 @@ export default function PowerPointPreview({
-   return (
-     <div className="document-preview-powerpoint">
-       <div ref={scrollRef} className="document-preview-ppt-stage-shell" onScroll={handleScroll}>
--        <div ref={stageRef} className="document-preview-ppt-stage" style={{ zoom: fittedScale * scale }} />
-+        <div
-+          className="document-preview-ppt-layout"
+@@ -131,10 +145,15 @@
+           </div>
+         ) : null}
+         <div
+-          ref={stageRef}
+-          className={documentPreviewPanelStyles["document-preview-ppt-stage"]}
+-          style={{ zoom: fittedScale * scale }}
+-        />
++          className={documentPreviewPanelStyles["document-preview-ppt-layout"]}
 +          style={{ width: 960 * renderedScale, height: stageHeight * renderedScale }}
 +        >
-+          <div ref={stageRef} className="document-preview-ppt-stage" style={{ transform: `scale(${renderedScale})` }} />
++          <div
++            ref={stageRef}
++            className={documentPreviewPanelStyles["document-preview-ppt-stage"]}
++            style={{ transform: `scale(${renderedScale}) translateZ(0)` }}
++          />
 +        </div>
        </div>
        {slideCount > 0 ? (
-         <div className="document-preview-page-controls">
-diff --git a/web/app/tests/components/DocumentPreviewPanel.test.tsx b/web/app/tests/components/DocumentPreviewPanel.test.tsx
-index c44743ee..3ae02044 100644
---- a/web/app/tests/components/DocumentPreviewPanel.test.tsx
-+++ b/web/app/tests/components/DocumentPreviewPanel.test.tsx
-@@ -307,6 +307,12 @@ describe("DocumentPreviewPanel", () => {
+         <div className={documentPreviewPanelStyles["document-preview-page-controls"]}>
+diff --git a/web/packages/app/tests/components/DocumentPreviewPanel.test.tsx b/web/packages/app/tests/components/DocumentPreviewPanel.test.tsx
+--- a/web/packages/app/tests/components/DocumentPreviewPanel.test.tsx
++++ b/web/packages/app/tests/components/DocumentPreviewPanel.test.tsx
+@@ -319,6 +319,12 @@
+     expect(frameDocument).not.toContain('alt="remote"');
      expect(frameDocument).not.toContain("window.hacked");
      expect(frameDocument).not.toContain("tracker.example");
- 
++
 +    await user.click(screen.getByRole("button", { name: "Zoom in" }));
 +    expect(frame).toHaveStyle({ transform: "scale(1.1)" });
 +    expect(parseFloat((frame as HTMLIFrameElement).style.width)).toBeCloseTo(100 / 1.1);
 +    expect(parseFloat((frame as HTMLIFrameElement).style.height)).toBeCloseTo(100 / 1.1);
 +    expect(frame).toHaveAttribute("srcdoc", frameDocument);
-+
+ 
      await user.click(screen.getByRole("radio", { name: "Code" }));
-     await waitFor(() =>
-       expect(container.querySelector('.document-preview-shiki[data-language="html"]')).toHaveTextContent(
-@@ -815,3 +821,50 @@ describe("image preview sizing", () => {
+     const code = await screen.findByRole("textbox", { name: "Code" });
+@@ -891,3 +897,58 @@
      }
    });
  });
@@ -1204,13 +1187,21 @@ index c44743ee..3ae02044 100644
 +          onIndexChange={() => {}}
 +        />,
 +      );
-+      await waitFor(() => expect(container.querySelector(".document-preview-ppt-layout")).toBeInTheDocument());
-+      const layout = container.querySelector<HTMLElement>(".document-preview-ppt-layout")!;
-+      const stage = container.querySelector<HTMLElement>(".document-preview-ppt-stage")!;
++      await waitFor(() =>
++        expect(
++          container.querySelector(`.${testDocumentPreviewPanelStyles["document-preview-ppt-layout"]}`),
++        ).toBeInTheDocument(),
++      );
++      const layout = container.querySelector<HTMLElement>(
++        `.${testDocumentPreviewPanelStyles["document-preview-ppt-layout"]}`,
++      )!;
++      const stage = container.querySelector<HTMLElement>(
++        `.${testDocumentPreviewPanelStyles["document-preview-ppt-stage"]}`,
++      )!;
 +      const fitted = parseFloat(layout.style.width);
 +      expect(fitted).toBeLessThanOrEqual(560);
 +      expect(parseFloat(layout.style.height)).toBeCloseTo((1080 * fitted) / 960);
-+      expect(stage.style.transform).toBe(`scale(${fitted / 960})`);
++      expect(stage.style.transform).toBe(`scale(${fitted / 960}) translateZ(0)`);
 +      await userEvent.click(screen.getByRole("button", { name: "Zoom in" }));
 +      expect(parseFloat(layout.style.width)).toBeCloseTo(fitted * 1.1);
 +      expect(parseFloat(layout.style.height)).toBeCloseTo(((1080 * fitted) / 960) * 1.1);
@@ -1222,11 +1213,10 @@ index c44743ee..3ae02044 100644
 +    }
 +  });
 +});
-diff --git a/web/app/tests/shared/pdfBrowserCompatibility.test.ts b/web/app/tests/shared/pdfBrowserCompatibility.test.ts
+diff --git a/web/packages/app/tests/shared/pdfBrowserCompatibility.test.ts b/web/packages/app/tests/shared/pdfBrowserCompatibility.test.ts
 new file mode 100644
-index 00000000..a86432a6
 --- /dev/null
-+++ b/web/app/tests/shared/pdfBrowserCompatibility.test.ts
++++ b/web/packages/app/tests/shared/pdfBrowserCompatibility.test.ts
 @@ -0,0 +1,21 @@
 +import { describe, expect, it, vi } from "vitest";
 +
@@ -1249,23 +1239,36 @@ index 00000000..a86432a6
 +    }
 +  });
 +});
-diff --git a/web/app/vite.config.ts b/web/app/vite.config.ts
-index c2eb8fe3..4e20cd58 100644
---- a/web/app/vite.config.ts
-+++ b/web/app/vite.config.ts
-@@ -58,9 +58,12 @@ export default defineConfig(({ command }) => ({
-   base: "./",
-   publicDir: "public",
+diff --git a/web/packages/app/vite.config.ts b/web/packages/app/vite.config.ts
+--- a/web/packages/app/vite.config.ts
++++ b/web/packages/app/vite.config.ts
+@@ -64,9 +64,10 @@
    resolve: {
+     conditions: ["csgclaw-source", "module", "browser", "development|production"],
+     dedupe: ["react", "react-dom"],
 -    alias: {
 -      "@": path.resolve(__dirname, "src"),
 -    },
 +    alias: [
 +      { find: "@", replacement: path.resolve(__dirname, "src") },
-+      // React-PDF and its worker must use the same PDF.js build. The legacy
-+      // build supplies platform APIs missing from Firefox 115 ESR on Win7.
 +      { find: /^pdfjs-dist$/, replacement: path.resolve(__dirname, "node_modules/pdfjs-dist/legacy/build/pdf.mjs") },
 +    ],
    },
    build: {
-     outDir: "../static-dist",
+     outDir: staticDistDir,
+diff --git a/internal/diagnostics/worker_stderr.go b/internal/diagnostics/worker_stderr.go
+--- a/internal/diagnostics/worker_stderr.go
++++ b/internal/diagnostics/worker_stderr.go
+@@ -43,7 +43,11 @@
+ 		return nil, err
+ 	}
+ 	cmd.Stderr = writer
+-	err = processgroup.Start(cmd)
++	if kind == "codex" {
++		err = processgroup.StartWithChildJobs(cmd)
++	} else {
++		err = processgroup.Start(cmd)
++	}
+ 	_ = writer.Close()
+ 	if err != nil {
+ 		_ = reader.Close()

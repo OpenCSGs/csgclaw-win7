@@ -5,7 +5,7 @@ See [the desktop build and acceptance guide](README.zh.md) for the complete Win7
 The repository root retains the CSGClaw upstream directory layout and sources.
 Win7 changes live here and are applied to an ignored build tree, rather than moving or duplicating application directories.
 The imported CSGClaw commit, Codex commit, patch digests and previously verified runtime digests are recorded in `sources.lock.json`.
-The current CSGClaw baseline is upstream main `f365f4550b20b0e76b09c6125f20eddf35bfa09b` (2026-10-30, `v0.10.0-beta.3`).
+The current CSGClaw baseline is upstream main `9096a27ca9c688f846055b5571d6320dad63babd` (2026-11-13), after `v0.10.0`.
 HTTP OpenCSG login and its regression tests come directly from upstream PR #787; no duplicate compatibility patch is applied.
 Unrelated local work in the original CSGClaw checkout is excluded.
 
@@ -46,7 +46,7 @@ The verified runtime set is Codex `rust-v0.149.1` plus our Win7 patch and matchi
 The backend records the application version, source commit and build time.
 The installer also includes Feishu CLI `1.0.97`, rebuilt from its checksum-pinned official source with the same Win7 Go SDK, and its pinned Skills.
 The connector imports this verified local package before trying an online download, so first connection does not depend on GitHub access or an incompatible ordinary Windows CLI.
-Its `+local` suffix preserves the upstream custom-install guard; the desktop application reports version `0.10.0-beta.3`.
+Its `+local` suffix preserves the upstream custom-install guard; the desktop application reports version `0.10.0`.
 
 ## Merge future CSGClaw updates
 
@@ -71,3 +71,17 @@ Local DSH context and memory plugins use escaped `file:` URLs so Windows drive l
 DSH initialization allows up to two minutes for cold profile loading, while still respecting caller cancellation and earlier deadlines.
 
 See [native desktop acceptance](DESKTOP-ACCEPTANCE.zh.md) and [fixture replay instructions](tests/README.zh.md).
+
+The Windows workflow fixes from upstream PR #814 are inherited directly, including DSH module URLs and startup deadlines, Feishu authorization URL validation, CLI startup deadlines, and native Windows process identity.
+Duplicate overlays and patch hunks have been removed.
+The Win7 layer retains the bundled compatible Feishu CLI, automatic local package discovery, and opaque delete-dialog colors for Chromium 108.
+
+## 2026-11-13 synchronization and connector checks
+
+The compatibility build now uses the upstream web workspace and CSS modules.
+The Electron 22 HTML preview server tracks and closes its sockets without Node 18-only APIs.
+Codex process startup retains Win7 child-job support after upstream moved stderr management into diagnostics.
+`api/connector_live_test.go` exercises the real MCP marketplace and Feishu authorization, cancellation, and retry over HTTP.
+Set `CSGCLAW_TEST_MCP_AUTH_FILE` to a private JSON fixture containing `hub_url` and `access_token`, and `CSGCLAW_TEST_CONNECTOR_PACKAGES` to the shipped connector package directory.
+These opt-in checks do not grant Feishu application or personal account access.
+Native results must be recorded separately from host checks.

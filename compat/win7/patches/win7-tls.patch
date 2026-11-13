@@ -1,0 +1,29 @@
+diff --git a/internal/mcp/remote.go b/internal/mcp/remote.go
+--- a/internal/mcp/remote.go
++++ b/internal/mcp/remote.go
+@@ -13,6 +13,7 @@
+ 	"time"
+ 
+ 	"csgclaw/internal/mcpschema"
++	_ "csgclaw/internal/win7httptrust"
+ )
+ 
+ const (
+diff --git a/internal/connectorcli/install.go b/internal/connectorcli/install.go
+--- a/internal/connectorcli/install.go
++++ b/internal/connectorcli/install.go
+@@ -59,7 +59,13 @@
+ 	target := filepath.Join(i.Root, i.Spec.Version)
+ 	pkg := Package{Executable: filepath.Join(target, "bin", name), SkillsDir: filepath.Join(target, "skills"), Version: i.Spec.Version, SkillsVersion: i.Spec.Skills.Version, VersionArgs: i.Spec.VersionArgs}
+ 	if err := verifyPackage(ctx, pkg); err == nil {
+-		return pkg, nil
++		refresh, err := i.preinstalledChanged(pkg)
++		if err != nil {
++			return Package{}, err
++		}
++		if !refresh {
++			return pkg, nil
++		}
+ 	}
+ 	platform := runtime.GOOS + "-" + runtime.GOARCH
+ 	release, ok := i.Spec.Releases[platform]
