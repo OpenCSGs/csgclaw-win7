@@ -133,3 +133,8 @@ Win7 的 HTTPS 与飞书长连接使用应用内固定来源的 Mozilla 根证�
 同版本飞书 CLI 的兼容构建更新会根据已校验的预装清单刷新有效旧缓存，授权配置保存在独立目录。
 来源和维护步骤见 [HTTPS 证书维护说明](httptrust/README.md)。
 原生缓存升级检查额外使用 `CSGCLAW_TEST_OLD_CONNECTOR_PACKAGES` 指向旧安装包的连接器目录。
+
+## GitHub tag 自动构建
+
+推送版本 tag 后自动构建 Win7 x64、麒麟 V10 amd64 和 arm64 的安装包。
+触发方式、固定依赖与兼容检查见 [Tag 发布 CI](CI.zh.md)。
