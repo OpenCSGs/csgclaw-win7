@@ -23,7 +23,7 @@ class DistributionTest(unittest.TestCase):
             compat.mkdir(parents=True)
             (compat / 'USER.zh.md').write_text('Install Setup.exe\n')
             (compat / 'sources.lock.json').write_text(json.dumps({
-                'app_version': 'test', 'csgclaw': {'commit': 'a'*40}, 'electron': {'version': '22.3.27'},
+                'app_version': '0.1.0', 'csgclaw': {'commit': 'a'*40}, 'electron': {'version': '22.3.27'},
             }))
             subprocess.run(['git', 'init', '-q', str(repo)], check=True)
             subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
@@ -37,8 +37,8 @@ class DistributionTest(unittest.TestCase):
                 manifest = distribution.write_distribution()
             recorded = json.loads(manifest.read_text())
             self.assertEqual(recorded['source_commit'], commit)
-            self.assertEqual(recorded['version'], 'test')
-            self.assertTrue(recorded['build_id'].startswith('test-'))
+            self.assertEqual(recorded['version'], '0.1.0')
+            self.assertTrue(recorded['build_id'].startswith('0.1.0-'))
             self.assertIn(commit[:8], recorded['build_id'])
             self.assertFalse(recorded['source_dirty'])
             self.assertEqual(recorded['files']['CSGClaw.exe'], distribution.digest(application / 'CSGClaw.exe'))

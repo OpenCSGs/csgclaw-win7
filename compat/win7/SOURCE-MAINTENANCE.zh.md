@@ -162,3 +162,6 @@ Codex 的 Win7 子 Job 启动适配跟随上游 stderr 管理迁移至 diagnosti
 证书来源、许可证和维护方式见 [HTTPS 证书维护说明](httptrust/README.md)。
 
 本轮桌面显示版本更新为 `0.10.0`，安装包通过日期、源码提交和 dirty 标记区分本地 main 快照。
+
+GitHub Actions 必须从 `.github/workflows/` 加载，因此本仓库的 `release.yml` 是根目录保持上游一致约定的明确例外。
+该入口只调度 `compat/win7/` 中的兼容构建，不恢复上游普通 Windows/macOS 发布或 OSS 发布任务。

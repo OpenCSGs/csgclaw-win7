@@ -1,0 +1,9 @@
+{
+  "win7_runtime": {
+    "url": "https://github.com/OpenCSGs/csgclaw-win7/releases/download/win7-runtime-v0.149.1-r1/codex-win7-v0.149.1-r1.tar.gz",
+    "sha256": "e2304366f63050b6f072ecf5117749cfb8b37728605ab565bcd6e111ef56b21b"
+  },
+  "kylin_smoke_image": "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214",
+  "kylin_glibc": "2.31",
+  "kylin_glibcxx": "3.4.28"
+}
