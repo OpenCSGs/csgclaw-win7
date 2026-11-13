@@ -90,7 +90,7 @@ def main():
         raise ValueError('Feishu HTTPS patch checksum mismatch')
     patch_env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(roots[0].parent))
     for arguments in (['--check'], []):
-        subprocess.run(['git', 'apply', *arguments, str(patch)], cwd=roots[0], env=patch_env, check=True)
+        subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', *arguments, str(patch)], cwd=roots[0], env=patch_env, check=True)
     _configure.configure_http_trust(roots[0])
     target = args.output.resolve() / spec['executable'] / spec['version']
     if target.exists():
