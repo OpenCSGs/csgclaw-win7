@@ -71,7 +71,10 @@ def main():
     run(['bash', source / 'scripts/desktop-pnpm.sh', 'test'], cwd=source, env=env)
     # Server tests exercise embedded UI responses; a pristine archive contains
     # only the generated directory placeholder until the web build completes.
-    run(['make', 'build-web'], cwd=source, env=env)
+    if os.name == 'nt':
+        run(['cmd', '/c', source / 'scripts/build.cmd', 'build-web'], cwd=source, env=env)
+    else:
+        run(['make', 'build-web'], cwd=source, env=env)
     run([go, 'test', './...'], cwd=source, env=env)
     run([sys.executable, COMPAT / 'build-backend.py', '--go', go, '--codex-bundle', args.codex_bundle.resolve(), '--skip-web'], env=env)
     run([node, COMPAT / 'package-desktop.mjs'], env=env)

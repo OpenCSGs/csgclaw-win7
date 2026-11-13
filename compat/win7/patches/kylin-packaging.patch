@@ -1,0 +1,12 @@
+diff --git a/desktop/forge.config.ts b/desktop/forge.config.ts
+--- a/desktop/forge.config.ts
++++ b/desktop/forge.config.ts
+@@ -74,7 +74,7 @@
+ fs.writeFileSync(
+   updateConfig,
+   `${JSON.stringify(
+-    { base_url: updateBaseURL || "", channels_base_url: updateChannelsBaseURL || "" },
++    { disabled: true, base_url: "", channels_base_url: "" },
+     null,
+     2,
+   )}\n`,

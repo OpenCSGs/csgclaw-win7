@@ -6,9 +6,12 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from compat.win7.version import app_version
 COMPAT = ROOT / 'compat/win7'
 
 
@@ -35,12 +38,12 @@ def write_distribution():
     inputs = compatibility_inputs()
     status = subprocess.check_output(['git', 'status', '--porcelain', '--', 'compat/win7'], cwd=ROOT, text=True)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
-    build_id = lock['app_version'] + '-' + datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y%m%d') + '-' + commit[:8]
+    build_id = app_version(lock) + '-' + datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y%m%d') + '-' + commit[:8]
     if status.strip():
         build_id += '-dirty'
     manifest = {
         'kind': 'Win7 desktop compatibility build',
-        'version': lock['app_version'],
+        'version': app_version(lock),
         'source_commit': commit,
         'source_order': int(subprocess.check_output(['git', 'show', '-s', '--format=%ct', commit], cwd=ROOT, text=True)),
         'build_id': build_id,
