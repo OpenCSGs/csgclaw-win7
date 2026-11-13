@@ -97,10 +97,12 @@ def win7_tools():
     return go, runtime
 
 
-def metadata(version, output=None):
+def metadata(version, output=None, target='all'):
     version = normalize(version)
+    if target != 'all' and target not in TARGETS:
+        raise ValueError('Unsupported target: ' + target)
     values = {'version': 'v' + version, 'app_version': version, 'prerelease': str('-' in version).lower(),
-              'matrix': json.dumps({'include': [{'target': target, 'runner': runner} for target, runner in TARGETS.items()]})}
+              'matrix': json.dumps({'include': [{'target': name, 'runner': runner} for name, runner in TARGETS.items() if target == 'all' or name == target]})}
     text = ''.join(f'{key}={value}\n' for key, value in values.items())
     if output:
         with Path(output).open('a') as stream:
@@ -221,11 +223,11 @@ def build(target, version):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    p = sub.add_parser('metadata'); p.add_argument('--version', required=True); p.add_argument('--output')
+    p = sub.add_parser('metadata'); p.add_argument('--version', required=True); p.add_argument('--output'); p.add_argument('--target', choices=['all', *TARGETS], default='all')
     p = sub.add_parser('build'); p.add_argument('--version', required=True); p.add_argument('--target', choices=TARGETS, required=True)
     args = parser.parse_args()
     if args.command == 'metadata':
-        metadata(args.version, args.output)
+        metadata(args.version, args.output, args.target)
     else:
         build(args.target, args.version)
 

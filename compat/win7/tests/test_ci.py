@@ -34,6 +34,8 @@ class ReleaseCITest(unittest.TestCase):
         self.assertEqual(values['prerelease'], 'true')
         self.assertEqual({v['target'] for v in json.loads(values['matrix'])['include']},
                          {'win7-amd64', 'kylin-v10-amd64', 'kylin-v10-arm64'})
+        selected = ci.metadata('v0.10.1', target='win7-amd64')
+        self.assertEqual([v['target'] for v in json.loads(selected['matrix'])['include']], ['win7-amd64'])
 
     def test_tag_override_does_not_change_locked_version(self):
         lock = {'app_version': '0.10.0'}
