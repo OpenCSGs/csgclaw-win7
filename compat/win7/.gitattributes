@@ -1,4 +1,5 @@
 # These inputs are checksum-pinned; native Windows checkout must preserve bytes.
+* text=auto eol=lf
 patches/*.patch text eol=lf
 httptrust/cacert.pem text eol=lf
 httptrust/LICENSE.MPL-2.0 text eol=lf

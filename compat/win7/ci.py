@@ -115,7 +115,7 @@ def export_source(destination):
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
-    data = subprocess.check_output(['git', 'archive', 'HEAD'], cwd=ROOT)
+    data = subprocess.check_output(['git', '-c', 'core.autocrlf=false', 'archive', 'HEAD'], cwd=ROOT)
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
         archive.extractall(destination, members=[m for m in archive.getmembers() if not m.name.startswith('compat/')], filter='data')
 
