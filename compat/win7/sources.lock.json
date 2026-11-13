@@ -14,7 +14,7 @@
     "csgclaw.patch": "f2716f4f3dfc67e1e2303a9b7fdf36456d8950f7b5439b27d4cae18a304e1d6d",
     "codex.patch": "c7d7927c1344bda05f8c81cce719a33c52e4b6e3901cf3728db281985d4a0342",
     "previous-desktop-port.patch": "27e44e27c96fb8004eb7690286305d14002d037b167a947a33e6305463491c04",
-    "test-stability.patch": "2c49c1f1a94c7a0e2aab0873a429b359ad30de8c7d2ca150fe1884905277d04b",
+    "test-stability.patch": "edaf5ad7c1ea5b1f436e46788edecb96f70e4016f9d440c0bddde2c1d07f440c",
     "runtime-metadata-win7.patch": "2577ccfe6be26fe0ec59a438c30627bd3f003a7544e3662d71af008419e0cc25",
     "manager-skills-win7.patch": "daa498d0635d177e48d369729ab7b26ca8bf9a4b2dc7c510f0632a6334c88aa4",
     "inherited-job.patch": "bfe4416dcd80d8830fcdaa2c89e37509a4717a26905b775af57ff19d127fc903",

@@ -1,6 +1,6 @@
 # These inputs are checksum-pinned; native Windows checkout must preserve bytes.
 * text=auto eol=lf
-patches/*.patch text eol=lf
+patches/*.patch text eol=lf whitespace=-blank-at-eol,-space-before-tab
 httptrust/cacert.pem text eol=lf
 httptrust/LICENSE.MPL-2.0 text eol=lf
 web/fonts/LICENSE.noto-emoji text eol=lf
