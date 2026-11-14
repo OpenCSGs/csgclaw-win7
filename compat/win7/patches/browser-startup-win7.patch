@@ -1,0 +1,11 @@
+--- a/internal/browser/launch_windows.go
++++ b/internal/browser/launch_windows.go
+@@ -41,7 +41,7 @@
+ 	cmd := exec.Command(l.Get(flags.Bin), l.FormatArgs()...)
+ 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+ 	cmd.Stdout, cmd.Stderr = log, log
+-	if err := processgroup.Start(cmd); err != nil {
++	if err := processgroup.StartWithChildJobs(cmd); err != nil {
+ 		_ = log.Close()
+ 		_ = os.RemoveAll(profile)
+ 		return "", nil, err

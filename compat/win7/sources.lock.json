@@ -1,7 +1,7 @@
 {
   "csgclaw": {
     "repository": "https://github.com/OpenCSGs/csgclaw.git",
-    "commit": "f72040341dba534f6961a9a95fd7fae4fe6445f0"
+    "commit": "6fee9a0ee9d13cc9b4054845c33e90b06ba3a300"
   },
   "codex": {
     "repository": "https://github.com/openai/codex.git",
@@ -11,7 +11,7 @@
   },
   "previous_port_commit": "edf39aba2e307766913e97ddcf1a0cbaa21463ed",
   "patches": {
-    "csgclaw.patch": "f2716f4f3dfc67e1e2303a9b7fdf36456d8950f7b5439b27d4cae18a304e1d6d",
+    "csgclaw.patch": "1c3396527c250fff6ccece2e52a05d08f8a662b243390ebc4c1a6e5382551699",
     "codex.patch": "c7d7927c1344bda05f8c81cce719a33c52e4b6e3901cf3728db281985d4a0342",
     "previous-desktop-port.patch": "27e44e27c96fb8004eb7690286305d14002d037b167a947a33e6305463491c04",
     "test-stability.patch": "b6e297ff18802a4b3df9f02e0bd6e4af7d24cff4b5fc2150354cbb49f7181470",
@@ -21,7 +21,8 @@
     "windows-workflows.patch": "bd9fcbcbb04cdbe8da6b88e8ec9551cac95b13b5a4f4790bf1c09ec45b222508",
     "upstream-sync.patch": "551745a0b59605d407b4124ec2664f00e5f963d73189528685e7e28999fc8236",
     "win7-tls.patch": "9a8e7462c55828ac7cb1aa0b1f0437c4173d4a09498e9a1c9b15397ce478b9ed",
-    "feishu-tls.patch": "421e72fb6e4d466f4fc364d13707b5f0689d6d759fafe554a2e8ab9d1f1fd378"
+    "feishu-tls.patch": "421e72fb6e4d466f4fc364d13707b5f0689d6d759fafe554a2e8ab9d1f1fd378",
+    "browser-startup-win7.patch": "74b4298720195649ba193f4ef6036526e0e68e0b192b4d98d05787f86f96cc82"
   },
   "runtime": {
     "codex.exe": {
@@ -93,13 +94,14 @@
     "inherited-job.patch",
     "windows-workflows.patch",
     "upstream-sync.patch",
-    "win7-tls.patch"
+    "win7-tls.patch",
+    "browser-startup-win7.patch"
   ],
   "installer": {
     "compiler": "NSIS",
     "version": "3.13"
   },
-  "app_version": "0.11.0-beta.5",
+  "app_version": "0.11.0-beta.6",
   "emoji_font": {
     "repository": "https://github.com/googlefonts/noto-emoji",
     "commit": "e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e",
