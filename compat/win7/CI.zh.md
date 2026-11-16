@@ -1,22 +1,15 @@
-# Tag 发布 CI
+# 兼容构建与 Tag 发布
 
-GitHub Actions 入口为 `.github/workflows/release.yml`，具体构建、依赖锁定、兼容检查和测试保存在 `compat/win7/`。
-该入口是根目录与已采用上游版本保持一致规则的明确例外。
-它替代本仓库继承的普通 Windows/macOS 发布矩阵，避免同一个 tag 同时发布不适合 Win7 的安装包。
+所有 Win7 专属跟踪改动限定在 `compat/`，根目录 `.github/workflows/` 与当前上游 main 完全一致。
+原兼容工作流保存在 `compat/win7/workflows/release.yml`，作为已有构建矩阵和发布步骤的模板。
+GitHub 不会从 `compat/` 自动加载工作流，因此推送 tag 不再通过该模板触发 Win7 或麒麟安装包构建。
 
-推送 `vX.Y.Z` 或 `vX.Y.Z-beta.N` 等语义化版本 tag，会并行生成以下三个包，并在全部成功后附到对应的 GitHub Release。
+`release beta win7` 先同步最新上游 main 并完成受影响检查，然后在 Win7 main 的最新提交上递增 beta 编号并推送标签。
+该命令以远端标签指向预期提交为完成条件，不手动创建 Release、上传安装包或等待 CI。
+旧标签及其安装包保留原始来源和验收记录。
 
-| 目标 | 产物 | 构建环境 |
-| --- | --- | --- |
-| Win7 SP1 x64 | `csgclaw-desktop_<tag>_win7_amd64.exe` | macOS 15 交叉编译，固定 Win7 Go SDK、Electron 22、定制 Codex/WinPTY、NSIS 3.13 |
-| 麒麟 V10 amd64 | `csgclaw-desktop_<tag>_kylin-v10_amd64.deb` | Ubuntu 24.04 amd64 |
-| 麒麟 V10 arm64 | `csgclaw-desktop_<tag>_kylin-v10_arm64.deb` | Ubuntu 24.04 arm64 |
-
-Release 同时包含 SHA-256 校验表、Win7 构建记录和麒麟 ELF 审计记录。
-预发布 tag 生成 prerelease，稳定 tag 生成普通 Release。
-手动运行同一 workflow 可以指定版本及单个构建目标，运行结果仅保留为 Actions artifacts，不创建 tag 或 Release。
-Win7 仓库统一在 `main` 维护适配、连接修复和发布工作流，版本 tag 从已验证的 `main` 提交创建。
-不需要为每个 tag 修改 `sources.lock.json` 的默认版本；CI 通过 `CSGCLAW_WIN7_VERSION` 传递已校验版本，源码来源及校验值保持不变。
+`compat/win7/ci.py` 保留 Win7 x64、麒麟 V10 amd64 和 arm64 三个兼容构建目标。
+需要构建安装包时，使用这些入口及固定依赖，不能把上游普通 Windows 产物视为 Win7 产物。
 
 ## 固定依赖
 

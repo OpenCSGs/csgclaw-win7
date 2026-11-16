@@ -5,7 +5,7 @@ See [the desktop build and acceptance guide](README.zh.md) for the complete Win7
 The repository root retains the CSGClaw upstream directory layout and sources.
 Win7 changes live here and are applied to an ignored build tree, rather than moving or duplicating application directories.
 The imported CSGClaw commit, Codex commit, patch digests and previously verified runtime digests are recorded in `sources.lock.json`.
-The current CSGClaw baseline is upstream main `6fee9a0ee9d13cc9b4054845c33e90b06ba3a300` (2026-11-14), tagged `v0.11.0-beta.6`.
+The current CSGClaw baseline is upstream main `a2fe282ce8aa69acaab534f9033c48d17f3a75a9` (2026-11-16); the Win7 release version is `0.11.0-beta.7`.
 HTTP OpenCSG login and its regression tests come directly from upstream PR #787; no duplicate compatibility patch is applied.
 Unrelated local work in the original CSGClaw checkout is excluded.
 
@@ -46,11 +46,11 @@ The verified runtime set is Codex `rust-v0.149.1` plus our Win7 patch and matchi
 The backend records the application version, source commit and build time.
 The installer also includes Feishu CLI `1.0.97`, rebuilt from its checksum-pinned official source with the same Win7 Go SDK, and its pinned Skills.
 The connector imports this verified local package before trying an online download, so first connection does not depend on GitHub access or an incompatible ordinary Windows CLI.
-Its `+local` suffix preserves the upstream custom-install guard; the desktop application reports version `0.11.0-beta.6`.
+Its `+local` suffix preserves the upstream custom-install guard; the desktop application reports version `0.11.0-beta.7`.
 
 ## Merge future CSGClaw updates
 
-Rebase Win7 commits onto the selected upstream release, preserving upstream commit SHAs and messages.
+Rebase Win7 commits in order onto the freshly fetched upstream main, preserving upstream commit SHAs and messages.
 Never create synchronization merge commits.
 Every locally authored commit uses the `win7` scope.
 Keep root files identical to the adopted upstream revision and maintain adaptations only under `compat/win7/`.
@@ -85,3 +85,11 @@ Codex process startup retains Win7 child-job support after upstream moved stderr
 Set `CSGCLAW_TEST_MCP_AUTH_FILE` to a private JSON fixture containing `hub_url` and `access_token`, and `CSGCLAW_TEST_CONNECTOR_PACKAGES` to the shipped connector package directory.
 These opt-in checks do not grant Feishu application or personal account access.
 Native results must be recorded separately from host checks.
+
+## 2026-11-16 main synchronization
+
+All Win7-only commits now change paths exclusively under `compat/`, with no GitHub Actions entrypoint exception.
+The compatibility workflow is retained as a template at `compat/win7/workflows/release.yml`; GitHub does not automatically load it from that directory.
+The root `.github/workflows/` matches upstream and does not dispatch the compatibility builders.
+`release beta win7` synchronizes main, increments the beta version, and pushes the new tag without waiting for package builds.
+Historical native acceptance records retain their original tested revisions.

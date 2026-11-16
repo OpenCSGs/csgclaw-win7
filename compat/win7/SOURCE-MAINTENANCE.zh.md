@@ -1,9 +1,9 @@
 # Win7 与主仓库的维护约定
 
-当前业务基线为主仓库 main 原始提交 `6fee9a0ee9d13cc9b4054845c33e90b06ba3a300`（2026-11-14，`v0.11.0-beta.6`）。
+当前业务基线为主仓库最新 main 原始提交 `a2fe282ce8aa69acaab534f9033c48d17f3a75a9`（2026-11-16），Win7 发布版本为 `0.11.0-beta.7`。
 Git 历史保留主仓库 main 的原始提交时间线，Win7 提交线性追加在选定的上游基线之后。
 Win7 适配提交按原顺序线性 rebase 到该基线之后，不创建 Win7 同步 merge commit。
-仓库根目录的业务源码和依赖与该上游基线完全一致，发布工作流入口遵循下述明确例外。
+所有 `compat/` 以外的跟踪文件与该上游基线完全一致，发布工作流也没有例外。
 
 ## 改动范围
 
@@ -25,7 +25,7 @@ Win7 专属差异包括 Job breakaway、WinPTY 终端、专用 Go 工具链、El
 所有自行创建的提交必须使用 `(win7)` scope，例如 `fix(win7): ...`、`feat(win7): ...` 和 `build(win7): ...`。
 引入的上游提交保留原始消息和 SHA，不改写为 Win7 提交。
 
-1. 在本仓库获取 `upstream/main`，检查选定版本与当前适配的差异。
+1. 在本仓库获取最新 `upstream/main`，检查其与当前适配的差异。
 2. 保留可恢复的历史备份，仅将 Win7 提交 rebase 到选定的上游 main 之后，禁止创建同步 merge commit。
    上游提交的 SHA 和消息保持不变；仅在明确要求时将 Win7 提交整理为一个提交。
 3. 根目录文件保持与选定的上游版本一致，仅在 `compat/win7/` 解决适配冲突。
@@ -182,3 +182,13 @@ Win7 源码、补丁、测试、依赖锁定及构建实现全部位于 `compat/
 移除已由上游提供的退出后 taskkill 检查及重复测试，浏览器启动继续使用允许 Win7 子 Job 的进程入口。
 应用版本更新为 `0.11.0-beta.6`，Codex、Electron、WinPTY 和专用 Go 工具链继续使用原有锁定来源与校验值。
 本轮构建与原生验收记录单独保存，不改变历史记录的验证范围。
+
+## 2026-11-16 main 同步与 beta.7
+
+原有 16 个 Win7 提交保留原始消息、作者和顺序，线性重放在最新上游 main 之后。
+每个 Win7 提交的专属差异均限定在 `compat/`；原发布入口迁移为 `compat/win7/workflows/release.yml` 模板。
+本节取代上述历史记录中的 `.github/workflows/` 例外，旧标签和验收记录仍对应原历史。
+`sync win7` 同步并推送 main，不创建发布标签。
+`release beta win7` 先完成同步，再以当前版本系列已有最大 beta 编号加一创建并推送标签，推送后结束。
+完整备份位于本地 `.cache/win7/release-beta7-20261116/before.bundle`，原 main 保存在 `refs/backup/win7-beta7-20261116-before`。
+本轮未声明重新通过 Win7 原生桌面验收，历史结果不覆盖新的上游功能。
