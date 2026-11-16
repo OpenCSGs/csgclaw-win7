@@ -18,8 +18,8 @@ dist/win7/                          可交付的安装 EXE、SHA-256 与构建�
 dist/win7/app/                      安装器输入目录，不作为独立分发包
 ```
 
-当前业务源码同步到主仓库 main 原始提交 `f72040341dba534f6961a9a95fd7fae4fe6445f0`（2026-11-13，`v0.11.0-beta.5`）。
-桌面版本为 `0.11.0-beta.5`，安装包中的日期和源码 commit 标识本次 main 快照。
+当前业务源码同步到主仓库最新 main 原始提交 `a2fe282ce8aa69acaab534f9033c48d17f3a75a9`（2026-11-16）。
+桌面版本为 `0.11.0-beta.7`，安装包中的日期和源码 commit 标识本次 main 快照。
 HTTP 分站点登录直接继承上游 PR #787，已移除重复的 `http-opencsg-oauth.patch`。
 头像等待状态和取消、工作租约、进程清理等通用修复已由主仓库 PR #721、#722 合入，不在 Win7 补丁中重复维护。
 离线运行时恢复、重建确认和连接器配置修复已由 PR #739 合入，直接继承上游实现，相关重复补丁和 engine overlay 已移除。
@@ -75,7 +75,7 @@ python3.12 compat/win7/build-installer.py --go /path/to/pinned-win7-go/bin/go
 
 ## 同步后续上游更新
 
-获取选定的 `upstream/main`，保留主仓库原始提交和 SHA，仅将 Win7 提交 rebase 到其后。
+每次获取最新的 `upstream/main`，保留主仓库原始提交和 SHA，仅将 Win7 提交 rebase 到其后。
 Win7 历史保持线性，不创建同步 merge commit。
 自行创建的修复、功能和构建提交均使用 `(win7)` scope，例如 `fix(win7): ...` 或 `feat(win7): ...`。
 更新 `sources.lock.json` 中的上游基线后，重新运行构建入口。
@@ -134,7 +134,10 @@ Win7 的 HTTPS 与飞书长连接使用应用内固定来源的 Mozilla 根证�
 来源和维护步骤见 [HTTPS 证书维护说明](httptrust/README.md)。
 原生缓存升级检查额外使用 `CSGCLAW_TEST_OLD_CONNECTOR_PACKAGES` 指向旧安装包的连接器目录。
 
-## GitHub tag 自动构建
+## Tag 发布与兼容构建
 
-推送版本 tag 后自动构建 Win7 x64、麒麟 V10 amd64 和 arm64 的安装包。
-触发方式、固定依赖与兼容检查见 [Tag 发布 CI](CI.zh.md)。
+`release beta win7` 先同步最新主仓库 main，再递增 beta 版本并推送 tag。
+所有 Win7 专属改动严格限定在 `compat/`，不再保留 `.github/workflows/` 例外。
+兼容工作流保存在 `compat/win7/workflows/release.yml`，GitHub 不会从该目录自动加载工作流。
+根目录工作流与上游一致，不调度 Win7 或麒麟兼容构建。
+固定依赖与兼容检查见 [兼容构建说明](CI.zh.md)。
