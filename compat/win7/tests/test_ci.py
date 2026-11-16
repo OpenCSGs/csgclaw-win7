@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -42,6 +43,49 @@ class ReleaseCITest(unittest.TestCase):
         with patch.dict('os.environ', {'CSGCLAW_WIN7_VERSION': 'v0.10.1-beta.2'}):
             self.assertEqual(app_version(lock), '0.10.1-beta.2')
         self.assertEqual(lock['app_version'], '0.10.0')
+
+    def release_repository(self):
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        for name, value in [('user.name', 'Fixture'), ('user.email', 'fixture@example.invalid')]:
+            subprocess.run(['git', 'config', name, value], cwd=self.root, check=True)
+        source = self.root / 'compat/win7/sources.lock.json'
+        source.parent.mkdir(parents=True)
+        source.write_text('{}\n')
+        subprocess.run(['git', 'add', '.'], cwd=self.root, check=True)
+        subprocess.run(['git', 'commit', '-qm', 'release source'], cwd=self.root, check=True)
+        commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.root, text=True).strip()
+        subprocess.run(['git', 'tag', 'v0.11.0-beta.7'], cwd=self.root, check=True)
+        source.write_text('{"workflow_fix": true}\n')
+        subprocess.run(['git', 'commit', '-qam', 'later workflow fix'], cwd=self.root, check=True)
+        return commit
+
+    def test_recovery_uses_existing_tag_instead_of_new_workflow_commit(self):
+        commit = self.release_repository()
+        output = self.root / 'outputs'
+        with patch.object(ci, 'ROOT', self.root):
+            values = ci.release_metadata('v0.11.0-beta.7', output, publish=True)
+        self.assertEqual(values['source_ref'], commit)
+        self.assertEqual(values['publish'], 'true')
+        self.assertIn('source_ref=' + commit, output.read_text())
+        self.assertEqual(subprocess.check_output(
+            ['git', 'rev-parse', 'v0.11.0-beta.7'], cwd=self.root, text=True).strip(), commit)
+
+    def test_publish_rejects_missing_tag_and_partial_builds(self):
+        self.release_repository()
+        output = self.root / 'outputs'
+        with patch.object(ci, 'ROOT', self.root):
+            with self.assertRaises(subprocess.CalledProcessError):
+                ci.release_metadata('v0.11.0-beta.8', output, publish=True)
+            with self.assertRaisesRegex(ValueError, 'all three'):
+                ci.release_metadata('v0.11.0-beta.7', output, target='win7-amd64', publish=True)
+        self.assertFalse(output.exists())
+
+    def test_preview_uses_current_commit_without_publishing(self):
+        commit = self.release_repository()
+        with patch.object(ci, 'ROOT', self.root):
+            values = ci.release_metadata('v0.11.0-beta.8', target='win7-amd64')
+        self.assertEqual(values['publish'], 'false')
+        self.assertNotEqual(values['source_ref'], commit)
 
     def test_download_rejects_poisoned_cache(self):
         cache = self.root / 'downloads'

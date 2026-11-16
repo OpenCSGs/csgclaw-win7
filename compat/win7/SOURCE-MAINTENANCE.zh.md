@@ -3,7 +3,7 @@
 当前业务基线为主仓库最新 main 原始提交 `a2fe282ce8aa69acaab534f9033c48d17f3a75a9`（2026-11-16），Win7 发布版本为 `0.11.0-beta.7`。
 Git 历史保留主仓库 main 的原始提交时间线，Win7 提交线性追加在选定的上游基线之后。
 Win7 适配提交按原顺序线性 rebase 到该基线之后，不创建 Win7 同步 merge commit。
-所有 `compat/` 以外的跟踪文件与该上游基线完全一致，发布工作流也没有例外。
+除用户授权的 `.github/workflows/release.yml` CI 入口外，所有 `compat/` 以外的跟踪文件与该上游基线完全一致。
 
 ## 改动范围
 
@@ -192,3 +192,11 @@ Win7 源码、补丁、测试、依赖锁定及构建实现全部位于 `compat/
 `release beta win7` 先完成同步，再以当前版本系列已有最大 beta 编号加一创建并推送标签，推送后结束。
 完整备份位于本地 `.cache/win7/release-beta7-20261116/before.bundle`，原 main 保存在 `refs/backup/win7-beta7-20261116-before`。
 本轮未声明重新通过 Win7 原生桌面验收，历史结果不覆盖新的上游功能。
+
+## 2026-11-16 发布入口修复
+
+本节取代上一节取消 CI 入口例外的规则。
+用户授权 `.github/workflows/release.yml` 作为唯一目录例外，构建、版本解析和恢复实现仍位于 `compat/win7/`。
+同步上游时须保留该入口，不能恢复普通 Windows/macOS 发布矩阵或要求 macOS 签名证书。
+已有 `v0.11.0-beta.7` 保持指向 `42b1a1dc7b7ad98ea39bce2a58d4155afd6705fc`，通过 main 上的修复工作流从原 tag 构建并补齐兼容包。
+`release beta` 的顺序为主仓库 tag、同步 Win7、Win7 同名 tag，正常命令仍以 tag 推送为完成条件。

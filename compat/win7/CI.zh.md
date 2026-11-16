@@ -1,15 +1,22 @@
 # 兼容构建与 Tag 发布
 
-所有 Win7 专属跟踪改动限定在 `compat/`，根目录 `.github/workflows/` 与当前上游 main 完全一致。
-原兼容工作流保存在 `compat/win7/workflows/release.yml`，作为已有构建矩阵和发布步骤的模板。
-GitHub 不会从 `compat/` 自动加载工作流，因此推送 tag 不再通过该模板触发 Win7 或麒麟安装包构建。
+Win7 构建、测试和恢复实现位于 `compat/win7/`。
+`.github/workflows/release.yml` 是用户授权的唯一 CI 入口例外，负责调度兼容构建，其他根目录文件与上游一致。
+GitHub Actions 只加载 `.github/workflows/`，不得再次将该入口移到 `compat/` 或替换为上游普通桌面发布流程。
 
-`release beta win7` 先同步最新上游 main 并完成受影响检查，然后在 Win7 main 的最新提交上递增 beta 编号并推送标签。
-该命令以远端标签指向预期提交为完成条件，不手动创建 Release、上传安装包或等待 CI。
-旧标签及其安装包保留原始来源和验收记录。
+推送版本 tag 自动构建 Win7 x64、麒麟 V10 amd64 和 arm64 三个包，并在全部成功后发布到该 tag 的 Release。
+Release 包含安装包、逐目标 SHA-256 校验表、Win7 构建记录及麒麟 ELF 审计记录。
 
-`compat/win7/ci.py` 保留 Win7 x64、麒麟 V10 amd64 和 arm64 三个兼容构建目标。
-需要构建安装包时，使用这些入口及固定依赖，不能把上游普通 Windows 产物视为 Win7 产物。
+`release beta` 先发布主仓库 beta tag，再同步 Win7，并在最新 Win7 main 上推送同名 tag。
+正常命令以两个远端 tag 校验完成为结束条件，不等待 CI。
+用户要求修复发布失败时，须跟进三平台构建与发布并核验资产。
+
+## 已有 tag 的恢复
+
+在 main 上手动运行 Release，指定原 `version`、`publish=true` 和 `target=all`。
+工作流使用当前 main 的恢复逻辑，但各构建 checkout 的源码固定为原 tag 的完整 commit。
+不存在的 tag 或只构建单个目标时禁止发布，原 tag 不移动，历史验收结果保持原始范围。
+不设置 `publish` 时只生成当前工作流提交的预览构建及 Actions artifacts，不创建 Release。
 
 ## 固定依赖
 

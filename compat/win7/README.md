@@ -86,10 +86,11 @@ Set `CSGCLAW_TEST_MCP_AUTH_FILE` to a private JSON fixture containing `hub_url` 
 These opt-in checks do not grant Feishu application or personal account access.
 Native results must be recorded separately from host checks.
 
-## 2026-11-16 main synchronization
+## 2026-11-16 main synchronization and release recovery
 
-All Win7-only commits now change paths exclusively under `compat/`, with no GitHub Actions entrypoint exception.
-The compatibility workflow is retained as a template at `compat/win7/workflows/release.yml`; GitHub does not automatically load it from that directory.
-The root `.github/workflows/` matches upstream and does not dispatch the compatibility builders.
-`release beta win7` synchronizes main, increments the beta version, and pushes the new tag without waiting for package builds.
+Win7-only changes stay under `compat/`, with `.github/workflows/release.yml` as the sole authorized entrypoint exception.
+That entrypoint dispatches the compatibility builders in `compat/win7/` for Win7 x64 and Kylin V10 amd64/arm64.
+`release beta` publishes the main-repository beta tag first, synchronizes Win7, then publishes the same tag on Win7 main.
+To recover an existing release, dispatch the workflow on main with the existing version, `publish=true`, and `target=all`.
+The recovery resolves and builds the original tag commit rather than the newer workflow commit, without moving the tag.
 Historical native acceptance records retain their original tested revisions.

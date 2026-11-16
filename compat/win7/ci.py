@@ -111,6 +111,27 @@ def metadata(version, output=None, target='all'):
     return values
 
 
+def release_metadata(version, output=None, target='all', publish=False):
+    version = normalize(version)
+    if publish and target != 'all':
+        raise ValueError('Publishing requires all three compatibility targets')
+    source = 'refs/tags/v' + version if publish else 'HEAD'
+    commit = subprocess.check_output(
+        ['git', 'rev-parse', '--verify', source + '^{commit}'], cwd=ROOT, text=True).strip()
+    # Recovery builds must use the immutable published tag, not the newer
+    # workflow checkout containing the recovery implementation.
+    subprocess.run(['git', 'cat-file', '-e', commit + ':compat/win7/sources.lock.json'],
+                   cwd=ROOT, check=True)
+    values = metadata(version, output, target)
+    extra = {'source_ref': commit, 'publish': str(publish).lower()}
+    text = ''.join(f'{key}={value}\n' for key, value in extra.items())
+    if output:
+        with Path(output).open('a') as stream:
+            stream.write(text)
+    print(text, end='')
+    return dict(values, **extra)
+
+
 def export_source(destination):
     if destination.exists():
         shutil.rmtree(destination)
@@ -224,10 +245,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('metadata'); p.add_argument('--version', required=True); p.add_argument('--output'); p.add_argument('--target', choices=['all', *TARGETS], default='all')
+    p = sub.add_parser('release-metadata'); p.add_argument('--version', required=True); p.add_argument('--output'); p.add_argument('--target', choices=['all', *TARGETS], default='all'); p.add_argument('--publish', action='store_true')
     p = sub.add_parser('build'); p.add_argument('--version', required=True); p.add_argument('--target', choices=TARGETS, required=True)
     args = parser.parse_args()
     if args.command == 'metadata':
         metadata(args.version, args.output, args.target)
+    elif args.command == 'release-metadata':
+        release_metadata(args.version, args.output, args.target, args.publish)
     else:
         build(args.target, args.version)
 

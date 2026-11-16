@@ -136,8 +136,8 @@ Win7 的 HTTPS 与飞书长连接使用应用内固定来源的 Mozilla 根证�
 
 ## Tag 发布与兼容构建
 
-`release beta win7` 先同步最新主仓库 main，再递增 beta 版本并推送 tag。
-所有 Win7 专属改动严格限定在 `compat/`，不再保留 `.github/workflows/` 例外。
-兼容工作流保存在 `compat/win7/workflows/release.yml`，GitHub 不会从该目录自动加载工作流。
-根目录工作流与上游一致，不调度 Win7 或麒麟兼容构建。
+`release beta` 先发布主仓库 beta tag，再同步最新主仓库 main，最后为 Win7 main 打同名 tag。
+Win7 专属改动保存在 `compat/`，`.github/workflows/release.yml` 是用户授权的唯一 CI 入口例外。
+该入口调度 Win7 x64、麒麟 V10 amd64 和 arm64 的兼容构建，不能替换为上游普通桌面发布流程。
+补发已有版本时在 main 手动运行工作流，指定原版本、`publish=true` 和 `target=all`，从原 tag 构建且不移动 tag。
 固定依赖与兼容检查见 [兼容构建说明](CI.zh.md)。
