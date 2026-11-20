@@ -5,7 +5,7 @@ See [the desktop build and acceptance guide](README.zh.md) for the complete Win7
 The repository root retains the CSGClaw upstream directory layout and sources.
 Win7 changes live here and are applied to an ignored build tree, rather than moving or duplicating application directories.
 The imported CSGClaw commit, Codex commit, patch digests and previously verified runtime digests are recorded in `sources.lock.json`.
-The current CSGClaw baseline is upstream main `a2fe282ce8aa69acaab534f9033c48d17f3a75a9` (2026-11-16); the Win7 release version is `0.11.0-beta.7`.
+The current CSGClaw baseline is upstream `v0.11.0` at `fef2c5133068954f15da2c2d440d1349ff1b196f` (2026-11-20).
 HTTP OpenCSG login and its regression tests come directly from upstream PR #787; no duplicate compatibility patch is applied.
 Unrelated local work in the original CSGClaw checkout is excluded.
 
@@ -46,14 +46,16 @@ The verified runtime set is Codex `rust-v0.149.1` plus our Win7 patch and matchi
 The backend records the application version, source commit and build time.
 The installer also includes Feishu CLI `1.0.97`, rebuilt from its checksum-pinned official source with the same Win7 Go SDK, and its pinned Skills.
 The connector imports this verified local package before trying an online download, so first connection does not depend on GitHub access or an incompatible ordinary Windows CLI.
-Its `+local` suffix preserves the upstream custom-install guard; the desktop application reports version `0.11.0-beta.7`.
+The backend uses the `+local` suffix to preserve the upstream custom-install guard.
+The desktop application reports version `0.11.0`.
 
 ## Merge future CSGClaw updates
 
 Rebase Win7 commits in order onto the freshly fetched upstream main, preserving upstream commit SHAs and messages.
 Never create synchronization merge commits.
 Every locally authored commit uses the `win7` scope.
-Keep root files identical to the adopted upstream revision and maintain adaptations only under `compat/win7/`.
+Keep root files identical to the adopted upstream revision except for the compatibility release entrypoint `.github/workflows/release.yml`.
+Maintain the compatibility implementation under `compat/win7/`.
 Do not edit generated files under `.cache/win7`.
 Run `prepare.py` after each synchronization; a conflicting patch must fail rather than silently dropping a compatibility fix.
 Resolve the compatibility patch against the new upstream source, review its digest change and repeat native Win7 acceptance.

@@ -18,13 +18,14 @@ dist/win7/                          可交付的安装 EXE、SHA-256 与构建�
 dist/win7/app/                      安装器输入目录，不作为独立分发包
 ```
 
-当前业务源码同步到主仓库最新 main 原始提交 `a2fe282ce8aa69acaab534f9033c48d17f3a75a9`（2026-11-16）。
-桌面版本为 `0.11.0-beta.7`，安装包中的日期和源码 commit 标识本次 main 快照。
+当前业务源码同步到主仓库正式版 `v0.11.0` 对应的原始提交 `fef2c5133068954f15da2c2d440d1349ff1b196f`（2026-11-20）。
+桌面版本为 `0.11.0`，安装包中的日期和源码 commit 标识本次发布快照。
 HTTP 分站点登录直接继承上游 PR #787，已移除重复的 `http-opencsg-oauth.patch`。
 头像等待状态和取消、工作租约、进程清理等通用修复已由主仓库 PR #721、#722 合入，不在 Win7 补丁中重复维护。
 离线运行时恢复、重建确认和连接器配置修复已由 PR #739 合入，直接继承上游实现，相关重复补丁和 engine overlay 已移除。
-Git 历史保留完整主仓库历史，后续兼容改动单独使用 `win7` scope 提交，仓库根目录与该上游基线保持一致。
-全部 Win7 差异集中在 `compat/win7/`，包括定制 Codex 完整源码。
+Git 历史保留完整主仓库历史，后续兼容改动单独使用 `win7` scope 提交。
+Win7 兼容实现集中在 `compat/win7/`，包括定制 Codex 完整源码。
+其余跟踪文件与上游基线一致，唯一例外是兼容发布入口 `.github/workflows/release.yml`。
 后续维护和上游同步规则见 [源码维护约定](SOURCE-MAINTENANCE.zh.md)。
 
 ## 构建桌面 App
@@ -85,7 +86,7 @@ Win7 历史保持线性，不创建同步 merge commit。
 
 `patches/previous-desktop-port.patch` 保存同事此前的 Electron 22 方案，仅用于追溯，不会再次应用。
 `REPORT.zh.md` 和 `verification-20261017.json` 记录此前 Go + Codex 验收，不能替代本轮桌面结果。
-上游发布工作流保留用于同步；本轮未接入 Win7 正式发布自动化，不应使用上游发布入口生成兼容包。
+推送版本标签会触发兼容发布工作流，构建 Win7 x64 和麒麟 V10 amd64/arm64 安装包及校验文件。
 
 ## 原生验收
 
